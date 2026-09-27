@@ -1832,6 +1832,7 @@ class BridgeService : Service() {
         //     --es user mqttuser --es haUrl http://192.168.0.39:8123
         //     --es sendspinUrl ws://192.168.0.39:8927/sendspin   (empty string = back to mDNS)
         //     --es deviceId 0123456789abcdef   (keep the HA device across a re-signed reinstall)
+        //     --es cameraId 1   (stream the raw sensor, experimental; empty string = Camera 0)
         // ★Deliberately NO password: it would sit in shell history and the device log. That one
         // stays a typed-in-person field.
         debugConfigReceiver = object : BroadcastReceiver() {
@@ -1847,6 +1848,19 @@ class BridgeService : Service() {
                 }
                 if (intent.hasExtra("port")) {
                     p.brokerPort = intent.getIntExtra("port", 1883); changed = true
+                }
+                intent.getStringExtra("cameraId")?.let { id ->
+                    if (id.trim() != p.streamCameraId) {
+                        p.streamCameraId = id
+                        Log.i(TAG, "config: stream camera '${p.streamCameraId}' (blank = Camera 0)")
+                        commandExecutor.submit {
+                            rtspStreamer?.let {
+                                it.cameraId = p.streamCameraId
+                                if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                            }
+                        }
+                    }
+                    if (!changed) return
                 }
                 intent.getStringExtra("sendspinUrl")?.let { url ->
                     if (url.trim() != p.sendspinServerUrl) {
@@ -2409,6 +2423,7 @@ class BridgeService : Service() {
                     it.onStreamDead = { reason -> onRtspStreamDead(reason) }
                 }
                 r.rotationOffset = p.streamRotation
+                r.cameraId = p.streamCameraId
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
                     // stream itself never opens the mic, so calls/Alexa/wake word

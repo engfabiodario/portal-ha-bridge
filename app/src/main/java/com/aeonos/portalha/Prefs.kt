@@ -90,6 +90,12 @@ class Prefs(private val context: Context) {
             return new
         }
 
+    // Fleet: camera the RTSP stream uses ("" = Camera 0, the default). "1" = the raw sensor
+    // (wider 4:3 view) - experimental, see RtspStreamer.cameraId. Set via DEBUG_CONFIG cameraId.
+    var streamCameraId: String
+        get() = sp.getString("stream_camera_id", "") ?: ""
+        set(v) = sp.edit().putString("stream_camera_id", v.trim()).apply()
+
     // Carry an existing HA identity over to a reinstall that got a new ANDROID_ID (Android 8+
     // derives it from the signing key, so a differently-signed build would otherwise show up in
     // HA as a second device with "_2" entities).
