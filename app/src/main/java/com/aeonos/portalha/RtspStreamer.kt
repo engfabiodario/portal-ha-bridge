@@ -44,8 +44,16 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // FOV is ~SQUARE — so any 16:9 request comes out stretched. Encoding a square
     // surface makes the stream natively display 1:1 in every player with no aspect
     // override (verified on aloha via raw frames; cipher shares the exact camera
-    // architecture). 480x480 keeps the native vertical resolution.
+    // architecture). aloha encodes 720x720: the full 720 vertical lines of the
+    // 1280x720 capture, same framing as the old 480x480, 2.25x the pixels.
     private val squashedFrontCam = android.os.Build.DEVICE.lowercase() in setOf("aloha", "cipher")
+
+    // Fleet: camera to stream from. "" / "0" = Camera 0 (the processed 1280x720 feed,
+    // default). Any other id (Portals: "1" = the raw 12-13 MP sensor, wider 4:3 view)
+    // is EXPERIMENTAL: Meta's aiservice normally holds it for auto-framing/presence.
+    // The stream is prepared at 1440x1080 and switched to that camera once running;
+    // if the camera can't be opened the stream keeps running on Camera 0.
+    @Volatile var cameraId: String = ""
 
     // Capture params from the last start(), reused by restart() on rotation change.
     private var baseWidth = 1280
@@ -100,18 +108,33 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             //            its 4:3 setting. TODO: a DIY encoder pipeline could stamp SAR.
             val corrected = squashedFrontCam && width * 9 == height * 16
             val isCipher = android.os.Build.DEVICE.equals("cipher", true)
-            val encW = if (corrected) (if (isCipher) 640 else 480) else width
-            val encH = if (corrected) 480 else height
+            var fullSensor = cameraId.isNotBlank() && cameraId != "0"
+            fun encSize(full: Boolean): Pair<Int, Int> = when {
+                full -> 1440 to 1080
+                corrected -> if (isCipher) 640 to 480 else 720 to 720
+                else -> width to height
+            }
+            var (encW, encH) = encSize(fullSensor)
             // Force H.264 Constrained Baseline — WebRTC browser decoders (and most
             // RTSP camera clients) need it. RootEncoder's default is HIGH profile,
             // which WebRTC rejects → "one keyframe then freeze". Fall back to the
             // encoder default if this device can't do Constrained Baseline.
             val profile = MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline
-            val level = MediaCodecInfo.CodecProfileLevel.AVCLevel31
-            var videoOk = s.prepareVideo(encW, encH, bitrate, fps, 2, rot, profile, level)
-            if (!videoOk) {
-                Log.w(TAG, "Constrained-Baseline prepare failed; using encoder default profile")
-                videoOk = s.prepareVideo(encW, encH, bitrate, fps, 2, rot)
+            fun prepare(w: Int, h: Int): Boolean {
+                // Level 3.1 tops out at 1280x720; bigger frames need 4.0.
+                val level = if (w * h > 921_600) MediaCodecInfo.CodecProfileLevel.AVCLevel4
+                            else MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                val br = if (w * h > 921_600) maxOf(bitrate, 3_000_000) else bitrate
+                if (s.prepareVideo(w, h, br, fps, 2, rot, profile, level)) return true
+                Log.w(TAG, "Constrained-Baseline prepare failed at ${w}x$h; using encoder default profile")
+                return s.prepareVideo(w, h, br, fps, 2, rot)
+            }
+            var videoOk = prepare(encW, encH)
+            if (!videoOk && fullSensor) {
+                Log.w(TAG, "camera $cameraId: ${encW}x$encH prepare failed; back to Camera 0")
+                fullSensor = false
+                encSize(false).let { encW = it.first; encH = it.second }
+                videoOk = prepare(encW, encH)
             }
             // Always prepare the audio encoder — startStream() requires it even with
             // NoAudioSource (NoAudioSource just means no mic is opened, no data fed).
@@ -119,7 +142,14 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             if (videoOk && audioOk) {
                 s.startStream()
                 isStreaming = true
-                Log.i(TAG, "RTSP streaming on ${url()} ${encW}x${encH} rot=$rot squash=$squashedFrontCam (audio=$withAudio)")
+                if (fullSensor) {
+                    // start() opened Camera 0 by facing; hop to the requested camera now
+                    // that the capture surface exists. A refusal leaves Camera 0 running.
+                    runCatching { video.openCameraId(cameraId) }
+                        .onSuccess { Log.i(TAG, "camera $cameraId: opened for the stream") }
+                        .onFailure { Log.w(TAG, "camera $cameraId: open failed (${it.message}); staying on Camera 0") }
+                }
+                Log.i(TAG, "RTSP streaming on ${url()} ${encW}x${encH} rot=$rot squash=$squashedFrontCam camera=${if (fullSensor) cameraId else "0"} (audio=$withAudio)")
                 true
             } else {
                 Log.w(TAG, "RTSP prepare failed (video=$videoOk audio=$audioOk)")
