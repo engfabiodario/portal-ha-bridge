@@ -172,6 +172,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
 
     // Freeform: null = not seen yet, true = our task came up freeform, false = not active this boot.
     @Volatile private var freeformOk: Boolean? = null
+    // A park has been issued by this process (the first one clears a task left from an earlier one).
+    @Volatile private var parkedThisRun = false
 
     // What AudioPolicyService last said about the assistant's uid (-1 = nothing seen yet).
     @Volatile private var avaFg = -1
@@ -442,15 +444,23 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val bounds = launchBounds()
         // Same intent every time: with NEW_TASK an existing task whose root has this exact intent is
         // brought to the front as it is (the assistant on top, resumed) - no new instance.
+        // Except the FIRST park of this process: our task outlives a previous process of ours (an
+        // update, a crash) with only the assistant left in it, and bringing that back would never
+        // resume our activity - no freeform check, so no corner cover over a visible sliver. Clear
+        // it and start over inside it (the task keeps its freeform bounds).
+        val fresh = !parkedThisRun
         val intent = Intent(ctx, AvaKeepAliveActivity::class.java).addFlags(
-            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION or Intent.FLAG_ACTIVITY_NO_USER_ACTION)
-        if (freeformOk == true) coverBeforePark()
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION or Intent.FLAG_ACTIVITY_NO_USER_ACTION or
+                (if (fresh) Intent.FLAG_ACTIVITY_CLEAR_TASK else 0))
+        if (freeformOk != false) coverBeforePark()
         val ok = runCatching { ctx.startActivity(intent, freeformOptions(bounds)) }
             .onFailure { Log.w(TAG, "keepalive: park failed: ${it.message}") }.isSuccess
         if (!ok) return
+        parkedThisRun = true
         val now = SystemClock.elapsedRealtime()
         lastParkMs = now; parkTimes.addLast(now); parkCount++
-        Log.i(TAG, "keepalive: park #$parkCount ($reason) fg=$avaFg state=$avaAppState screen=${if (host.screenIsOn) "on" else "off"}")
+        Log.i(TAG, "keepalive: park #$parkCount ($reason${if (fresh) ", fresh task" else ""}) fg=$avaFg state=$avaAppState " +
+            "screen=${if (host.screenIsOn) "on" else "off"}")
         refreshCoverSoon()
     }
 
@@ -704,8 +714,10 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         coverView = null; guardView = null; coverLp = null; guardLp = null; coverShown = false
     }
 
+    // Freeform not confirmed yet counts: a parked sliver may already be on screen (harmless if not -
+    // the cover shows the very pixels behind it).
     private fun wantCover(): Boolean =
-        enabled && freeformOk == true && lastParkMs != 0L &&
+        enabled && freeformOk != false && lastParkMs != 0L &&
             host.screenIsOn && host.dashboardInFront && !host.fullScreenOverlayUp
 
     private fun updateCover(forceCopy: Boolean = false) {
