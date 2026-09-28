@@ -13,6 +13,7 @@ import android.graphics.Point
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
@@ -65,9 +66,9 @@ import android.widget.ImageView
  * in a tight loop (minimum gap + rate limit with exponential backoff), and every park is logged with
  * its reason ("keepalive: park #n (<reason>) ...").
  *
- * The corner cover is refreshed every second (every 3 s if a copy turns out to be expensive), plus
- * a burst at +0.4/+1.2/+2.5 s after each park, page change and cover show, so a page that was still
- * drawing when it was first copied doesn't stay frozen in the corner.
+ * The corner cover is re-copied every 3 s, plus a burst at +0.4/+1.2/+2.5 s after each park, page
+ * change, wake and cover show, so a page that was still drawing when it was first copied doesn't
+ * stay frozen in the corner. Copies run on a thread of their own (PixelCopy blocks its caller).
  *
  * Two ways to turn it off: the user's switch ([setEnabled], HA "Ava Keep-Alive"), which stays off,
  * and a timed pause for setup scripts ([pauseUntil], at most [MAX_PAUSE_MINUTES]) that ends BY
@@ -108,11 +109,10 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         private const val START_DELAY_MS = 6_000L
         private const val TICK_MS = 60_000L
         private const val COVER_TICK_MS = 1_000L
-        private const val COVER_REFRESH_MS = 1_000L
-        // Fallback cadence when a copy costs more than COPY_CHEAP_US on average (PixelCopy runs
-        // synchronously on the calling thread on Android 10, via the render thread).
-        private const val COVER_REFRESH_SLOW_MS = 3_000L
-        private const val COPY_CHEAP_US = 8_000L
+        // Steady refresh of the corner cover. Not 1 s: every copy is real render-thread work
+        // (~7 ms on the Portal 10", shared with every window of the app), for a corner that
+        // rarely changes between page changes - which get the burst below.
+        private const val COVER_REFRESH_MS = 3_000L
         // Extra copies after a park, a page change or the cover coming up: the page drawing
         // underneath settles within a couple of seconds.
         private val COVER_BURST_MS = longArrayOf(400L, 1_200L, 2_500L)
@@ -207,7 +207,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     private var sliver = Rect()
     private var coverRect = Rect()
     private val burstToken = Any()
-    // PixelCopy cost (main thread), for the cadence choice and the status line.
+    // PixelCopy cost (on the copy thread), for the status line.
     @Volatile private var copyCount = 0
     @Volatile private var copyTotalUs = 0L
     @Volatile private var copyMaxUs = 0L
@@ -232,7 +232,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             "backoff=${if (backoffUntil > now) (backoffUntil - now) / 1000 else 0}s cover=$coverShown " +
             "switch=${if (userEnabled) "on" else "off"} paused=${pauseLeftSec()}s " +
             "copies=$n copyAvg=${String.format(java.util.Locale.US, "%.1f", avgMs)}ms " +
-            "copyMax=${copyMaxUs / 1000}ms refresh=${coverRefreshMs() / 1000}s"
+            "copyMax=${copyMaxUs / 1000}ms"
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -260,7 +260,10 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         main.removeCallbacks(tick); main.removeCallbacks(coverTick); main.removeCallbacks(attemptRunnable)
         main.removeCallbacks(pauseEnd); main.removeCallbacksAndMessages(burstToken)
         stopLogReader()
-        main.post { removeCoverWindows() }
+        main.post {
+            removeCoverWindows()
+            copyThread?.quitSafely(); copyThread = null; copyHandler = null
+        }
         if (instance === this) instance = null
     }
 
@@ -725,28 +728,43 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         if (want != coverShown) { setCoverVisible(want); return }
         if (!want) return
         val now = SystemClock.elapsedRealtime()
-        // -50 ms: a 1 s cadence on a 1 s tick must not skip every other tick on jitter.
-        if (forceCopy || now - lastCoverCopyMs >= coverRefreshMs() - 50L) copyCover()
+        // -50 ms: the refresh must not slip a whole 1 s tick on jitter.
+        if (forceCopy || now - lastCoverCopyMs >= COVER_REFRESH_MS - 50L) copyCover()
     }
 
-    /** 1 s while copies are cheap; 3 s if they turn out not to be (measured, see copyCover). */
-    private fun coverRefreshMs(): Long {
-        val n = copyCount
-        return if (n >= 10 && copyTotalUs / n > COPY_CHEAP_US) COVER_REFRESH_SLOW_MS else COVER_REFRESH_MS
-    }
-
-    /** Copy the dashboard pixels behind the corner into the cover (main thread). */
+    /**
+     * Copy the dashboard pixels behind the corner into the cover. PixelCopy.request is synchronous
+     * up to Android 13 and, measured on the Portal 10", takes ~7 ms per copy on a settled page and
+     * up to ~100 ms while a page loads (it waits for the render thread) - so it runs on a thread of
+     * its own; only setting the bitmap happens on the main thread.
+     */
     private fun copyCover() {
         lastCoverCopyMs = SystemClock.elapsedRealtime()
-        val t0 = SystemClock.elapsedRealtimeNanos()
-        DashboardActivity.copyRegion(Rect(coverRect)) { bmp: Bitmap? ->
-            if (bmp != null && coverShown) coverView?.setImageBitmap(bmp)
+        val r = Rect(coverRect)
+        val h = copier() ?: return
+        h.post {
+            val t0 = SystemClock.elapsedRealtimeNanos()
+            DashboardActivity.copyRegion(r) { bmp: Bitmap? ->
+                if (bmp != null && coverShown) coverView?.setImageBitmap(bmp)
+            }
+            val us = (SystemClock.elapsedRealtimeNanos() - t0) / 1000L
+            if (copyCount == Int.MAX_VALUE) { copyCount = 0; copyTotalUs = 0L }
+            copyCount++; copyTotalUs += us
+            if (us > copyMaxUs) copyMaxUs = us
         }
-        // PixelCopy.request is synchronous up to Android 13, so this is the real cost.
-        val us = (SystemClock.elapsedRealtimeNanos() - t0) / 1000L
-        if (copyCount == Int.MAX_VALUE) { copyCount = 0; copyTotalUs = 0L }
-        copyCount++; copyTotalUs += us
-        if (us > copyMaxUs) copyMaxUs = us
+    }
+
+    private var copyThread: HandlerThread? = null
+    private var copyHandler: Handler? = null
+
+    private fun copier(): Handler? {
+        copyHandler?.let { return it }
+        if (!started) return null
+        return runCatching {
+            val t = HandlerThread("portal-ha-keepalive-copy").also { it.start() }
+            copyThread = t
+            Handler(t.looper).also { copyHandler = it }
+        }.getOrNull()
     }
 
     /**
