@@ -53,6 +53,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // is EXPERIMENTAL: Meta's aiservice normally holds it for auto-framing/presence.
     // The stream is prepared at 1440x1080 and switched to that camera once running;
     // if the camera can't be opened the stream keeps running on Camera 0.
+    // TESTED 2026-09-27 on aloha: camera 1 is hidden from apps without the privileged
+    // android.permission.CAMERA_PRIV (only Meta's system apps have it), so openCameraId("1")
+    // never reaches CameraService. Kept as an inert option (default off) for other hardware.
     @Volatile var cameraId: String = ""
 
     // Capture params from the last start(), reused by restart() on rotation change.
