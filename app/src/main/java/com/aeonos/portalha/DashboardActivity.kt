@@ -193,6 +193,10 @@ class DashboardActivity : AppCompatActivity() {
             }
             override fun onPageFinished(view: WebView, url: String) {
                 view.evaluateJavascript(alwaysVisibleJs(), null)
+                AvaKeepAlive.onDashboardContentChanged()   // re-copy the corner cover as the page settles
+            }
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                AvaKeepAlive.onDashboardContentChanged()
             }
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
                 handler.proceed() // Accept self-signed certs for local HA
@@ -455,6 +459,8 @@ class DashboardActivity : AppCompatActivity() {
      * which may not be a routable HA path.
      */
     private fun showTarget() {
+        // Another page is coming: the keep-alive's corner cover re-copies it as it draws.
+        AvaKeepAlive.onDashboardContentChanged()
         val home = homeUrl()
         if (home.isEmpty()) { loadDashboard(); return }
         val nav = navUrl
