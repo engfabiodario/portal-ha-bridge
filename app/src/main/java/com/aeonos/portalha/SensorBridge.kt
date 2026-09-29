@@ -24,12 +24,68 @@ class SensorBridge(
         private const val RGB_TYPE = 65537
         private const val TAP_COOLDOWN_MS = 800L
         private const val TAP_RESET_MS = 1500L
-        private const val LIGHT_THROTTLE_MS = 2_000L
-        private const val LIGHT_MIN_DELTA = 1.5f
-        private const val ACCEL_THROTTLE_MS = 5_000L
         private const val GRAVITY_ALPHA = 0.85f
-        private const val TEMP_THROTTLE_MS = 30_000L
-        private const val TEMP_MIN_DELTA = 0.2f
+
+        // Publish deadbands (see Gate). A change must clear both the absolute and the relative band.
+        private const val HEARTBEAT_MS = 60_000L
+        private const val LIGHT_MIN_LX = 5f            // ambient light: >= max(5 lx, 10 %)
+        private const val LIGHT_REL = 0.10f
+        private const val LIGHT_MIN_INTERVAL_MS = 5_000L
+        private const val RGB_MIN_ABS = 5f             // RGB channels (raw counts ~1e4): >= max(5, 10 %)
+        private const val RGB_REL = 0.10f
+        private const val RGB_MIN_INTERVAL_MS = 5_000L
+        private const val ACCEL_MIN_DELTA = 0.5f       // m/s2 on any axis (gravity-filtered)
+        private const val ACCEL_MIN_INTERVAL_MS = 5_000L
+        private const val TEMP_MIN_DELTA = 0.3f        // degC, raw reading
+        private const val TEMP_MIN_INTERVAL_MS = 30_000L
+        private const val SETTLE_MS = 1_500L           // a change must still be there this much later
+    }
+
+    /**
+     * Publish deadband for one high-rate sensor. HA records every MQTT state that differs from the
+     * previous one, and these sensors were ~83% of all HA state changes (a Portal+'s ambient light
+     * alone ~7k/h from +-3 lx flicker). A reading goes out only when [moved] says the latest reading
+     * left the deadband around the value last published AND still does SETTLE_MS later (a
+     * one-sample spike is dropped), at most once per [minIntervalMs]. The check re-runs on a timer,
+     * so the end value of a step is published even when the sensor then goes quiet (on-change
+     * sensors do). Without a real change the LAST PUBLISHED payload is re-sent every HEARTBEAT_MS:
+     * HA is refreshed after an MQTT reconnect without recording a new state.
+     * Sensor thread only (the handler below), so no locking.
+     */
+    private inner class Gate(
+        private val minIntervalMs: Long,
+        private val topic: (Prefs) -> String,
+        private val moved: () -> Boolean,
+        private val render: () -> String      // renders the latest reading AND records it as published
+    ) {
+        private var lastMs = 0L
+        private var payload: String? = null
+        private var pending = false
+        private val recheck = Runnable { pending = false; offer(settled = true) }
+
+        fun offer(settled: Boolean = false) {
+            val p = prefs ?: return
+            val now = SystemClock.elapsedRealtime()
+            val last = payload
+            if (last == null) { publishNow(p, now); return }
+            if (moved()) {
+                if (settled && now - lastMs >= minIntervalMs) { publishNow(p, now); return }
+                if (!pending) {
+                    pending = true
+                    handler.postDelayed(recheck, maxOf(SETTLE_MS, lastMs + minIntervalMs - now))
+                }
+                return
+            }
+            if (now - lastMs >= HEARTBEAT_MS) { lastMs = now; onPublish(topic(p), last, 0) }
+        }
+
+        // Publishes the latest reading at once (first reading, or a settings change like the offset).
+        fun publishNow(p: Prefs, now: Long = SystemClock.elapsedRealtime()) {
+            lastMs = now
+            val out = render()
+            payload = out
+            onPublish(topic(p), out, 0)
+        }
     }
 
     // Which optional sensors this hardware actually has — drives whether the
@@ -60,12 +116,44 @@ class SensorBridge(
     // Double knock -> the "Knock" event entity. Separate from the Tap sensor above (whose 800 ms
     // cooldown can't see a second knock anyway), which keeps behaving exactly as before.
     private val knocks = KnockDetector()
-    private var lastLightMs = 0L
-    private var lastLux = Float.MIN_VALUE
-    private var lastAccelMs = 0L
-    private var lastRgbMs = 0L
-    private var lastTempMs = 0L
-    private var lastTemp = Float.MIN_VALUE
+    // Latest readings, and what was last published (the deadband centre).
+    private var lux = 0f
+    private var pubLux = 0f
+    private val rgb = FloatArray(3)
+    private val pubRgb = FloatArray(3)
+    private val pubAccel = FloatArray(3)
+    private var lastTemp = Float.MIN_VALUE   // latest RAW temperature (no offset)
+    private var pubTemp = 0f
+
+    private fun outside(v: Float, centre: Float, minAbs: Float, rel: Float) =
+        abs(v - centre) >= maxOf(minAbs, rel * abs(centre))
+
+    private val lightGate = Gate(LIGHT_MIN_INTERVAL_MS, { HaDiscovery.lightStateTopic(it.deviceId) },
+        { outside(lux, pubLux, LIGHT_MIN_LX, LIGHT_REL) },
+        { pubLux = lux; "%.1f".format(lux) })
+
+    private val rgbGate = Gate(RGB_MIN_INTERVAL_MS, { HaDiscovery.rgbStateTopic(it.deviceId) },
+        { (0..2).any { outside(rgb[it], pubRgb[it], RGB_MIN_ABS, RGB_REL) } },
+        {
+            rgb.copyInto(pubRgb)
+            """{"r":${"%.1f".format(rgb[0])},"g":${"%.1f".format(rgb[1])},"b":${"%.1f".format(rgb[2])}}"""
+        })
+
+    // Publishes the gravity (low-pass) vector: raw samples carry every tap/knock spike.
+    private val accelGate = Gate(ACCEL_MIN_INTERVAL_MS, { HaDiscovery.accelStateTopic(it.deviceId) },
+        {
+            abs(gravX - pubAccel[0]) >= ACCEL_MIN_DELTA || abs(gravY - pubAccel[1]) >= ACCEL_MIN_DELTA ||
+                abs(gravZ - pubAccel[2]) >= ACCEL_MIN_DELTA
+        },
+        {
+            pubAccel[0] = gravX; pubAccel[1] = gravY; pubAccel[2] = gravZ
+            """{"x":${"%.2f".format(gravX)},"y":${"%.2f".format(gravY)},"z":${"%.2f".format(gravZ)}}"""
+        })
+
+    // The deadband is on the raw reading; the offset is applied at publish time.
+    private val tempGate = Gate(TEMP_MIN_INTERVAL_MS, { HaDiscovery.tempStateTopic(it.deviceId) },
+        { abs(lastTemp - pubTemp) >= TEMP_MIN_DELTA },
+        { pubTemp = lastTemp; "%.1f".format(lastTemp + (prefs?.tempOffset ?: 0f)) })
 
     @Volatile private var prefs: Prefs? = null
 
@@ -96,20 +184,16 @@ class SensorBridge(
     override fun onSensorChanged(event: SensorEvent) {
         val p = prefs ?: return
         when (event.sensor.type) {
-            Sensor.TYPE_LIGHT -> handleLight(event, p)
+            Sensor.TYPE_LIGHT -> handleLight(event)
             Sensor.TYPE_ACCELEROMETER -> handleAccel(event, p)
-            Sensor.TYPE_AMBIENT_TEMPERATURE -> handleTemp(event, p)
-            RGB_TYPE -> handleRgb(event, p)
+            Sensor.TYPE_AMBIENT_TEMPERATURE -> handleTemp(event)
+            RGB_TYPE -> handleRgb(event)
         }
     }
 
-    private fun handleTemp(event: SensorEvent, p: Prefs) {
-        val c = event.values[0]
-        val now = System.currentTimeMillis()
-        if (now - lastTempMs < TEMP_THROTTLE_MS && abs(c - lastTemp) < TEMP_MIN_DELTA) return
-        lastTempMs = now
-        lastTemp = c   // raw reading; offset applied at publish time
-        onPublish(HaDiscovery.tempStateTopic(p.deviceId), "%.1f".format(c + p.tempOffset), 0)
+    private fun handleTemp(event: SensorEvent) {
+        lastTemp = event.values[0]   // raw reading; offset applied at publish time
+        tempGate.offer()
     }
 
     // Last RAW temperature reading (no offset), or null before the first one.
@@ -122,30 +206,17 @@ class SensorBridge(
     fun republishTemperature() {
         val p = prefs ?: return
         if (lastTemp == Float.MIN_VALUE) return
-        onPublish(HaDiscovery.tempStateTopic(p.deviceId), "%.1f".format(lastTemp + p.tempOffset), 0)
+        handler.post { tempGate.publishNow(p) }   // on the sensor thread, like every other gate call
     }
 
-    private fun handleLight(event: SensorEvent, p: Prefs) {
-        val lux = event.values[0]
-        val now = System.currentTimeMillis()
-        if (now - lastLightMs < LIGHT_THROTTLE_MS && abs(lux - lastLux) < LIGHT_MIN_DELTA) return
-        lastLightMs = now
-        lastLux = lux
-        onPublish(HaDiscovery.lightStateTopic(p.deviceId), "%.1f".format(lux), 0)
+    private fun handleLight(event: SensorEvent) {
+        lux = event.values[0]
+        lightGate.offer()
     }
 
-    private fun handleRgb(event: SensorEvent, p: Prefs) {
-        val now = System.currentTimeMillis()
-        if (now - lastRgbMs < LIGHT_THROTTLE_MS) return
-        lastRgbMs = now
-        val r = event.values.getOrElse(0) { 0f }
-        val g = event.values.getOrElse(1) { 0f }
-        val b = event.values.getOrElse(2) { 0f }
-        onPublish(
-            HaDiscovery.rgbStateTopic(p.deviceId),
-            """{"r":${"%.1f".format(r)},"g":${"%.1f".format(g)},"b":${"%.1f".format(b)}}""",
-            0
-        )
+    private fun handleRgb(event: SensorEvent) {
+        for (i in 0..2) rgb[i] = event.values.getOrElse(i) { 0f }
+        rgbGate.offer()
     }
 
     private fun handleAccel(event: SensorEvent, p: Prefs) {
@@ -165,14 +236,7 @@ class SensorBridge(
         val force = sqrt((lx * lx + ly * ly + lz * lz).toDouble()).toFloat()
 
         val now = System.currentTimeMillis()
-        if (now - lastAccelMs >= ACCEL_THROTTLE_MS) {
-            lastAccelMs = now
-            onPublish(
-                HaDiscovery.accelStateTopic(p.deviceId),
-                """{"x":${"%.2f".format(x)},"y":${"%.2f".format(y)},"z":${"%.2f".format(z)}}""",
-                0
-            )
-        }
+        accelGate.offer()
 
         // Threshold is read live from prefs so HA slider and app slider take effect
         // immediately; tapScale lowers it on the less-sensitive Portal+ 2nd gen.
