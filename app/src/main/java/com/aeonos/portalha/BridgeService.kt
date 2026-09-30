@@ -2305,7 +2305,7 @@ class BridgeService : Service() {
         pub(HaDiscovery.sendspinDiscoveryTopic(p.deviceId), HaDiscovery.sendspinConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.npOverlayDiscoveryTopic(p.deviceId), HaDiscovery.npOverlayConfigPayload(p.deviceId, p.deviceName))
         publishDlnaState(p)
-        // Assistant keep-alive: Android 10 only (Android 9 has no policy to work around).
+        // Assistant keep-alive: Android 9+ (both the Portal+ and the Portal 10" silence a background assistant).
         if (keepAlive?.supported == true) {
             pub(HaDiscovery.avaKeepAliveDiscoveryTopic(p.deviceId), HaDiscovery.avaKeepAliveConfigPayload(p.deviceId, p.deviceName))
             publishAvaKeepAliveState(p)

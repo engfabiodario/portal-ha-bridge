@@ -74,7 +74,7 @@ import android.widget.ImageView
  * and a timed pause for setup scripts ([pauseUntil], at most [MAX_PAUSE_MINUTES]) that ends BY
  * ITSELF, so a script interrupted while it drives the assistant's own UI can't leave it deaf.
  *
- * A no-op below SDK 29, when the assistant isn't installed, when the switch is off or paused.
+ * A no-op below SDK 28, when the assistant isn't installed, when the switch is off or paused.
  */
 class AvaKeepAlive(private val ctx: Context, private val host: Host) {
 
@@ -212,7 +212,11 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     @Volatile private var copyTotalUs = 0L
     @Volatile private var copyMaxUs = 0L
 
-    val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+    // Android 9 (Portal+ "aloha", SDK 28) silences a background assistant too (measured 2026-09-29:
+    // dashboard in front = exact zeros in Ava's own audio buffer, Ava visible = real audio), and it
+    // has freeform windows. It resumes one app only, so the parked window pauses the dashboard while
+    // it stays visible: DashboardActivity treats "visible" as in front there (see its onPause).
+    val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
 
     /** Seconds left of a timed pause (0 = not paused). */
     private fun pauseLeftSec(): Long {

@@ -1,5 +1,7 @@
 package com.aeonos.portalha
 
+import android.os.Build
+
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.http.SslError
@@ -280,7 +282,15 @@ class DashboardActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        // Hide the floating talk buttons when the dashboard isn't in front.
+        // Hide the floating talk buttons when the dashboard isn't in front. Android 10+ resumes
+        // several windows at once, so paused = not in front. Android 9 resumes ONE: the Ava
+        // keep-alive's parked corner window (a freeform task) pauses us while we stay fully
+        // visible - there "in front" means visible, and onStop clears it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) BridgeService.setDashboardForeground(false)
+    }
+
+    override fun onStop() {
+        super.onStop()
         BridgeService.setDashboardForeground(false)
     }
 
