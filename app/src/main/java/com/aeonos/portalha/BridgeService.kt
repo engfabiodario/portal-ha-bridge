@@ -294,7 +294,7 @@ class BridgeService : Service() {
 
         fun setDashboardForeground(fg: Boolean) {
             dashboardForeground = fg
-            // Android 10 assistant keep-alive: a resume may have covered the parked assistant, and
+            // Assistant keep-alive (Android 9+): a resume may have covered the parked assistant, and
             // the corner cover follows the dashboard (see AvaKeepAlive).
             if (fg) instance?.keepAlive?.onDashboardResumed() else instance?.keepAlive?.onDashboardPaused()
             if (fg) { userLeftDashboard = false; instance?.clearForegroundSteal() }
@@ -1077,7 +1077,7 @@ class BridgeService : Service() {
 
         screenOn = getSystemService(PowerManager::class.java).isInteractive
         lastActivityMs = System.currentTimeMillis()
-        // Android 10: keep the external voice assistant (Ava) able to hear - see AvaKeepAlive.
+        // Android 9+: keep the external voice assistant (Ava) able to hear - see AvaKeepAlive.
         // Started here, before any photo/sleep overlay exists, so its corner cover sits below them.
         // A timed setup pause survives a restart (an update mid-setup), clamped so it still ends.
         val kaPause = AvaKeepAlive.clampPauseUntil(p.keepAlivePausedUntil)
@@ -1915,7 +1915,7 @@ class BridgeService : Service() {
         debugConfigReceiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 val p = prefs ?: return
-                // Android 10 assistant keep-alive (AvaKeepAlive):
+                // Assistant keep-alive (AvaKeepAlive, Android 9+):
                 //   --ez avaKeepAlive false|true   the switch (HA "Ava Keep-Alive"); true also ends a pause
                 //   --ei keepAlivePauseMinutes N   timed pause for setup scripts driving the assistant's
                 //                                  own UI (Setup-Ava): off now, back on BY ITSELF after N
@@ -2409,7 +2409,7 @@ class BridgeService : Service() {
         }
     }
 
-    // -- Android 10 assistant keep-alive (AvaKeepAlive) ------------------------------
+    // -- Assistant keep-alive (AvaKeepAlive, Android 9+) -----------------------------
     private var keepAlive: AvaKeepAlive? = null
 
     private val keepAliveHost = object : AvaKeepAlive.Host {

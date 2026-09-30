@@ -25,7 +25,8 @@ import android.widget.ImageView
 
 /**
  * Keeps an external voice assistant (fleet: Ava, com.example.ava) able to HEAR on Android 10
- * Portals (Portal 10" "omni", SDK 29) without ever covering the dashboard.
+ * Portals (Portal 10" "omni", SDK 29) and Android 9 ones (Portal+ "aloha", SDK 28) without ever
+ * covering the dashboard.
  *
  * ## Why
  * Meta's AudioPolicyService carries a "ProcessPolicy" that silences a recorder unless its
@@ -34,7 +35,8 @@ import android.widget.ImageView
  *     ProcessPolicy: onUidForeground() silencing for <uid> -> 0
  *     Setting App state for uid = <uid>, state = 0        <- the recorder now gets zeros
  * A voice assistant that runs from a foreground service (Ava) therefore records silence while
- * our dashboard is in front, i.e. always. Android 9 (Portal+) has no such policy.
+ * our dashboard is in front, i.e. always. Android 9 (Portal+) silences it the same way (measured
+ * 2026-09-29: exact zeros in Ava's own buffer); its logcat has the foreground line, not the state one.
  *
  * ## How
  * With freeform windowing enabled (Settings.Global enable_freeform_support=1 and
@@ -44,7 +46,9 @@ import android.widget.ImageView
  * activity INSIDE that task (no NEW_TASK), so the assistant's activity lives in a freeform task we
  * own. WindowManager keeps 48x32 dp of any freeform window on screen; Android draws only that
  * sliver, the dashboard stays visible and resumed (multi-resume) so the camera keeps streaming,
- * and the assistant's process owns a visible activity so it is not silenced.
+ * and the assistant's process owns a visible activity so it is not silenced. Android 9 resumes one
+ * activity only: there the park PAUSES the dashboard, which stays fully visible and keeps the
+ * camera; DashboardActivity counts "visible" as in front on Android 9 (it clears it in onStop).
  * Owning the task matters: an existing task keeps its windowing mode whatever the launch options
  * say, so starting the assistant's OWN task could bring it up full screen (someone opened it from
  * the launcher, a setup script drove its UI) - covering the dashboard and killing the stream. Our
@@ -82,7 +86,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         /** Why a park must wait right now (call, cast, one of our screens, another app), or null. */
         fun parkBlocker(): String?
         val screenIsOn: Boolean
-        /** The dashboard activity is resumed (in front, possibly next to the parked window). */
+        /** The dashboard is in front, possibly next to the parked window (Android 10: resumed;
+         *  Android 9: visible - the park pauses it there). */
         val dashboardInFront: Boolean
         /** One of our full-screen overlays (photos, sleep cover, now playing) is up. */
         val fullScreenOverlayUp: Boolean

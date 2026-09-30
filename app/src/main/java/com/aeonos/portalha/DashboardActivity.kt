@@ -280,18 +280,27 @@ class DashboardActivity : AppCompatActivity() {
         if (hasFocus) enableImmersive()
     }
 
+    // Stopped (no longer visible) since the last onResume. Android 9 only uses it: see onResume.
+    private var stoppedSinceResume = true
+
     override fun onPause() {
         super.onPause()
         // Hide the floating talk buttons when the dashboard isn't in front. Android 10+ resumes
         // several windows at once, so paused = not in front. Android 9 resumes ONE: the Ava
         // keep-alive's parked corner window (a freeform task) pauses us while we stay fully
         // visible - there "in front" means visible, and onStop clears it.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) BridgeService.setDashboardForeground(false)
+        // Only the CURRENT instance speaks for the dashboard (here and in onStop): a kiosk rebuild
+        // (NEW_TASK|CLEAR_TASK, Setup-Portal's kiosk restart) creates and resumes the new instance
+        // BEFORE the old one stops, and the old one's late callback would otherwise mark the
+        // visible dashboard "not in front" - no parks (Ava deaf), no photos, no talk buttons,
+        // until the next resume.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && instance === this) BridgeService.setDashboardForeground(false)
     }
 
     override fun onStop() {
         super.onStop()
-        BridgeService.setDashboardForeground(false)
+        stoppedSinceResume = true
+        if (instance === this) BridgeService.setDashboardForeground(false)
     }
 
     // Any touch or key on the dashboard restarts the photo-frame countdown. onUserInteraction
@@ -337,6 +346,11 @@ class DashboardActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         instance = this
+        // A real return to the dashboard, or (Android 9) only the end of a pause during which it
+        // stayed fully visible: every Ava keep-alive park pauses it there and the next touch
+        // resumes it. The latter is not a return - Android 10 doesn't even call onResume for it.
+        val returned = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q || stoppedSinceResume
+        stoppedSinceResume = false
         enableImmersive()
         // Floating talk buttons are shown only while the dashboard is in front.
         BridgeService.setDashboardForeground(true)
@@ -347,10 +361,13 @@ class DashboardActivity : AppCompatActivity() {
         // changed in settings. Home = <HA origin><dashboard path>, or haUrl when no path is set.
         // While a navigate is showing some other page, that page IS where we should be: don't
         // bounce it home on every resume (a wake, returning from settings) - the navigate's own
-        // timer or a "home" command brings it back.
+        // timer or a "home" command brings it back. Nor on an Android 9 resume that wasn't a
+        // return (above): someone browsing another HA page would be thrown home, mid-use, by the
+        // first touch after each keep-alive park. A screen-off/on or a settings screen is a stop,
+        // so the page still comes home the next time the Portal is picked up.
         val home = homeUrl()
         val current = webView.url ?: ""
-        if (navUrl == null && home.isNotEmpty() && !DashboardUrls.isAtHome(current, home)) {
+        if (returned && navUrl == null && home.isNotEmpty() && !DashboardUrls.isAtHome(current, home)) {
             loadDashboard()
         }
     }
