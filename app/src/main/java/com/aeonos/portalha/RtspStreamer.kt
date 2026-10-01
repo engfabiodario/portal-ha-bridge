@@ -97,6 +97,11 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // ~150 lines/s with a UDP client like go2rtc attached) — it floods the
             // device log so hard that chatty prunes OUR diagnostics away.
             s.getStreamClient().setLogs(false)
+            // The server puts ITS OWN address into the SDP (o=/c= and Content-Base), and clients send
+            // SETUP/PLAY to that Content-Base. Left on All it picked the Portal's IPv6 ULA
+            // (fd4f:...), so every client that can't route IPv6 (Frigate's laptop after it moved to
+            // Ethernet, 2026-10-01) hung at SETUP: all Portal cameras at 0 fps. IPv4 only.
+            s.getStreamClient().forceIpType(com.pedro.rtspserver.server.IpType.IPv4)
             stream = s
             lastFrameElapsed = 0L
             startedElapsed = android.os.SystemClock.elapsedRealtime()
