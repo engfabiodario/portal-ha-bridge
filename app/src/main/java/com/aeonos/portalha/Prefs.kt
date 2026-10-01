@@ -350,6 +350,12 @@ class Prefs(private val context: Context) {
         get() = sp.getBoolean("ava_keep_alive", true)
         set(v) = sp.edit().putBoolean("ava_keep_alive", v).apply()
 
+    // Soft self-heal of the app's own components (see SelfHeal). HA switch "Self Heal";
+    // adb DEBUG_CONFIG --ez selfHeal true|false.
+    var selfHeal: Boolean
+        get() = sp.getBoolean("self_heal", true)
+        set(v) = sp.edit().putBoolean("self_heal", v).apply()
+
     // Timed pause of the keep-alive for setup scripts (wall clock ms, 0 = none): off until then, then
     // back on by itself - unlike avaKeepAlive=false, which stays off. adb DEBUG_CONFIG
     // --ei keepAlivePauseMinutes N (max AvaKeepAlive.MAX_PAUSE_MINUTES; 0 ends it).

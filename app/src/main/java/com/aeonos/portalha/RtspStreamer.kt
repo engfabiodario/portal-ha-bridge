@@ -38,6 +38,13 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // BridgeService's OrientationEventListener — keeps the stream upright as the
     // Portal is physically turned (the OS display rotation is locked).
     @Volatile var autoRotation = 0
+    // elapsedRealtime of the last ENCODED video frame (RootEncoder's FpsListener fires about once a
+    // second while the encoder produces frames, clients or not); 0 = none since the last start().
+    // SelfHeal reads it: a wanted stream whose encoder went quiet is restarted.
+    @Volatile var lastFrameElapsed = 0L
+        private set
+    @Volatile var startedElapsed = 0L
+        private set
 
     // Both Portal+ models ("aloha" 1st-gen, "cipher" 2nd-gen) have a front camera
     // whose usable cam (Camera 0) reports only 1280x720 + 4:3 sizes but whose true
@@ -91,6 +98,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // device log so hard that chatty prunes OUR diagnostics away.
             s.getStreamClient().setLogs(false)
             stream = s
+            lastFrameElapsed = 0L
+            startedElapsed = android.os.SystemClock.elapsedRealtime()
+            s.setFpsListener { lastFrameElapsed = android.os.SystemClock.elapsedRealtime() }
             // Pass the LANDSCAPE capture dims + rotation; prepareVideo swaps the
             // ENCODER size itself for 90/270 (don't pre-swap — that double-swaps).
             // NOTE: portrait still letterboxes because the Portal front cam can only

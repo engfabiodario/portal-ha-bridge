@@ -532,6 +532,30 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         }.onFailure { Log.w(TAG, "keepalive: could not start ${cmp.flattenToShortString()}: ${it.message}") }
     }
 
+    // ── SelfHeal ─────────────────────────────────────────────────────────────────
+
+    /**
+     * For SelfHeal: null = nothing to judge (unsupported, off, paused, not installed, freeform not
+     * active, a park blocker, or a park of ours already pending / backing off); true = our parked
+     * task exists and AudioPolicyService doesn't show the assistant hidden or silenced; false = not parked.
+     */
+    fun selfHealParked(): Boolean? {
+        if (!supported || !enabled || !started) return null
+        if (component == null && !resolve()) return null
+        if (freeformOk == false) return null
+        if (host.parkBlocker() != null) return null
+        if (pendingReason != null || SystemClock.elapsedRealtime() < backoffUntil) return null
+        val task = runCatching {
+            ctx.getSystemService(ActivityManager::class.java).appTasks.any { t ->
+                runCatching { t.taskInfo.baseIntent.component?.className }.getOrNull() == AvaKeepAliveActivity::class.java.name
+            }
+        }.getOrDefault(true)
+        return task && avaFg != 0 && avaAppState != 0
+    }
+
+    /** For SelfHeal: the same re-park every other trigger uses (forced: not dropped as "still visible"). */
+    fun selfHealRepark() = request("self-heal", 0L, force = true)
+
     private fun removeOurTask(why: String) {
         runCatching {
             val am = ctx.getSystemService(ActivityManager::class.java)

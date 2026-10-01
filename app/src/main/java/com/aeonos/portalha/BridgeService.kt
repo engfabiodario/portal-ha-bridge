@@ -419,6 +419,7 @@ class BridgeService : Service() {
         Thread(r, "portal-ha-cmd").also { it.isDaemon = true }
     }
     @Volatile private var mqtt: MqttClient? = null
+    @Volatile private var mqttThread: Thread? = null
     @Volatile private var prefs: Prefs? = null
 
     // Screen + audio
@@ -1083,6 +1084,7 @@ class BridgeService : Service() {
         val kaPause = AvaKeepAlive.clampPauseUntil(p.keepAlivePausedUntil)
         if (kaPause != p.keepAlivePausedUntil) p.keepAlivePausedUntil = kaPause
         keepAlive = AvaKeepAlive(this, keepAliveHost).also { it.start(p.avaKeepAlive, p.keepAlivePackage, kaPause) }
+        selfHeal = SelfHeal(this, selfHealHost).also { it.start(p.selfHeal) }
         reconcilePresence(p)
         reconcileDreamSlot(p)
         startDreamWatch()          // and take it back whenever the launcher grabs it
@@ -1115,7 +1117,7 @@ class BridgeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (running.compareAndSet(false, true)) {
-            Thread(::mqttLoop, "portal-ha-mqtt").also { it.isDaemon = true }.start()
+            mqttThread = Thread(::mqttLoop, "portal-ha-mqtt").also { it.isDaemon = true; it.start() }
         }
         if (intent?.action == ACTION_SET_CAMERA) {
             val on = intent.getBooleanExtra(EXTRA_CAMERA_ON, false)
@@ -1229,6 +1231,7 @@ class BridgeService : Service() {
     override fun onDestroy() {
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
+        runCatching { selfHeal?.stop() }; selfHeal = null
         runCatching { screensaver.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
@@ -1951,6 +1954,22 @@ class BridgeService : Service() {
                 if (intent.getBooleanExtra("keepAliveStatus", false)) {
                     Log.i(TAG, keepAlive?.status() ?: "keepalive: status n/a (service starting)")
                 }
+                // Soft self-heal (SelfHeal):
+                //   --ez selfHeal true|false                   the switch (HA "Self Heal")
+                //   --es selfHealTest mqtt|stream|webview|none fake that check failing until its action fired once
+                //   --ez selfHealTick true                     run one check now (counts as a tick)
+                //   --ez selfHealStatus true                   logs one "status ..." line (tag SelfHeal)
+                if (intent.hasExtra("selfHeal")) {
+                    val on = intent.getBooleanExtra("selfHeal", true)
+                    p.selfHeal = on
+                    selfHeal?.setEnabled(on)
+                    publishSelfHealSwitchState(p)
+                }
+                intent.getStringExtra("selfHealTest")?.let { selfHeal?.setTest(it) }
+                if (intent.getBooleanExtra("selfHealTick", false)) selfHeal?.tickNow()
+                if (intent.getBooleanExtra("selfHealStatus", false)) {
+                    Log.i("SelfHeal", selfHeal?.status() ?: "status n/a (service starting)")
+                }
                 var changed = false
                 intent.getStringExtra("name")?.let { p.deviceName = it; changed = true }
                 intent.getStringExtra("broker")?.let { p.brokerHost = it; changed = true }
@@ -2181,7 +2200,8 @@ class BridgeService : Service() {
             HaDiscovery.dlnaCommandTopic(p.deviceId),
             HaDiscovery.sendspinCommandTopic(p.deviceId),
             HaDiscovery.npOverlayCommandTopic(p.deviceId),
-            HaDiscovery.avaKeepAliveCommandTopic(p.deviceId)
+            HaDiscovery.avaKeepAliveCommandTopic(p.deviceId),
+            HaDiscovery.selfHealCommandTopic(p.deviceId)
         ).forEach { client.subscribe(it, 1) }
 
         // Intercom: subscribe to presence/lock/audio and announce ourselves.
@@ -2312,6 +2332,11 @@ class BridgeService : Service() {
         } else {
             client.publish(HaDiscovery.avaKeepAliveDiscoveryTopic(p.deviceId), emptyRetained())
         }
+        // Soft self-heal (SelfHeal): its switch and its status sensor.
+        pub(HaDiscovery.selfHealSwitchDiscoveryTopic(p.deviceId), HaDiscovery.selfHealSwitchConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.selfHealSensorDiscoveryTopic(p.deviceId), HaDiscovery.selfHealSensorConfigPayload(p.deviceId, p.deviceName))
+        publishSelfHealSwitchState(p)
+        selfHeal?.republish()
 
         // Camera, motion-enable and streaming-enable switches exist only while
         // the camera service is enabled; motion entities additionally require
@@ -2406,7 +2431,117 @@ class BridgeService : Service() {
             HaDiscovery.sendspinCommandTopic(p.deviceId)          -> handleSendspinCommand(payload, p)
             HaDiscovery.npOverlayCommandTopic(p.deviceId)         -> handleNpOverlayCommand(payload, p)
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId)      -> handleAvaKeepAliveCommand(payload, p)
+            HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
         }
+    }
+
+    // -- Soft self-heal (SelfHeal) ----------------------------------------------------
+    private var selfHeal: SelfHeal? = null
+
+    private val selfHealHost = object : SelfHeal.Host {
+        override fun busyReason(): String? = when {
+            inCall -> "a call is on"
+            ringing -> "a call is ringing"
+            anyPlaybackUsage(AudioAttributes.USAGE_ALARM) -> "an alarm is ringing"
+            TvAppActivity.isShowing() -> "a cast is showing"
+            intercom?.isTalking() == true || intercom?.busySpeakerName() != null -> "the intercom is in use"
+            twoWayChannelOpen -> "a two-way voice channel is open"
+            micYieldedForWake -> "a wake hand-off is running"
+            navPath.isNotEmpty() -> "a navigate page is showing"
+            otherScreensResumed > 0 -> "a Bridge screen is open"
+            else -> null
+        }
+
+        override fun mqttConnected(): Boolean? {
+            val p = prefs ?: return null
+            if (p.brokerHost.isBlank()) return null
+            return mqtt?.isConnected == true
+        }
+
+        // The app's own reconnect: drop the session (connectAndRun's loop ends, mqttLoop connects
+        // again); a dead loop thread is started again.
+        override fun mqttReconnect(): String {
+            val t = mqttThread
+            if (running.get() && (t == null || !t.isAlive)) {
+                mqttThread = Thread(::mqttLoop, "portal-ha-mqtt").also { it.isDaemon = true; it.start() }
+                return "MQTT loop thread was dead - started again"
+            }
+            val had = mqtt != null
+            restartMqtt()
+            return if (had) "dropped the broker session - the MQTT loop reconnects" else "MQTT loop is retrying (no session to drop)"
+        }
+
+        override fun streamFrameAgeMs(): Long? {
+            val p = prefs ?: return null
+            if (!(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled)) return null
+            val r = rtspStreamer ?: return Long.MAX_VALUE
+            if (!r.isStreaming) return Long.MAX_VALUE
+            val now = android.os.SystemClock.elapsedRealtime()
+            // A (re)start is still coming up: not judged yet.
+            if (now - r.startedElapsed < 60_000L) return null
+            val last = r.lastFrameElapsed
+            return if (last == 0L) Long.MAX_VALUE else now - last
+        }
+
+        // Exactly the app's internal dead-stream restart (onRtspStreamDead), on the command executor
+        // that serializes every stream start/stop. Camera switches and prefs are never touched.
+        override fun streamRestart(): String {
+            commandExecutor.submit {
+                val p = prefs ?: return@submit
+                if (!(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled)) return@submit
+                val r = rtspStreamer
+                if (r != null && r.isStreaming) {
+                    Log.w(TAG, "rtsp: self-heal restart (no frames)")
+                    rtspNeedsRestart = false
+                    r.restart()
+                    noteRtspStarted()
+                } else {
+                    Log.w(TAG, "rtsp: self-heal start (stream wanted but not running)")
+                    applyCameraState(p)
+                }
+            }
+            return "restarted the RTSP streamer"
+        }
+
+        override fun webviewProbe(timeoutMs: Long): Boolean? {
+            if (!dashboardForeground || !DashboardActivity.alive()) return null
+            if (getSystemService(PowerManager::class.java)?.isInteractive != true) return null
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val ok = java.util.concurrent.atomic.AtomicBoolean(false)
+            DashboardActivity.probe { r -> ok.set(r); latch.countDown() }
+            val answered = runCatching { latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            return answered && ok.get()
+        }
+
+        override fun webviewReload(): String =
+            if (DashboardActivity.selfHealReload()) "reloaded the start page" else ""
+
+        override fun keepAliveParked(): Boolean? = keepAlive?.selfHealParked()
+
+        override fun keepAliveRepark(): String {
+            val k = keepAlive ?: return ""
+            k.selfHealRepark()
+            return "asked the keep-alive to re-park Ava"
+        }
+
+        override fun publish(state: String, attributesJson: String) {
+            val p = prefs ?: return
+            if (mqtt?.isConnected != true) return
+            publishRaw(HaDiscovery.selfHealStateTopic(p.deviceId), state, 1, retained = true)
+            publishRaw(HaDiscovery.selfHealAttributesTopic(p.deviceId), attributesJson, 1, retained = true)
+        }
+    }
+
+    private fun handleSelfHealCommand(payload: String, p: Prefs) {
+        val on = payload.equals("ON", ignoreCase = true)
+        if (on != p.selfHeal) p.selfHeal = on
+        selfHeal?.setEnabled(on)
+        publishSelfHealSwitchState(p)
+        Log.i(TAG, "selfheal: HA set enabled=$on")
+    }
+
+    private fun publishSelfHealSwitchState(p: Prefs) {
+        publishRaw(HaDiscovery.selfHealSwitchStateTopic(p.deviceId), if (p.selfHeal) "ON" else "OFF", 1, retained = true)
     }
 
     // -- Assistant keep-alive (AvaKeepAlive, Android 9+) -----------------------------

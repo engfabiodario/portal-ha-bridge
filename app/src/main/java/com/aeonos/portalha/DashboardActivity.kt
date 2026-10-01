@@ -82,6 +82,30 @@ class DashboardActivity : AppCompatActivity() {
             act.runOnUiThread { if (navUrl == null) act.loadDashboard() }
         }
 
+        /**
+         * SelfHeal: run a trivial script in the live WebView. [cb] gets true when it answered, from
+         * the main thread; never called when the main thread or the renderer is stuck (the caller
+         * times out). False at once when there is no dashboard.
+         */
+        fun probe(cb: (Boolean) -> Unit) {
+            val act = instance ?: run { cb(false); return }
+            act.runOnUiThread {
+                if (!act::webView.isInitialized) { cb(false); return@runOnUiThread }
+                runCatching { act.webView.evaluateJavascript("1+1") { r -> cb(r == "2") } }
+                    .onFailure { cb(false) }
+            }
+        }
+
+        /** True while a dashboard activity exists. */
+        fun alive(): Boolean = instance != null
+
+        /** SelfHeal: full reload of the page the kiosk should be on (the navigate target, else home). */
+        fun selfHealReload(): Boolean {
+            val act = instance ?: return false
+            act.runOnUiThread { act.loadDashboard() }
+            return true
+        }
+
         // ── Navigate (HA "Navigate" command, see BridgeService.handleNavigateCommand) ──────
         // The page HA asked for, as a full URL on the HA origin, or null while the kiosk is home.
         // Process-wide rather than per activity so it survives the dashboard being recreated

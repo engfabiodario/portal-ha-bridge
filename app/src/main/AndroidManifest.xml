@@ -15,6 +15,9 @@
     -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- SelfHeal: WifiManager.reconnect() once when the Wi-Fi link stays down (Android 9 only).
+         Normal permission; the radio itself is never toggled. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <!--
         Granted at setup time via ADB:

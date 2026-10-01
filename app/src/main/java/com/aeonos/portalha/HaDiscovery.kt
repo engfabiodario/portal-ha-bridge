@@ -220,6 +220,25 @@ object HaDiscovery {
         return """{"name":"Ava Keep-Alive","unique_id":"${deviceId}_ava_keepalive","device":${device(deviceId, name)},"state_topic":"${avaKeepAliveStateTopic(deviceId)}","command_topic":"${avaKeepAliveCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:microphone-message","entity_category":"config"}"""
     }
 
+    // ── Self heal: switch + status sensor (see SelfHeal) ──────────────────────
+
+    fun selfHealSwitchDiscoveryTopic(deviceId: String) = "homeassistant/switch/${deviceId}_self_heal/config"
+    fun selfHealSwitchStateTopic(deviceId: String) = "portal/$deviceId/selfheal/switch"
+    fun selfHealCommandTopic(deviceId: String) = "portal/$deviceId/selfheal/set"
+    fun selfHealSensorDiscoveryTopic(deviceId: String) = "homeassistant/sensor/${deviceId}_self_heal/config"
+    fun selfHealStateTopic(deviceId: String) = "portal/$deviceId/selfheal/state"
+    fun selfHealAttributesTopic(deviceId: String) = "portal/$deviceId/selfheal/attributes"
+
+    fun selfHealSwitchConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal","device":${device(deviceId, name)},"state_topic":"${selfHealSwitchStateTopic(deviceId)}","command_topic":"${selfHealCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:medical-bag","entity_category":"config"}"""
+    }
+
+    fun selfHealSensorConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal_status","device":${device(deviceId, name)},"state_topic":"${selfHealStateTopic(deviceId)}","json_attributes_topic":"${selfHealAttributesTopic(deviceId)}","icon":"mdi:heart-pulse","entity_category":"diagnostic"}"""
+    }
+
     // ── Volume number (slider) ────────────────────────────────────────────────
 
     fun volumeDiscoveryTopic(deviceId: String) =
@@ -564,7 +583,8 @@ object HaDiscovery {
         dlnaCommandTopic(deviceId),
         sendspinCommandTopic(deviceId),
         npOverlayCommandTopic(deviceId),
-        avaKeepAliveCommandTopic(deviceId)
+        avaKeepAliveCommandTopic(deviceId),
+        selfHealCommandTopic(deviceId)
     )
 
     // ── Shared helpers ────────────────────────────────────────────────────────
