@@ -59,6 +59,21 @@ import android.widget.ImageView
  * (PixelCopy of the dashboard window), plus a transparent touch guard over the sliver itself so a
  * finger in the corner can't drag the parked window on screen by its caption.
  *
+ * ## Corner tap shield (Android 10 system_server crash)
+ * WindowManager treats a touch within 30 dp OUTSIDE a freeform task (RESIZE_HANDLE_WIDTH_IN_DP) as
+ * the start of a resize: TaskTapPointerEventListener -> TaskPositioningController.handleTapOutsideTask.
+ * The touch already belongs to another window, so transferTouchFocus fails, and Android 10's
+ * TaskPositioner.unregister() then calls mClientCallback.unlinkToDeath() on a callback that was never
+ * set (startDrag never ran): NPE in android.display = system_server soft restart (measured 2026-09-30
+ * on Guest Bed 1 from a tap on Ava's own 'Got it' button next to the parked sliver). Overlays don't
+ * help - that listener is an input MONITOR and sees every touch on the display. What it does honour
+ * is the display's touch-exclude region, which windows can extend with
+ * IWindowSession.updateTapExcludeRegion (what ActivityView uses). So a transparent, NOT_TOUCHABLE
+ * window of ours covers the corner (sliver + margin + slack) and registers itself as tap-excluded:
+ * touches there still reach whatever is under them (Ava's button, the dashboard), but WindowManager
+ * no longer reads them as a resize. Verifiable with `dumpsys window displays` (mTouchExcludeRegion).
+ * Android 9 has no such crash (its unregister has no callback to unlink), so the shield is Android 10 only.
+ *
  * Every activity start on the display (ours: a wake, a navigate, Show Dashboard, the steal return;
  * or anyone else's) moves the fullscreen stack above the parked window, and the policy silences the
  * assistant again seconds-to-minutes later. So we re-park (bring our task back to the front):
@@ -110,6 +125,12 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         // The freeform window's drop shadow spills this far left of / above its visible sliver.
         private const val SHADOW_LEFT_DP = 36
         private const val SHADOW_TOP_DP = 28
+        // WindowManager's resize margin around a freeform task (DisplayContent.RESIZE_HANDLE_WIDTH_IN_DP)
+        // and how far beyond the sliver the tap shield reaches: the margin plus generous slack for dp
+        // rounding and the window's drop shadow.
+        private const val RESIZE_MARGIN_DP = 30
+        private const val SHIELD_DP = 72
+        private const val SHIELD_REGION_ID = 0x50484131   // any stable id for our one exclude rect
 
         private const val START_DELAY_MS = 6_000L
         private const val TICK_MS = 60_000L
@@ -207,6 +228,11 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     private var coverLp: WindowManager.LayoutParams? = null
     private var guardView: View? = null
     private var guardLp: WindowManager.LayoutParams? = null
+    // Corner tap shield (see the class comment): always present while the keep-alive runs.
+    private var shieldView: View? = null
+    private var shieldLp: WindowManager.LayoutParams? = null
+    private var shieldRect = Rect()
+    @Volatile private var shieldRegistered = ""   // "" = not yet, else the rect it registered
     @Volatile private var coverShown = false
     @Volatile private var lastCoverCopyMs = 0L
     private var sliver = Rect()
@@ -241,7 +267,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             "backoff=${if (backoffUntil > now) (backoffUntil - now) / 1000 else 0}s cover=$coverShown " +
             "switch=${if (userEnabled) "on" else "off"} paused=${pauseLeftSec()}s " +
             "copies=$n copyAvg=${String.format(java.util.Locale.US, "%.1f", avgMs)}ms " +
-            "copyMax=${copyMaxUs / 1000}ms"
+            "copyMax=${copyMaxUs / 1000}ms shield=${shieldRegistered.ifEmpty { "none" }}"
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -544,6 +570,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val l = s.x - dp(MIN_VISIBLE_W_DP); val t = s.y - dp(MIN_VISIBLE_H_DP)
         sliver = Rect(l, t, s.x, s.y)
         coverRect = Rect(l - dp(SHADOW_LEFT_DP), t - dp(SHADOW_TOP_DP), s.x, s.y)
+        shieldRect = Rect((l - dp(SHIELD_DP)).coerceAtLeast(0), (t - dp(SHIELD_DP)).coerceAtLeast(0), s.x, s.y)
         return Rect(l, t, l + dp(MIN_TASK_DP), t + dp(MIN_TASK_DP))
     }
 
@@ -718,12 +745,74 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             guardView = g; guardLp = glp
             Log.i(TAG, "keepalive: corner cover ready at ${coverRect.toShortString()} (sliver ${sliver.toShortString()})")
         }.onFailure { Log.w(TAG, "keepalive: cover window failed: ${it.message}"); removeCoverWindows() }
+        ensureShieldWindow()
+    }
+
+    /**
+     * The corner tap shield: a transparent window that never takes a touch (NOT_TOUCHABLE: taps fall
+     * through to Ava's button or the dashboard underneath) and asks WindowManager to leave its area out
+     * of freeform resize detection (tap-exclude region). Kept VISIBLE at all times - a GONE window has
+     * no laid-out frame for the region to live in.
+     */
+    private fun ensureShieldWindow() {
+        // Android 10 only: Android 9's TaskPositioner has no such crash (nothing to unlink).
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (!supported || shieldView != null || !Settings.canDrawOverlays(ctx)) return
+        runCatching {
+            val v = View(ctx).apply { setBackgroundColor(Color.TRANSPARENT) }
+            val lp = overlayLp(shieldRect, touchable = false).apply { title = "PortalHA keep-alive tap shield" }
+            v.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> registerShield(view) }
+            wm.addView(v, lp)
+            shieldView = v; shieldLp = lp
+            Log.i(TAG, "keepalive: corner tap shield window at ${shieldRect.toShortString()}")
+        }.onFailure { Log.w(TAG, "keepalive: tap shield window failed: ${it.message}") }
+    }
+
+    /** Keep the shield over the current corner (rotation / size change). */
+    private fun updateShieldGeometry() {
+        val v = shieldView ?: return
+        val lp = shieldLp ?: return
+        if (lp.x == shieldRect.left && lp.y == shieldRect.top && lp.width == shieldRect.width() && lp.height == shieldRect.height()) return
+        lp.x = shieldRect.left; lp.y = shieldRect.top; lp.width = shieldRect.width(); lp.height = shieldRect.height()
+        runCatching { wm.updateViewLayout(v, lp) }
+    }
+
+    /**
+     * Register the shield's whole window as tap-excluded (IWindowSession.updateTapExcludeRegion, hidden
+     * API, reachable because the fleet's provisioning sets hidden_api_policy=1; if it isn't reachable the
+     * failure is logged and the status line says shield=none). Android 10 takes a Region in WINDOW
+     * coordinates.
+     */
+    private fun registerShield(view: View) {
+        val w = view.width; val h = view.height
+        if (w <= 0 || h <= 0) return
+        val key = "${shieldRect.left},${shieldRect.top}+${w}x$h"
+        if (key == shieldRegistered) return
+        val ok = runCatching {
+            val session = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowSession").invoke(null)
+                ?: error("no window session")
+            val token = view.windowToken ?: error("shield not attached")
+            val iWindowCls = Class.forName("android.view.IWindow")
+            val iWindow = Class.forName("android.view.IWindow\$Stub")
+                .getMethod("asInterface", android.os.IBinder::class.java).invoke(null, token)
+            val sessionCls = Class.forName("android.view.IWindowSession")
+            sessionCls.getMethod("updateTapExcludeRegion", iWindowCls, Int::class.javaPrimitiveType, android.graphics.Region::class.java)
+                .invoke(session, iWindow, SHIELD_REGION_ID, android.graphics.Region(0, 0, w, h))
+            true
+        }.onFailure { Log.w(TAG, "keepalive: tap shield registration failed: ${it.javaClass.simpleName}: ${it.message}") }
+            .getOrDefault(false)
+        if (ok) {
+            shieldRegistered = key
+            Log.i(TAG, "keepalive: corner tap shield registered at $key (resize margin ${dp(RESIZE_MARGIN_DP)}px)")
+        }
     }
 
     private fun removeCoverWindows() {
         coverView?.let { v -> runCatching { wm.removeView(v) } }
         guardView?.let { v -> runCatching { wm.removeView(v) } }
+        shieldView?.let { v -> runCatching { wm.removeView(v) } }
         coverView = null; guardView = null; coverLp = null; guardLp = null; coverShown = false
+        shieldView = null; shieldLp = null; shieldRegistered = ""
     }
 
     // Freeform not confirmed yet counts: a parked sliver may already be on screen (harmless if not -
@@ -794,6 +883,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val v = coverView ?: return
         coverShown = show
         launchBounds()   // keep the geometry current
+        updateShieldGeometry()
         coverLp?.let { lp ->
             if (lp.x != coverRect.left || lp.y != coverRect.top || lp.width != coverRect.width() || lp.height != coverRect.height()) {
                 lp.x = coverRect.left; lp.y = coverRect.top; lp.width = coverRect.width(); lp.height = coverRect.height()
