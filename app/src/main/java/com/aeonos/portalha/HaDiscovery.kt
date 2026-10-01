@@ -98,10 +98,13 @@ object HaDiscovery {
 
     fun rgbStateTopic(deviceId: String) = "portal/$deviceId/sensor/rgb"
 
+    // Guarded template: an older build (or a dark-room NaN/Infinity reading) could publish a payload
+    // that isn't valid JSON for HA's parser -> "'value_json' is undefined" every ~30 s all night.
+    // Valid JSON = unchanged behaviour; anything else keeps the last numeric state.
     fun rgbConfigPayload(deviceId: String, deviceName: String, channel: String): String {
         val name = deviceName.escape()
         val label = channel.uppercase()
-        return """{"name":"Light $label","unique_id":"${deviceId}_rgb_$channel","device":${device(deviceId, name)},"state_topic":"${rgbStateTopic(deviceId)}","value_template":"{{ value_json.$channel }}","unit_of_measurement":"lx","state_class":"measurement","icon":"mdi:palette"}"""
+        return """{"name":"Light $label","unique_id":"${deviceId}_rgb_$channel","device":${device(deviceId, name)},"state_topic":"${rgbStateTopic(deviceId)}","value_template":"{{ value_json.$channel if value_json is defined else (this.state if is_number(this.state) else none) }}","unit_of_measurement":"lx","state_class":"measurement","icon":"mdi:palette"}"""
     }
 
     // ── Tap / slap direction ──────────────────────────────────────────────────

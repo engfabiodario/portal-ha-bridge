@@ -215,6 +215,10 @@ class SensorBridge(
     }
 
     private fun handleRgb(event: SensorEvent) {
+        // The tcs34x0 driver can report NaN/Infinity in the dark; "%.1f" turns those into
+        // NaN/Infinity, which isn't JSON (HA logged a template error per channel every ~30 s
+        // all night). Skip such readings - the last published values stay in HA.
+        for (i in 0..2) if (!event.values.getOrElse(i) { 0f }.isFinite()) return
         for (i in 0..2) rgb[i] = event.values.getOrElse(i) { 0f }
         rgbGate.offer()
     }
