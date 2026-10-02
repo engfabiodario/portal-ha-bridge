@@ -205,6 +205,13 @@ class BridgeService : Service() {
         // installed — we never rely on its "launch an app at boot" setting, which on Immortal
         // is self-defeating anyway.
         private val BOOT_FRONT_DELAYS_MS = longArrayOf(4_000L, 12_000L, 25_000L, 45_000L, 70_000L)
+        // After a sticky restart (process death). Each attempt is a no-op once the dashboard is back.
+        private val RESTART_FRONT_DELAYS_MS = longArrayOf(5_000L, 15_000L, 40_000L, 90_000L)
+        // Window owners that don't mean "someone chose another app": the home launcher, system UI,
+        // Ava's parked keep-alive sliver.
+        private val RESTART_FRONT_NEUTRAL_PKGS = setOf(
+            "com.immortal.launcher", "com.android.systemui", "android", "com.example.ava",
+        )
         private const val ACTION_APPLY_INTERCOM = "com.aeonos.portalha.APPLY_INTERCOM"
         private const val ACTION_TWOWAY_TEST = "com.aeonos.portalha.TWOWAY_TEST"
         private const val EXTRA_TWOWAY_ON = "two_way_on"
@@ -1161,6 +1168,11 @@ class BridgeService : Service() {
             (prefs ?: Prefs(this).also { prefs = it }).wakeCoverStyle = style
             Log.i(TAG, "wake: cover style set to '$style'")
         }
+        // START_STICKY restart: the app process died (the RTSP OutOfMemoryError of 2026-10-01) and
+        // Android restarted only this service, with a null intent. Nothing brought the dashboard
+        // back (Office 19:19: no resumed activity, no camera, RTSP not listening until it was
+        // started by hand), so do what the boot path does - our own DashboardActivity only.
+        if (intent == null) scheduleRestartFront()
         if (intent?.action == ACTION_BOOTED) {
             val p = prefs ?: Prefs(this).also { prefs = it }
             if (p.startOnBoot) {
@@ -1967,6 +1979,10 @@ class BridgeService : Service() {
                 }
                 intent.getStringExtra("selfHealTest")?.let { selfHeal?.setTest(it) }
                 if (intent.getBooleanExtra("selfHealTick", false)) selfHeal?.tickNow()
+                //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
+                if (intent.getBooleanExtra("rtspStatus", false)) {
+                    Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
+                }
                 if (intent.getBooleanExtra("selfHealStatus", false)) {
                     Log.i("SelfHeal", selfHeal?.status() ?: "status n/a (service starting)")
                 }
@@ -2501,6 +2517,19 @@ class BridgeService : Service() {
                 }
             }
             return "restarted the RTSP streamer"
+        }
+
+        override fun rtspClientsReceiving(): Boolean? {
+            val r = rtspStreamer ?: return null
+            if (!r.isStreaming) return null
+            return r.clientsReceiving(30_000L)
+        }
+
+        override fun rtspEvictStalled(): String {
+            val r = rtspStreamer ?: return ""
+            val n = r.evictStalledClients(30_000L, "self-heal: no data for 30 s")
+            Log.w(TAG, "rtsp: self-heal evicted $n stalled client(s); ${r.rtspStatus()}")
+            return if (n > 0) "evicted $n stalled RTSP client(s)" else "no stalled RTSP client to evict"
         }
 
         override fun webviewProbe(timeoutMs: Long): Boolean? {
@@ -3686,6 +3715,35 @@ class BridgeService : Service() {
             lastActivityMs = System.currentTimeMillis()
             bringDashboardToFront()
         }
+    }
+
+    private fun scheduleRestartFront() {
+        val p = prefs ?: Prefs(this).also { prefs = it }
+        if (!p.startOnBoot) {
+            Log.i(TAG, "restart: service restarted by Android - dashboard left alone (start on boot is off)")
+            return
+        }
+        Log.i(TAG, "restart: service restarted by Android after the app process died - the dashboard comes back unless something else is in front")
+        RESTART_FRONT_DELAYS_MS.forEach { d -> wakeHandler.postDelayed({ restartFrontAttempt(d) }, d) }
+    }
+
+    private fun restartFrontAttempt(delayMs: Long) {
+        if (DashboardActivity.alive()) return            // back already (or never gone)
+        val fg = foregroundPkg
+        val why = when {
+            getSystemService(PowerManager::class.java)?.isInteractive != true -> "screen off"
+            inCall || ringing -> "a call"
+            TvAppActivity.isShowing() -> "a cast is showing"
+            keepAlive?.isPaused() == true -> "the Ava keep-alive is paused (a setup is running)"
+            fg != null && fg != packageName && fg !in RESTART_FRONT_NEUTRAL_PKGS -> "another app is in front ($fg)"
+            else -> null
+        }
+        if (why != null) {
+            Log.i(TAG, "restart: dashboard not brought back at +${delayMs / 1000}s ($why)")
+            return
+        }
+        Log.i(TAG, "restart: bringing the dashboard back (+${delayMs / 1000}s after the service restart)")
+        bringDashboardToFront()
     }
 
     private fun bringDashboardToFront() {

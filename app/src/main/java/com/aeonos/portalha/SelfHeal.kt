@@ -20,6 +20,9 @@ import java.util.Locale
  *
  *  - mqtt      the broker client is disconnected on 2 ticks         -> the app's MQTT reconnect
  *  - stream    RTSP wanted but the encoder produced no frame for 2 ticks -> the streamer's own restart
+ *  - rtspclients  RTSP clients are PLAYing but none of them received data in the last 30 s, on 2
+ *              ticks (a dead client starving the rest, 2026-10-01) -> evict the stalled clients
+ *              (the server's own 12 s watchdog normally does this first)
  *  - webview   the dashboard doesn't answer a trivial evaluateJavascript in 10 s on 2 ticks
  *              -> reload the current start page
  *  - keepalive the Ava keep-alive is on but not parked             -> the keep-alive's own re-park
@@ -50,6 +53,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** null = stream not wanted (camera/stream off by the user) or not judgeable yet; else ms since the last encoded frame. */
         fun streamFrameAgeMs(): Long?
         fun streamRestart(): String
+        /** null = no PLAYing RTSP client (n/a); true = at least one received data recently; false = none did. */
+        fun rtspClientsReceiving(): Boolean? = null
+        fun rtspEvictStalled(): String = ""
         /** null = no dashboard to probe (not in front, screen off); else true when it answered in [timeoutMs]. Blocking. */
         fun webviewProbe(timeoutMs: Long): Boolean?
         fun webviewReload(): String
@@ -59,7 +65,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         fun publish(state: String, attributesJson: String)
     }
 
-    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi") }
+    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), RTSPCLIENTS("rtspclients"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi") }
 
     private class CheckState {
         var last = "unknown"     // ok / bad: <why> / n/a: <why>
@@ -159,6 +165,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         judge(Check.WIFI, wifi)
         judge(Check.MQTT, evalMqtt(), skipActionWhy = if (wifiDown) "the Wi-Fi link is down" else null)
         judge(Check.STREAM, evalStream())
+        judge(Check.RTSPCLIENTS, evalRtspClients())
         judge(Check.WEBVIEW, evalWebview(), skipActionWhy = if (wifiDown) "the Wi-Fi link is down" else null)
         judge(Check.KEEPALIVE, evalKeepAlive())
 
@@ -199,6 +206,15 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         if (faked(Check.STREAM)) return "bad: test (selfHealTest stream)"
         val age = runCatching { host.streamFrameAgeMs() }.getOrNull() ?: return "n/a: stream off or just started"
         return if (age <= STREAM_STALE_MS) "ok" else "bad: no camera frames for ${if (age == Long.MAX_VALUE) "ever" else "${age / 1000}s"}"
+    }
+
+    private fun evalRtspClients(): String {
+        if (faked(Check.RTSPCLIENTS)) return "bad: test (selfHealTest rtspclients)"
+        return when (runCatching { host.rtspClientsReceiving() }.getOrNull()) {
+            null -> "n/a: no RTSP client playing"
+            true -> "ok"
+            false -> "bad: RTSP clients connected but none receiving"
+        }
     }
 
     private fun evalWebview(): String {
@@ -249,6 +265,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             when (c) {
                 Check.MQTT -> host.mqttReconnect()
                 Check.STREAM -> host.streamRestart()
+                Check.RTSPCLIENTS -> host.rtspEvictStalled()
                 Check.WEBVIEW -> host.webviewReload()
                 Check.KEEPALIVE -> host.keepAliveRepark()
                 Check.WIFI -> wifiAction(s)

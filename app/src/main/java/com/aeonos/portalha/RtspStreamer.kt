@@ -7,7 +7,8 @@ import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.util.sources.audio.NoAudioSource
 import com.pedro.library.util.sources.video.Camera2Source
-import com.pedro.rtspserver.RtspServerStream
+import com.aeonos.portalha.rtspserver.FleetRtspServerStream
+import com.aeonos.portalha.rtspserver.IpType
 
 // Headless camera -> H.264 (+ optional AAC) -> RTSP server. RtspServerStream is
 // the source-based (no preview view) variant, so it runs in our background
@@ -17,7 +18,7 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
 
     companion object { private const val TAG = "PortalHA" }
 
-    private var stream: RtspServerStream? = null
+    private var stream: FleetRtspServerStream? = null
     @Volatile var isStreaming = false
         private set
     // Fired when the stream is fatally dead while isStreaming is still true —
@@ -72,6 +73,15 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     private var baseBitrate = 2_000_000
     private var baseAudio = true
 
+    /** One line for adb rtspStatus / logs: the server's clients, their progress and evictions. */
+    fun rtspStatus(): String = stream?.rtspServer?.status() ?: "rtsp: status server not running"
+
+    /** null = no PLAYing client; true = one got data within [withinMs]; false = none did (SelfHeal). */
+    fun clientsReceiving(withinMs: Long): Boolean? = stream?.rtspServer?.anyReceiving(withinMs)
+
+    /** Evicts PLAYing clients that received nothing for [olderThanMs]; returns how many. */
+    fun evictStalledClients(olderThanMs: Long, why: String): Int = stream?.rtspServer?.evictStalled(olderThanMs, why) ?: 0
+
     fun url() = "rtsp://${BridgeService.localIp() ?: "0.0.0.0"}:$port/"
 
     private fun currentRotation(): Int = (((rotationOffset + autoRotation) % 360) + 360) % 360
@@ -92,7 +102,11 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // called to satisfy startStream() — an empty AAC track in the SDP.
             val audio = if (withAudio) MicTapSource().also { micTap = it }
                         else NoAudioSource()
-            val s = RtspServerStream(context, port, this, video, audio)
+            // Fleet RTSP server (rtspserver/): RTSP-Server 1.3.0 vendored with per-client write locks,
+            // bounded per-client queues, a 12 s stalled-client watchdog and a 6-client cap. The
+            // library's global send lock let ONE dead client (peer gone without FIN) freeze every
+            // client for ~15 min and its 10 MB-per-client queues ended in OutOfMemoryError.
+            val s = FleetRtspServerStream(context, port, this, video, audio)
             // Kill the library's per-packet logging ("BaseRtpSocket: wrote packet…",
             // ~150 lines/s with a UDP client like go2rtc attached) — it floods the
             // device log so hard that chatty prunes OUR diagnostics away.
@@ -101,7 +115,7 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // SETUP/PLAY to that Content-Base. Left on All it picked the Portal's IPv6 ULA
             // (fd4f:...), so every client that can't route IPv6 (Frigate's laptop after it moved to
             // Ethernet, 2026-10-01) hung at SETUP: all Portal cameras at 0 fps. IPv4 only.
-            s.getStreamClient().forceIpType(com.pedro.rtspserver.server.IpType.IPv4)
+            s.getStreamClient().forceIpType(IpType.IPv4)
             stream = s
             lastFrameElapsed = 0L
             startedElapsed = android.os.SystemClock.elapsedRealtime()

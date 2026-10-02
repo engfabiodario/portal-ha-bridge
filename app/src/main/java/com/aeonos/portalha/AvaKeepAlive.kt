@@ -255,6 +255,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         return if (u == 0L) 0L else ((u - System.currentTimeMillis()).coerceAtLeast(0L) + 999L) / 1000L
     }
 
+    /** A timed pause is running (Setup-Ava is working in Ava's UI). */
+    fun isPaused(): Boolean = pauseLeftSec() > 0L
+
     /** One line for logs / Setup-Ava: what the keep-alive is doing right now. */
     fun status(): String {
         val now = SystemClock.elapsedRealtime()

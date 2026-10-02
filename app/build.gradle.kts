@@ -91,8 +91,11 @@ dependencies {
 
     // RTSP server (headless RtspServerStream). Kotlin-2.0-era versions so they
     // build cleanly under our Kotlin 2.0.20 — no metadata hacks.
-    implementation("com.github.pedroSG94:RTSP-Server:1.3.0")
+    // RTSP-Server 1.3.0 is VENDORED (app/.../rtspserver/, fixed: per-client send locks, bounded
+    // per-client queues, stalled-client watchdog) - its global send lock let one dead client freeze
+    // every client and OOM the app (2026-10-01). Only RootEncoder is a dependency now.
     implementation("com.github.pedroSG94.RootEncoder:library:2.4.6")
+    implementation("com.github.pedroSG94.RootEncoder:rtsp:2.4.6")
 
     // On-device wake word ("hey jarvis") — Vosk speech recognizer with a grammar
     // limited to the wake phrase. Keyless/offline; the phrase is a config string, so
