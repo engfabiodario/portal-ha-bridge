@@ -159,9 +159,9 @@ class TvAppActivity : Activity() {
         private const val WATCH_JS = """
 (function(){
  if (window.__phaW) return;
- var W = window.__phaW = {off:0, mode:'idle', video:'', pos:0, at:0, calib:0, lead:40, seekLead:0.3,
+ var W = window.__phaW = {off:0, mode:'idle', video:'', pos:0, at:0, calib:0, lead:800, seekLead:0.3,
    lastKey:0, lastRep:0, pauseAt:0, settleAt:0, fix:'', seeks:0};
- try { var L = JSON.parse(localStorage.getItem('__phaWlearn')||'{}'); if (L.lead) W.lead=L.lead; if (L.seekLead) W.seekLead=L.seekLead; } catch(e){}
+ try { var L = JSON.parse(localStorage.getItem('__phaWlearn')||'{}'); if (L.lead) { W.lead=L.lead; W.leadN=1; } if (L.seekLead!=null) W.seekLead=L.seekLead; } catch(e){}
  function save(){ try{ localStorage.setItem('__phaWlearn', JSON.stringify({lead:W.lead, seekLead:W.seekLead})); }catch(e){} }
  function now(){ return Date.now() + W.off; }
  function P(){ return document.querySelector('.html5-video-player'); }
@@ -199,7 +199,7 @@ class TvAppActivity : Activity() {
     var wait = W.at - W.lead - n;
     if (wait > 4) return Math.min(wait-2, 50);
     if (wait > 0) { var until=Date.now()+wait; while(Date.now()<until){} }
-    p.playVideo(); W.mode='playing'; W.settleAt = n + 1500; W.fix='start'; rep('playing'); return 250;
+    p.playVideo(); W.mode='playing'; W.settleAt = n + 2500; W.playCall = n; W.startPos = v.currentTime; W.advWatch = true; rep('playing'); return 50;
   }
   if (W.mode==='paused') return null;
   if (W.mode==='playing') {
@@ -208,16 +208,22 @@ class TvAppActivity : Activity() {
     if (W.pauseAt && n >= W.pauseAt - 2) { p.pauseVideo(); v.playbackRate=1; W.mode='paused'; W.pauseAt=0; rep('paused'); return null; }
     if (W.pauseAt && W.pauseAt - n < 250) return Math.max(1, W.pauseAt - n - 2);
     if (v.paused && !v.seeking && v.readyState>=3) p.playVideo();
-    if (v.readyState < 3 || v.seeking) return 200;
+    if (W.advWatch && v.currentTime > W.startPos + 0.05) {
+      // The leanback player needs ~0.8 s from playVideo() to moving frames (measured on Mudroom): learn
+      // this Portal's real start latency from the first advance, back-extrapolated, and start that early next time.
+      var lat = (n - (v.currentTime - W.startPos)*1000) - W.playCall;
+      if (lat > 0 && lat < 3000) { W.lead = W.leadN ? Math.round(0.6*W.lead + 0.4*lat) : Math.round(lat); W.leadN = 1; save(); }
+      W.advWatch = false;
+    }
+    if (v.readyState < 3 || v.seeking) return 100;
     var target = W.pos + (n - W.at)/1000 + W.calib/1000;
     var err = v.currentTime - target;               // + = this Portal is ahead
-    if (n < W.settleAt) return 100;
+    if (n < W.settleAt) return W.advWatch ? 50 : 100;
     if (W.fix) {                                    // learn from the first settled error after a start / seek
-      if (W.fix==='start' && Math.abs(err) < 0.3) { W.lead = Math.max(0, Math.min(400, Math.round(W.lead + err*1000))); save(); }
-      if (W.fix==='seek' && Math.abs(err) < 1.0) { W.seekLead = Math.max(0, Math.min(1.5, W.seekLead - err)); save(); }
+      if (W.fix==='seek' && Math.abs(err) < 1.0) { W.seekLead = Math.max(0, Math.min(1.5, W.seekLead - 0.5*err)); save(); }
       W.fix='';
     }
-    if (Math.abs(err) > 0.5) { p.seekTo(target + W.seekLead, true); v.playbackRate=1; W.seeks++; W.settleAt = n + 1200; W.fix='seek'; rep('playing',{err:Math.round(err*1000), seek:1}); return 300; }
+    if (Math.abs(err) > 0.5) { p.seekTo(target + W.seekLead, true); v.playbackRate=1; W.seeks++; W.settleAt = n + 1500; W.fix='seek'; rep('playing',{err:Math.round(err*1000), seek:1}); return 300; }
     var lim = Math.abs(err) > 0.1 ? 0.06 : 0.03;
     var r = Math.abs(err) < 0.010 ? 1 : 1 - Math.max(-lim, Math.min(lim, err/1.5));
     if (Math.abs(v.playbackRate - r) > 0.002) v.playbackRate = r;
