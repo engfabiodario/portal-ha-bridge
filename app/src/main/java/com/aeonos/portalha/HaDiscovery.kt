@@ -320,6 +320,15 @@ object HaDiscovery {
         return """{"name":"YouTube Close","unique_id":"${deviceId}_youtube_close","device":${device(deviceId, name)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"close","icon":"mdi:youtube-tv"}"""
     }
 
+    // Watch together (WatchTogether): one fleet command topic, this Portal's state sensor.
+    fun watchStateTopic(deviceId: String) = "portal/$deviceId/watch/state"
+    fun watchAttributesTopic(deviceId: String) = "portal/$deviceId/watch/attributes"
+    fun watchSensorDiscoveryTopic(deviceId: String) = "homeassistant/sensor/${deviceId}_watch_together/config"
+    fun watchSensorConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Watch Together","unique_id":"${deviceId}_watch_together","device":${device(deviceId, name)},"state_topic":"${watchStateTopic(deviceId)}","json_attributes_topic":"${watchAttributesTopic(deviceId)}","icon":"mdi:youtube-subscription"}"""
+    }
+
     fun youtubeSensorConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
         return """{"name":"YouTube","unique_id":"${deviceId}_youtube_showing","device":${device(deviceId, name)},"state_topic":"${youtubeStateTopic(deviceId)}","json_attributes_topic":"${youtubeAttributesTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:youtube"}"""

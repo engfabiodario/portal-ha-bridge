@@ -266,6 +266,11 @@ class BridgeService : Service() {
         // next to it (allowed, see keepAliveHost.parkBlocker) and its corner cover now copies that screen.
         fun youtubeInFront() { instance?.keepAlive?.onFrontScreenChanged("youtube in front") }
 
+        // Watch together: the page engine's report / a member's pad play-pause / the screen closing.
+        fun watchReport(json: String) { instance?.watch?.onPageReport(json) }
+        fun watchPadToggle(): Boolean { val w = instance?.watch ?: return false; if (!w.active) return false; w.padToggle(); return true }
+        fun watchScreenClosed() { instance?.watch?.onScreenClosed() }
+
         // The YouTube screen's content moved (a pad key, the pad shown/hidden): re-copy the corner cover.
         fun youtubeFrontChanged() { instance?.keepAlive?.refreshCoverSoon() }
 
@@ -2014,6 +2019,18 @@ class BridgeService : Service() {
                     if (!TvAppActivity.pressKey(k)) Log.i(TAG, "youtube: key '$k' ignored - not showing")
                 }
                 if (intent.getBooleanExtra("youtubeStatus", false)) Log.i(TAG, TvAppActivity.status())
+                // Watch together:
+                //   --es watch '<json>'           a command as if from MQTT portal/watch/set (local only)
+                //   --ei watchCalibrationMs N     this Portal's audio-latency calibration (+ = later)
+                //   --ez watchStatus true         logs one "watch: ..." line (session, state, clock)
+                //   --es syncClock <host>         one SNTP burst now against <host> (logs the result)
+                intent.getStringExtra("watch")?.let { j -> wakeHandler.post { watch.handle(j) } }
+                if (intent.hasExtra("watchCalibrationMs")) {
+                    p.watchCalibrationMs = intent.getIntExtra("watchCalibrationMs", 0)
+                    Log.i(TAG, "config: watch calibration ${p.watchCalibrationMs} ms")
+                }
+                if (intent.getBooleanExtra("watchStatus", false)) Log.i(TAG, watch.status())
+                intent.getStringExtra("syncClock")?.let { h -> Thread { SyncClock.syncBlocking(h); Log.i(TAG, SyncClock.status()) }.start() }
                 //   --es youtubeTouch touch|native|pad  how touches drive the YouTube screen (kept; applies at once)
                 intent.getStringExtra("youtubeTouch")?.let { m ->
                     p.youtubeTouch = m
@@ -2252,7 +2269,9 @@ class BridgeService : Service() {
             HaDiscovery.npOverlayCommandTopic(p.deviceId),
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId),
             HaDiscovery.selfHealCommandTopic(p.deviceId),
-            HaDiscovery.youtubeCommandTopic(p.deviceId)
+            HaDiscovery.youtubeCommandTopic(p.deviceId),
+            // Watch together: shared by every Portal (never purged or retained).
+            WatchTogether.TOPIC
         ).forEach { client.subscribe(it, 1) }
 
         // Intercom: subscribe to presence/lock/audio and announce ourselves.
@@ -2393,6 +2412,8 @@ class BridgeService : Service() {
         pub(HaDiscovery.youtubeCloseDiscoveryTopic(p.deviceId), HaDiscovery.youtubeCloseConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.youtubeSensorDiscoveryTopic(p.deviceId), HaDiscovery.youtubeSensorConfigPayload(p.deviceId, p.deviceName))
         publishYoutubeState(p)
+        pub(HaDiscovery.watchSensorDiscoveryTopic(p.deviceId), HaDiscovery.watchSensorConfigPayload(p.deviceId, p.deviceName))
+        watch.republish()
 
         // Camera, motion-enable and streaming-enable switches exist only while
         // the camera service is enabled; motion entities additionally require
@@ -2489,6 +2510,7 @@ class BridgeService : Service() {
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId)      -> handleAvaKeepAliveCommand(payload, p)
             HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
+            WatchTogether.TOPIC                                   -> watch.handle(payload)
         }
     }
 
@@ -4482,6 +4504,24 @@ class BridgeService : Service() {
         }
     }
 
+    // -- Watch together (WatchTogether + SyncClock) ------------------------------------
+    val watch: WatchTogether by lazy {
+        WatchTogether(object : WatchTogether.Host {
+            override val slug: String get() = WatchTogether.slugOf(prefs?.deviceName ?: "")
+            override val calibrationMs: Int get() = prefs?.watchCalibrationMs ?: 0
+            override fun publishFleet(json: String) { commandExecutor.submit { publishRaw(WatchTogether.TOPIC, json, 1) } }
+            override fun publishState(state: String, attrs: org.json.JSONObject) {
+                val p = prefs ?: return
+                commandExecutor.submit {
+                    publishRaw(HaDiscovery.watchStateTopic(p.deviceId), state, 1, retained = true)
+                    publishRaw(HaDiscovery.watchAttributesTopic(p.deviceId), attrs.toString(), 1, retained = true)
+                }
+            }
+            override fun openYouTube() = this@BridgeService.openYouTube("watch together")
+            override fun closeYouTube(why: String) = this@BridgeService.closeYouTube(why)
+        })
+    }
+
     private fun closeYouTube(why: String) {
         if (!TvAppActivity.isShowing()) { Log.i(TAG, "youtube: close ($why) - not showing"); publishYoutubeStateAsync(); return }
         dialServer?.appRunning = false
@@ -4495,7 +4535,7 @@ class BridgeService : Service() {
         publishRaw(HaDiscovery.youtubeStateTopic(p.deviceId), if (showing) "ON" else "OFF", 1, retained = true)
         val attrs = org.json.JSONObject()
             .put("mode", TvAppActivity.mode().ifEmpty { "none" })
-            .put("playing", TvAppActivity.isPlayingVideo())
+            .put("playing", TvAppActivity.isReallyPlaying())
             .put("video", TvAppActivity.videoId())
         publishRaw(HaDiscovery.youtubeAttributesTopic(p.deviceId), attrs.toString(), 1, retained = true)
     }

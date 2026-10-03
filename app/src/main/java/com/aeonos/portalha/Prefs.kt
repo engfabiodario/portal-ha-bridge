@@ -363,6 +363,12 @@ class Prefs(private val context: Context) {
         get() = sp.getLong("keep_alive_paused_until", 0L)
         set(v) = sp.edit().putLong("keep_alive_paused_until", v.coerceAtLeast(0L)).apply()
 
+    // Watch together: this Portal's audio-latency calibration (ms, + = play later). Per model, measured
+    // once by ear / phone recording (manual step); adb DEBUG_CONFIG --ei watchCalibrationMs N.
+    var watchCalibrationMs: Int
+        get() = sp.getInt("watch_calibration_ms", 0)
+        set(v) = sp.edit().putInt("watch_calibration_ms", v.coerceIn(-500, 500)).apply()
+
     // YouTube screen (TvAppActivity) touch: "touch" = taps go to the page (youtube.com/tv takes them:
     // tap a tile = it opens) and swipes become D-pad moves (the page itself doesn't scroll by touch),
     // "native" = every touch to the page unchanged, "pad" = the page ignores touches, the on-screen D-pad

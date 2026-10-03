@@ -150,6 +150,104 @@ class TvAppActivity : Activity() {
             instance?.let { a -> a.runOnUiThread { a.touchMode = mode; a.applyTouchMode() } }
         }
 
+        /**
+         * Watch-together engine, injected into youtube.com/tv (see WatchTogether). Runs its own loop so the
+         * control timing doesn't depend on evaluateJavascript round trips. Server time = Date.now() + off
+         * (off pushed from SyncClock). Reports go to PortalWatch.report(json); a profile picker on a cold
+         * start gets the remote's OK (PortalWatch.key) - the focused tile is the last-used profile.
+         */
+        private const val WATCH_JS = """
+(function(){
+ if (window.__phaW) return;
+ var W = window.__phaW = {off:0, mode:'idle', video:'', pos:0, at:0, calib:0, lead:40, seekLead:0.3,
+   lastKey:0, lastRep:0, pauseAt:0, settleAt:0, fix:'', seeks:0};
+ try { var L = JSON.parse(localStorage.getItem('__phaWlearn')||'{}'); if (L.lead) W.lead=L.lead; if (L.seekLead) W.seekLead=L.seekLead; } catch(e){}
+ function save(){ try{ localStorage.setItem('__phaWlearn', JSON.stringify({lead:W.lead, seekLead:W.seekLead})); }catch(e){} }
+ function now(){ return Date.now() + W.off; }
+ function P(){ return document.querySelector('.html5-video-player'); }
+ function V(){ return document.querySelector('video'); }
+ function picker(){ var e=document.querySelector('ytlr-account-selector'); return !!(e && e.getBoundingClientRect().width>0); }
+ function curId(){ var m=(location.hash||'').match(/[?&]v=([A-Za-z0-9_-]+)/); return m?m[1]:''; }
+ function rep(state, extra){ try{ var v=V(); var o={state:state, t: v?Math.round(v.currentTime*1000)/1000:-1, rate: v?v.playbackRate:1, lead:W.lead, seekLead:W.seekLead, seeks:W.seeks};
+   for (var k in (extra||{})) o[k]=extra[k]; PortalWatch.report(JSON.stringify(o)); }catch(e){} }
+ function tick(){ clearTimeout(W.timer); var d; try { d = step(); } catch(e) { d = 500; } if (d!=null) W.timer=setTimeout(tick, d); }
+ W.kick = tick;
+ W.cue = function(video,pos){ W.mode='cue'; W.video=video; W.pos=pos; W.at=0; W.pauseAt=0; tick(); };
+ W.playAt = function(at,pos,calib){ W.mode='armed'; W.at=at; W.pos=pos; W.calib=calib||0; W.pauseAt=0; tick(); };
+ W.pauseAtT = function(at){ W.pauseAt=at; tick(); };
+ W.stop = function(){ W.mode='idle'; clearTimeout(W.timer); var v=V(); if(v) v.playbackRate=1; };
+ function step(){
+  var v=V(), p=P(), n=now();
+  if (W.mode==='idle') return null;
+  if (picker()) { if (Date.now()-W.lastKey>3000){ W.lastKey=Date.now(); PortalWatch.key('ok'); } rep('profile'); return 500; }
+  if (W.mode==='cue' || W.mode==='ready') {
+    if (curId()!==W.video) { location.hash='#/watch?v='+W.video; rep('loading'); return 800; }
+    if (!v || !p || v.readyState<1) { rep('loading'); return 400; }
+    if (!v.paused) p.pauseVideo();
+    if (Math.abs(v.currentTime-W.pos)>0.25) { if (!v.seeking) p.seekTo(W.pos,true); rep('loading'); return 500; }
+    if (v.readyState>=3 && v.paused) { if (W.mode!=='ready'){ W.mode='ready'; rep('ready'); } return 1000; }
+    rep('loading'); return 300;
+  }
+  if (W.mode==='armed') {
+    if (!v || !p) return 200;
+    if (curId()!==W.video) { location.hash='#/watch?v='+W.video; return 800; }
+    if (n < W.at - 500) {
+      if (!v.paused) p.pauseVideo();
+      if (Math.abs(v.currentTime-W.pos)>0.05 && !v.seeking) p.seekTo(W.pos,true);
+      return Math.max(20, Math.min(200, W.at-500-n));
+    }
+    var wait = W.at - W.lead - n;
+    if (wait > 4) return Math.min(wait-2, 50);
+    if (wait > 0) { var until=Date.now()+wait; while(Date.now()<until){} }
+    p.playVideo(); W.mode='playing'; W.settleAt = n + 1500; W.fix='start'; rep('playing'); return 250;
+  }
+  if (W.mode==='paused') return null;
+  if (W.mode==='playing') {
+    if (!v || !p) return 250;
+    if (v.ended) { W.mode='idle'; v.playbackRate=1; rep('ended'); return null; }
+    if (W.pauseAt && n >= W.pauseAt - 2) { p.pauseVideo(); v.playbackRate=1; W.mode='paused'; W.pauseAt=0; rep('paused'); return null; }
+    if (W.pauseAt && W.pauseAt - n < 250) return Math.max(1, W.pauseAt - n - 2);
+    if (v.paused && !v.seeking && v.readyState>=3) p.playVideo();
+    if (v.readyState < 3 || v.seeking) return 200;
+    var target = W.pos + (n - W.at)/1000 + W.calib/1000;
+    var err = v.currentTime - target;               // + = this Portal is ahead
+    if (n < W.settleAt) return 100;
+    if (W.fix) {                                    // learn from the first settled error after a start / seek
+      if (W.fix==='start' && Math.abs(err) < 0.3) { W.lead = Math.max(0, Math.min(400, Math.round(W.lead + err*1000))); save(); }
+      if (W.fix==='seek' && Math.abs(err) < 1.0) { W.seekLead = Math.max(0, Math.min(1.5, W.seekLead - err)); save(); }
+      W.fix='';
+    }
+    if (Math.abs(err) > 0.5) { p.seekTo(target + W.seekLead, true); v.playbackRate=1; W.seeks++; W.settleAt = n + 1200; W.fix='seek'; rep('playing',{err:Math.round(err*1000), seek:1}); return 300; }
+    var lim = Math.abs(err) > 0.1 ? 0.06 : 0.03;
+    var r = Math.abs(err) < 0.010 ? 1 : 1 - Math.max(-lim, Math.min(lim, err/1.5));
+    if (Math.abs(v.playbackRate - r) > 0.002) v.playbackRate = r;
+    if (Date.now()-W.lastRep > 2000) { W.lastRep=Date.now(); rep('playing',{err:Math.round(err*1000)}); }
+    return 250;
+  }
+  return 500;
+ }
+})();
+"""
+
+        // Watch-together calls arriving before the screen (or its page) is up wait here.
+        private val pendingWatch = ArrayList<String>()
+
+        private fun watchJs(call: String) {
+            val off = SyncClock.wallOffsetMs() ?: 0L
+            val js = "(function(){var W=window.__phaW;if(!W)return 0;W.off=$off;$call;return 1;})()"
+            val a = instance
+            if (a == null || !a.pageReady) { synchronized(pendingWatch) { pendingWatch.add(js) }; return }
+            a.runOnUiThread { a.runWatch(js) }
+        }
+
+        fun watchCue(video: String, pos: Double) = watchJs("W.cue('$video',$pos)")
+        fun watchPlayAt(at: Long, pos: Double, calibMs: Int) = watchJs("W.playAt($at,$pos,$calibMs)")
+        fun watchPauseAt(at: Long) = watchJs("W.pauseAtT($at)")
+        fun watchStop() { if (instance != null) watchJs("W.stop()") else synchronized(pendingWatch) { pendingWatch.clear() } }
+
+        /** A video actually seen playing (no launch grace) - HA's 'playing' attribute and the wake-word guard. */
+        fun isReallyPlaying(): Boolean = instance?.playingNow == true
+
         /** One status line (DEBUG_CONFIG --ez youtubeStatus true, and once a minute while showing). */
         fun status(): String = instance?.statusLine() ?: "youtube: status not showing"
 
@@ -193,6 +291,8 @@ class TvAppActivity : Activity() {
     @Volatile private var lastVideoId = ""
     @Volatile private var lastPoll = ""
     @Volatile private var playingNow = false
+    // The TV client finished loading at least once (the watch engine is injected then).
+    @Volatile private var pageReady = false
     private var lastStatusLogMs = 0L
     private var lastCookieFlushMs = 0L
 
@@ -244,6 +344,7 @@ class TvAppActivity : Activity() {
             CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         }
         webView.addJavascriptInterface(CastBridge(), "PortalCast")
+        webView.addJavascriptInterface(WatchBridge(), "PortalWatch")
         webView.isFocusable = true
         webView.isFocusableInTouchMode = true
 
@@ -258,7 +359,11 @@ class TvAppActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 view.evaluateJavascript(loungeShimJs(), null)
+                view.evaluateJavascript(WATCH_JS, null)
                 view.requestFocus()
+                pageReady = true
+                val queued = synchronized(pendingWatch) { ArrayList(pendingWatch).also { pendingWatch.clear() } }
+                queued.forEach { runWatch(it) }
             }
         }
 
@@ -369,6 +474,9 @@ class TvAppActivity : Activity() {
                 }
                 if (now - lastStatusLogMs >= STATUS_LOG_MS) { lastStatusLogMs = now; Log.i(TAG, statusLine()) }
                 if (now - lastCookieFlushMs >= COOKIE_FLUSH_MS) flushCookies()
+                SyncClock.wallOffsetMs()?.let { off ->
+                    webView.evaluateJavascript("(function(){var W=window.__phaW;if(W&&W.mode!=='idle'){W.off=$off;}})()", null)
+                }
                 val remoteGone = !standalone && remotes == 0 &&
                     now - lastRemoteSeenMs > DISCONNECT_GRACE_MS &&
                     now - lastPlayingMs > DISCONNECT_GRACE_MS
@@ -630,7 +738,7 @@ class TvAppActivity : Activity() {
             "close" -> { exitToDashboard("closed on the pad"); return }
             else -> { Log.w(TAG, "youtube: unknown pad key '$key'"); return }
         }
-        if (code == -1) { playPause(); return }
+        if (code == -1) { if (!BridgeService.watchPadToggle()) playPause(); return }
         sendKey(code)
         BridgeService.youtubeFrontChanged()
     }
@@ -657,6 +765,21 @@ class TvAppActivity : Activity() {
                 }
             }, 700L)
         }
+    }
+
+    /** Run a watch-together call, injecting the engine first if the page was replaced since. */
+    private fun runWatch(js: String) {
+        webView.evaluateJavascript(WATCH_JS, null)
+        webView.evaluateJavascript(js, null)
+    }
+
+    // The watch-together engine's reports and its one native need (the remote's OK on a profile picker).
+    inner class WatchBridge {
+        @JavascriptInterface
+        fun report(json: String) { BridgeService.watchReport(json) }
+
+        @JavascriptInterface
+        fun key(name: String) { runOnUiThread { padKey(name) } }
     }
 
     // Fed by the JS shim below with the number of connected remotes each time
@@ -745,6 +868,7 @@ class TvAppActivity : Activity() {
         handler.removeCallbacks(padHide)
         flushCookies()
         BridgeService.castScreenClosed()
+        BridgeService.watchScreenClosed()
         BridgeService.youtubeStateChanged()
         webView.destroy()
         super.onDestroy()
