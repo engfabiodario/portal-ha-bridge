@@ -921,6 +921,14 @@ class BridgeService : Service() {
     private val isAloha = android.os.Build.DEVICE.equals("aloha", true)
     private val isCipher = android.os.Build.DEVICE.equals("cipher", true)
     private val orientationApply = Runnable { commitDeviceOrientation() }
+    // Fleet (aloha): stream rotation = streamRotation (landscape base) + the DISPLAY rotation.
+    // The Portal+ camera sits in the pivoting screen, so a portrait screen (display rotation 1)
+    // needs the stream turned too (Office, 2026-10-03: faces arrived sideways in Frigate).
+    // aloha encodes 720x720, so the output size never changes - only the picture turns.
+    // Debounced; one RTSP restart (= a normal reconnect for Frigate) per settled change.
+    private val displayRotateApply = Runnable { commitDisplayRotation("display change") }
+    private var displayRotationListener: android.hardware.display.DisplayManager.DisplayListener? = null
+    @Volatile private var lastDisplayRotation = -1
     private val orientationListener by lazy {
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(deg: Int) {
@@ -1116,7 +1124,10 @@ class BridgeService : Service() {
         reconcileOsTimeout(p)
         timeoutHandler.post(timeoutRunnable)
 
-        if (p.cameraServiceEnabled && (isAloha || isCipher)) {
+        if (p.cameraServiceEnabled && isAloha) {
+            registerDisplayRotationWatch()
+            Log.i(TAG, "orientation: aloha stream follows the display rotation (auto=${p.streamAutoRotate}, base=${p.streamRotation})")
+        } else if (p.cameraServiceEnabled && isCipher) {
             Log.i(TAG, "orientation auto-rotate disabled (Portal+ camera is fixed; uses streamRotation)")
         } else if (p.cameraServiceEnabled && orientationListener.canDetectOrientation()) {
             orientationListener.enable()
@@ -1315,6 +1326,11 @@ class BridgeService : Service() {
         cameraStream?.release()
         rtspStreamer?.stop()
         runCatching { orientationListener.disable() }
+        displayRotationListener?.let { l ->
+            runCatching { getSystemService(android.hardware.display.DisplayManager::class.java).unregisterDisplayListener(l) }
+            displayRotationListener = null
+        }
+        timeoutHandler.removeCallbacks(displayRotateApply)
         runCatching { getSystemService(CameraManager::class.java).unregisterAvailabilityCallback(cameraAvailabilityCallback) }
         mediaKeepAlive.stop()
         presenceMonitor?.release()
@@ -1999,6 +2015,29 @@ class BridgeService : Service() {
                 }
                 intent.getStringExtra("selfHealTest")?.let { selfHeal?.setTest(it) }
                 if (intent.getBooleanExtra("selfHealTick", false)) selfHeal?.tickNow()
+                // Stream rotation (fleet):
+                //   --ei streamRotation 0|90|180|270   the landscape base (= the Rotate Stream button)
+                //   --ez streamAutoRotate true|false   aloha: add the display rotation on top (default true)
+                //   --ei streamAutoRotateSign 1|-1     direction of that delta (calibration)
+                //   --ez rotationStatus true           logs one "rotation: status ..." line
+                if (intent.hasExtra("streamRotation") || intent.hasExtra("streamAutoRotate") || intent.hasExtra("streamAutoRotateSign")) {
+                    if (intent.hasExtra("streamRotation"))
+                        p.streamRotation = ((intent.getIntExtra("streamRotation", 0) / 90 * 90) % 360 + 360) % 360
+                    if (intent.hasExtra("streamAutoRotate")) p.streamAutoRotate = intent.getBooleanExtra("streamAutoRotate", true)
+                    if (intent.hasExtra("streamAutoRotateSign")) p.streamAutoRotateSign = intent.getIntExtra("streamAutoRotateSign", 1)
+                    commandExecutor.submit {
+                        cameraStream?.rotation = p.streamRotation
+                        rtspStreamer?.let { r ->
+                            val auto = if (isAloha) displayAutoRotation(p) else r.autoRotation
+                            if (r.rotationOffset != p.streamRotation || r.autoRotation != auto) {
+                                r.rotationOffset = p.streamRotation; r.autoRotation = auto
+                                if (r.isStreaming) { r.restart(); noteRtspStarted() }
+                            }
+                        }
+                        Log.i(TAG, "config: " + rotationStatus())
+                    }
+                }
+                if (intent.getBooleanExtra("rotationStatus", false)) Log.i(TAG, rotationStatus())
                 //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
@@ -2848,6 +2887,7 @@ class BridgeService : Service() {
                     it.onStreamDead = { reason -> onRtspStreamDead(reason) }
                 }
                 r.rotationOffset = p.streamRotation
+                if (isAloha) r.autoRotation = displayAutoRotation(p)
                 r.cameraId = p.streamCameraId
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
@@ -2934,6 +2974,64 @@ class BridgeService : Service() {
         commandExecutor.submit {
             if (r.isStreaming) { r.restart(); noteRtspStarted() }
         }
+    }
+
+    // ── Display-rotation auto-rotate (aloha) ──────────────────────────────────
+
+    private fun currentDisplayRotation(): Int = runCatching {
+        @Suppress("DEPRECATION")
+        getSystemService(WindowManager::class.java).defaultDisplay.rotation
+    }.getOrDefault(0)
+
+    /** Auto component for aloha: the display's turn from landscape (0/90/180/270), 0 when off. */
+    private fun displayAutoRotation(p: Prefs): Int {
+        if (!isAloha || !p.streamAutoRotate) return 0
+        val deg = currentDisplayRotation() * 90
+        return ((p.streamAutoRotateSign * deg) % 360 + 360) % 360
+    }
+
+    private fun registerDisplayRotationWatch() {
+        if (displayRotationListener != null) return
+        lastDisplayRotation = currentDisplayRotation()
+        val l = object : android.hardware.display.DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != android.view.Display.DEFAULT_DISPLAY) return
+                val rot = currentDisplayRotation()
+                timeoutHandler.removeCallbacks(displayRotateApply)
+                if (rot == lastDisplayRotation) return          // settled back (or not a rotation change)
+                timeoutHandler.postDelayed(displayRotateApply, 2500)   // a brief app-forced turn never restarts
+            }
+        }
+        runCatching {
+            getSystemService(android.hardware.display.DisplayManager::class.java)
+                .registerDisplayListener(l, Handler(Looper.getMainLooper()))
+            displayRotationListener = l
+        }.onFailure { Log.w(TAG, "orientation: display watch failed: ${it.message}") }
+    }
+
+    /** Re-reads the display rotation; restarts the RTSP stream only when the stream rotation changes. */
+    private fun commitDisplayRotation(why: String) {
+        val p = prefs ?: return
+        lastDisplayRotation = currentDisplayRotation()
+        commandExecutor.submit {
+            val r = rtspStreamer ?: return@submit
+            val auto = displayAutoRotation(p)
+            if (auto == r.autoRotation) return@submit
+            Log.i(TAG, "orientation: $why: display rotation=$lastDisplayRotation -> auto=$auto (base=${r.rotationOffset}, was=${r.autoRotation}) - restarting the stream")
+            r.autoRotation = auto
+            if (r.isStreaming) { r.restart(); noteRtspStarted() }
+        }
+    }
+
+    fun rotationStatus(): String {
+        val p = prefs
+        val r = rtspStreamer
+        return "rotation: status model=${android.os.Build.DEVICE} display=${currentDisplayRotation()} " +
+            "auto=${p?.streamAutoRotate} sign=${p?.streamAutoRotateSign} base=${p?.streamRotation} " +
+            "stream=${r?.let { (it.rotationOffset + it.autoRotation) % 360 } ?: "n/a"} " +
+            "(offset=${r?.rotationOffset} auto=${r?.autoRotation}) watch=${if (displayRotationListener != null) "on" else "off"}"
     }
 
     // ── Presence + screen-off timer ───────────────────────────────────────────

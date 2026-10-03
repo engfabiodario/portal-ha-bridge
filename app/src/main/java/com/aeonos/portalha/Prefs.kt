@@ -168,6 +168,18 @@ class Prefs(private val context: Context) {
         get() = sp.getInt("stream_rotation", if (android.os.Build.DEVICE.equals("cipher", true)) 90 else 0)
         set(v) = sp.edit().putInt("stream_rotation", v).apply()
 
+    // Fleet: Portal+ (aloha) stream rotation follows the DISPLAY rotation (the camera sits in the
+    // pivoting screen). streamRotation stays the LANDSCAPE base (display rotation 0); the display's
+    // turn is added on top. false = streamRotation only (the old fixed behaviour).
+    var streamAutoRotate: Boolean
+        get() = sp.getBoolean("stream_auto_rotate", true)
+        set(v) = sp.edit().putBoolean("stream_auto_rotate", v).apply()
+
+    // Direction of the display delta (+1 / -1); calibrated on aloha, kept as a pref for other hardware.
+    var streamAutoRotateSign: Int
+        get() = sp.getInt("stream_auto_rotate_sign", 1)
+        set(v) = sp.edit().putInt("stream_auto_rotate_sign", if (v < 0) -1 else 1).apply()
+
     // Portal presence — reads Meta's own face-presence detection by tailing
     // logcat (needs READ_LOGS via adb). Published to HA as a binary_sensor.
     var presenceEnabled: Boolean
