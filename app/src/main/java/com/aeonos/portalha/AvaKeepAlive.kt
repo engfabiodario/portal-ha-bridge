@@ -237,6 +237,12 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     private var shieldLp: WindowManager.LayoutParams? = null
     private var shieldRect = Rect()
     @Volatile private var shieldRegistered = ""   // "" = not yet, else the rect it registered
+    // Where WindowManager really puts our overlays relative to what we ask (screen px). Not 0 under
+    // `wm overscan` (fleet 2026-10-02: status bar pushed off-screen = frames shifted up 52 px on the
+    // Portal 10"): the cover, guard and shield then sat ABOVE the parked sliver. Measured from the laid-out
+    // guard / shield window and subtracted from every overlay position.
+    private var ovDx = 0
+    private var ovDy = 0
     @Volatile private var coverShown = false
     @Volatile private var lastCoverCopyMs = 0L
     private var sliver = Rect()
@@ -756,7 +762,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         PixelFormat.TRANSLUCENT
     ).apply {
         gravity = Gravity.TOP or Gravity.START
-        x = r.left; y = r.top
+        x = r.left - ovDx; y = r.top - ovDy
         title = "PortalHA keep-alive cover"
     }
 
@@ -781,6 +787,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
                 @Suppress("ClickableViewAccessibility") setOnTouchListener { _, _ -> true }
             }
             val glp = overlayLp(sliver, touchable = false)
+            g.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffset(view) }
             wm.addView(g, glp)
             guardView = g; guardLp = glp
             Log.i(TAG, "keepalive: corner cover ready at ${coverRect.toShortString()} (sliver ${sliver.toShortString()})")
@@ -801,7 +808,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         runCatching {
             val v = View(ctx).apply { setBackgroundColor(Color.TRANSPARENT) }
             val lp = overlayLp(shieldRect, touchable = false).apply { title = "PortalHA keep-alive tap shield" }
-            v.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> registerShield(view) }
+            v.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffset(view); registerShield(view) }
             wm.addView(v, lp)
             shieldView = v; shieldLp = lp
             Log.i(TAG, "keepalive: corner tap shield window at ${shieldRect.toShortString()}")
@@ -812,9 +819,31 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     private fun updateShieldGeometry() {
         val v = shieldView ?: return
         val lp = shieldLp ?: return
-        if (lp.x == shieldRect.left && lp.y == shieldRect.top && lp.width == shieldRect.width() && lp.height == shieldRect.height()) return
-        lp.x = shieldRect.left; lp.y = shieldRect.top; lp.width = shieldRect.width(); lp.height = shieldRect.height()
+        val x = shieldRect.left - ovDx; val y = shieldRect.top - ovDy
+        if (lp.x == x && lp.y == y && lp.width == shieldRect.width() && lp.height == shieldRect.height()) return
+        lp.x = x; lp.y = y; lp.width = shieldRect.width(); lp.height = shieldRect.height()
         runCatching { wm.updateViewLayout(v, lp) }
+    }
+
+    /**
+     * Compare where an overlay landed with where we asked for it; a new shift (overscan, a changed
+     * display frame) moves all three windows so they cover the real corner again. Converges in one
+     * step (the shift doesn't depend on the requested position).
+     */
+    private fun measureOverlayOffset(view: View) {
+        val lp = view.layoutParams as? WindowManager.LayoutParams ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val loc = IntArray(2)
+        runCatching { view.getLocationOnScreen(loc) }.onFailure { return }
+        val dx = loc[0] - lp.x; val dy = loc[1] - lp.y
+        if (dx == ovDx && dy == ovDy) return
+        Log.i(TAG, "keepalive: overlays land shifted by ($dx,$dy) px (was ($ovDx,$ovDy)) - moving cover, guard and shield onto the real corner")
+        ovDx = dx; ovDy = dy
+        main.post {
+            updateShieldGeometry()
+            coverLp?.let { c -> coverView?.let { v -> c.x = coverRect.left - ovDx; c.y = coverRect.top - ovDy; runCatching { wm.updateViewLayout(v, c) } } }
+            guardLp?.let { g -> guardView?.let { v -> g.x = sliver.left - ovDx; g.y = sliver.top - ovDy; runCatching { wm.updateViewLayout(v, g) } } }
+        }
     }
 
     /**
@@ -924,8 +953,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         launchBounds()   // keep the geometry current
         updateShieldGeometry()
         coverLp?.let { lp ->
-            if (lp.x != coverRect.left || lp.y != coverRect.top || lp.width != coverRect.width() || lp.height != coverRect.height()) {
-                lp.x = coverRect.left; lp.y = coverRect.top; lp.width = coverRect.width(); lp.height = coverRect.height()
+            if (lp.x != coverRect.left - ovDx || lp.y != coverRect.top - ovDy || lp.width != coverRect.width() || lp.height != coverRect.height()) {
+                lp.x = coverRect.left - ovDx; lp.y = coverRect.top - ovDy; lp.width = coverRect.width(); lp.height = coverRect.height()
                 runCatching { wm.updateViewLayout(v, lp) }
             }
         }
@@ -933,7 +962,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val g = guardView
         guardLp?.let { lp ->
             if (g != null) {
-                lp.x = sliver.left; lp.y = sliver.top; lp.width = sliver.width(); lp.height = sliver.height()
+                lp.x = sliver.left - ovDx; lp.y = sliver.top - ovDy; lp.width = sliver.width(); lp.height = sliver.height()
                 lp.flags = if (show) lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
                            else lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 runCatching { wm.updateViewLayout(g, lp) }

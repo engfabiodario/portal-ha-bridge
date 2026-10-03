@@ -162,9 +162,13 @@ class TvAppActivity : Activity() {
             if (act == null || !visibleNow || src.width() <= 0 || src.height() <= 0) { cb(null); return }
             runCatching {
                 val v = act.window.peekDecorView()
-                if (v == null || !v.isAttachedToWindow || v.width < src.right || v.height < src.bottom) { cb(null); return }
-                val bmp = android.graphics.Bitmap.createBitmap(src.width(), src.height(), android.graphics.Bitmap.Config.ARGB_8888)
-                android.view.PixelCopy.request(act.window, src, bmp, { result ->
+                if (v == null || !v.isAttachedToWindow) { cb(null); return }
+                // src is in SCREEN px; PixelCopy wants window px (they differ under `wm overscan`).
+                val loc = IntArray(2); v.getLocationOnScreen(loc)
+                val r = Rect(src).apply { offset(-loc[0], -loc[1]) }
+                if (r.left < 0 || r.top < 0 || v.width < r.right || v.height < r.bottom) { cb(null); return }
+                val bmp = android.graphics.Bitmap.createBitmap(r.width(), r.height(), android.graphics.Bitmap.Config.ARGB_8888)
+                android.view.PixelCopy.request(act.window, r, bmp, { result ->
                     cb(if (result == android.view.PixelCopy.SUCCESS) bmp else null)
                 }, Handler(Looper.getMainLooper()))
             }.onFailure { cb(null) }
@@ -197,17 +201,16 @@ class TvAppActivity : Activity() {
     private lateinit var padHandle: TextView
     private var padShown = true
     private var gestureOnPad = false
-    // How touches on the page drive it (Prefs.youtubeTouch): "mouse" / "native" / "pad".
-    private var touchMode = "mouse"
-    // mouse mode: the gesture in progress (window coordinates = WebView coordinates, it fills the window).
-    private var mDownX = 0f
-    private var mDownY = 0f
-    private var mLastX = 0f
-    private var mLastY = 0f
-    private var mDownTime = 0L
-    private var mDragging = false
-    private var mScrollAccX = 0f
-    private var mScrollAccY = 0f
+    // How touches on the page drive it (Prefs.youtubeTouch): "touch" / "native" / "pad".
+    private var touchMode = "touch"
+    // touch mode: the gesture in progress.
+    private var tDownX = 0f
+    private var tDownY = 0f
+    private var tAccX = 0f
+    private var tAccY = 0f
+    private var tLastX = 0f
+    private var tLastY = 0f
+    private var tDragging = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -264,7 +267,7 @@ class TvAppActivity : Activity() {
             override fun onLongPress(e: MotionEvent) { if (!standalone && !gestureOnPad) exitToDashboard("long-press") }
         })
 
-        touchMode = runCatching { Prefs(this).youtubeTouch }.getOrDefault("mouse")
+        touchMode = runCatching { Prefs(this).youtubeTouch }.getOrDefault("touch")
         applyTouchMode()
         loadFromIntent(intent, fresh = true)
         handler.postDelayed(pollRunnable, POLL_MS)
@@ -418,83 +421,65 @@ class TvAppActivity : Activity() {
         gestures.onTouchEvent(ev)
         if (gestureOnPad) return super.dispatchTouchEvent(ev)
         if (touchMode == "native") return super.dispatchTouchEvent(ev)
-        if (touchMode == "mouse") { mouseFromTouch(ev); return true }
+        if (touchMode == "touch") return touchGesture(ev)
         // youtube.com/tv is remote-driven: a touch on the page itself only brings the pad up
         // (a click would switch the Leanback client into its pointer mode).
         if (ev.actionMasked == MotionEvent.ACTION_DOWN && !padShown) showPad()
         return true
     }
 
-    // ── Touch as a pointer remote ("mouse" mode) ─────────────────────────────
-    // youtube.com/tv supports a pointer remote (a mouse): hover highlights, click selects, the wheel
-    // scrolls. A finger becomes that pointer: a tap = move + click right where it landed, a drag =
-    // wheel notches along the drag (rows left/right, the page up/down), the finger never "clicks" after a drag.
+    // ── Touch ("touch" mode, default) ─────────────────────────────────────────
+    // Measured on Mudroom 2026-10-02: youtube.com/tv takes a TAP natively (tap a tile = it opens, tap a
+    // button = it presses), but ignores swipes (no touch scrolling). So a tap goes to the page as it is,
+    // and a drag is taken back from the page (ACTION_CANCEL) and turned into D-pad moves along the drag:
+    // swipe left = next item to the right, swipe up = the row below - like a phone's carousel.
 
-    private fun mouseEvent(action: Int, x: Float, y: Float, buttons: Int, downTime: Long): MotionEvent {
-        val pp = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE }
-        val pc = MotionEvent.PointerCoords().apply { this.x = x; this.y = y; pressure = 1f; size = 1f }
-        return MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(pp), arrayOf(pc),
-            0, buttons, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_MOUSE, 0)
-    }
-
-    private fun hover(x: Float, y: Float) {
-        val e = mouseEvent(MotionEvent.ACTION_HOVER_MOVE, x, y, 0, SystemClock.uptimeMillis())
-        webView.dispatchGenericMotionEvent(e); e.recycle()
-    }
-
-    private fun click(x: Float, y: Float) {
-        val t = SystemClock.uptimeMillis()
-        val primary = MotionEvent.BUTTON_PRIMARY
-        listOf(
-            mouseEvent(MotionEvent.ACTION_DOWN, x, y, primary, t),
-            mouseEvent(MotionEvent.ACTION_UP, x, y, 0, t)
-        ).forEach { e -> webView.dispatchTouchEvent(e); e.recycle() }
-    }
-
-    private fun wheel(x: Float, y: Float, h: Float, v: Float) {
-        val pp = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE }
-        val pc = MotionEvent.PointerCoords().apply {
-            this.x = x; this.y = y
-            setAxisValue(MotionEvent.AXIS_HSCROLL, h); setAxisValue(MotionEvent.AXIS_VSCROLL, v)
-        }
-        val t = SystemClock.uptimeMillis()
-        val e = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, 1, arrayOf(pp), arrayOf(pc), 0, 0, 1f, 1f, 0, 0,
-            android.view.InputDevice.SOURCE_MOUSE, 0)
-        webView.dispatchGenericMotionEvent(e); e.recycle()
-    }
-
-    private fun mouseFromTouch(ev: MotionEvent) {
-        val x = ev.x; val y = ev.y
-        val step = dp(48).toFloat()      // finger travel per wheel notch
+    private fun touchGesture(ev: MotionEvent): Boolean {
+        val step = dp(110).toFloat()      // finger travel per D-pad move
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                mDownX = x; mDownY = y; mLastX = x; mLastY = y; mDownTime = SystemClock.uptimeMillis()
-                mDragging = false; mScrollAccX = 0f; mScrollAccY = 0f
-                hover(x, y)
+                tDownX = ev.x; tDownY = ev.y; tLastX = ev.x; tLastY = ev.y
+                tAccX = 0f; tAccY = 0f; tDragging = false
+                return super.dispatchTouchEvent(ev)
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!mDragging && Math.hypot((x - mDownX).toDouble(), (y - mDownY).toDouble()) > dp(14)) mDragging = true
-                if (mDragging) {
-                    // Finger left = see more to the right (HSCROLL +); finger up = see further down (VSCROLL -).
-                    mScrollAccX += mLastX - x; mScrollAccY += mLastY - y
-                    val nx = (mScrollAccX / step).toInt(); val ny = (mScrollAccY / step).toInt()
-                    if (nx != 0 || ny != 0) {
-                        wheel(mDownX, mDownY, nx.toFloat(), -ny.toFloat())
-                        mScrollAccX -= nx * step; mScrollAccY -= ny * step
-                        BridgeService.youtubeFrontChanged()
-                    }
+                if (!tDragging && Math.hypot((ev.x - tDownX).toDouble(), (ev.y - tDownY).toDouble()) > dp(24)) {
+                    tDragging = true
+                    val c = MotionEvent.obtain(ev).apply { action = MotionEvent.ACTION_CANCEL }
+                    super.dispatchTouchEvent(c); c.recycle()          // the page never sees it as a tap
+                    tLastX = tDownX; tLastY = tDownY
                 }
-                mLastX = x; mLastY = y
-            }
-            MotionEvent.ACTION_UP -> {
-                if (!mDragging && SystemClock.uptimeMillis() - mDownTime < 600L) {
-                    click(x, y)
+                if (!tDragging) return super.dispatchTouchEvent(ev)
+                tAccX += tLastX - ev.x; tAccY += tLastY - ev.y
+                tLastX = ev.x; tLastY = ev.y
+                // One axis at a time: the dominant one.
+                if (Math.abs(tAccX) >= step && Math.abs(tAccX) >= Math.abs(tAccY)) {
+                    sendKey(if (tAccX > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT)
+                    tAccX -= Math.signum(tAccX) * step; tAccY = 0f
+                    BridgeService.youtubeFrontChanged()
+                } else if (Math.abs(tAccY) >= step) {
+                    sendKey(if (tAccY > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
+                    tAccY -= Math.signum(tAccY) * step; tAccX = 0f
                     BridgeService.youtubeFrontChanged()
                 }
-                mDragging = false
+                return true
             }
-            MotionEvent.ACTION_CANCEL -> mDragging = false
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val was = tDragging
+                tDragging = false
+                if (was) {
+                    // A short flick that never reached a full step still moves once.
+                    if (ev.actionMasked == MotionEvent.ACTION_UP && Math.abs(tAccX) + Math.abs(tAccY) > dp(40)) {
+                        if (Math.abs(tAccX) >= Math.abs(tAccY)) sendKey(if (tAccX > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT)
+                        else sendKey(if (tAccY > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
+                    }
+                    return true
+                }
+                BridgeService.youtubeFrontChanged()
+                return super.dispatchTouchEvent(ev)
+            }
         }
+        return super.dispatchTouchEvent(ev)
     }
 
     /** Pad up front only in "pad" mode; the other modes keep it one tap away (the Remote handle). */

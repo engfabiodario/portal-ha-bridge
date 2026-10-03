@@ -63,10 +63,14 @@ class DashboardActivity : AppCompatActivity() {
             if (act == null || src.width() <= 0 || src.height() <= 0) { cb(null); return }
             runCatching {
                 val v = act.window.peekDecorView()
-                if (v == null || !v.isAttachedToWindow || v.width < src.right || v.height < src.bottom) { cb(null); return }
+                if (v == null || !v.isAttachedToWindow) { cb(null); return }
+                // src is in SCREEN px; PixelCopy wants window px (they differ under `wm overscan`).
+                val loc = IntArray(2); v.getLocationOnScreen(loc)
+                val r = android.graphics.Rect(src).apply { offset(-loc[0], -loc[1]) }
+                if (r.left < 0 || r.top < 0 || v.width < r.right || v.height < r.bottom) { cb(null); return }
                 val bmp = android.graphics.Bitmap.createBitmap(
-                    src.width(), src.height(), android.graphics.Bitmap.Config.ARGB_8888)
-                android.view.PixelCopy.request(act.window, src, bmp, { result ->
+                    r.width(), r.height(), android.graphics.Bitmap.Config.ARGB_8888)
+                android.view.PixelCopy.request(act.window, r, bmp, { result ->
                     cb(if (result == android.view.PixelCopy.SUCCESS) bmp else null)
                 }, android.os.Handler(android.os.Looper.getMainLooper()))
             }.onFailure { cb(null) }

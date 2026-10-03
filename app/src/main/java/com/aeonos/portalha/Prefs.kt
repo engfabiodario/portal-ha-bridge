@@ -363,12 +363,13 @@ class Prefs(private val context: Context) {
         get() = sp.getLong("keep_alive_paused_until", 0L)
         set(v) = sp.edit().putLong("keep_alive_paused_until", v.coerceAtLeast(0L)).apply()
 
-    // YouTube screen (TvAppActivity) touch: "mouse" = a tap clicks what is under the finger and a drag
-    // scrolls (the client's pointer-remote mode), "native" = touches go to the page as they are, "pad" =
-    // the page ignores touches, the on-screen D-pad drives it. adb DEBUG_CONFIG --es youtubeTouch.
+    // YouTube screen (TvAppActivity) touch: "touch" = taps go to the page (youtube.com/tv takes them:
+    // tap a tile = it opens) and swipes become D-pad moves (the page itself doesn't scroll by touch),
+    // "native" = every touch to the page unchanged, "pad" = the page ignores touches, the on-screen D-pad
+    // drives it. adb DEBUG_CONFIG --es youtubeTouch. (A stored "mouse" from a test build reads as "touch".)
     var youtubeTouch: String
-        get() = sp.getString("youtube_touch", "mouse") ?: "mouse"
-        set(v) = sp.edit().putString("youtube_touch", v.trim().lowercase().takeIf { it in setOf("mouse", "native", "pad") } ?: "mouse").apply()
+        get() = (sp.getString("youtube_touch", "touch") ?: "touch").let { if (it in setOf("touch", "native", "pad")) it else "touch" }
+        set(v) = sp.edit().putString("youtube_touch", v.trim().lowercase().takeIf { it in setOf("touch", "native", "pad") } ?: "touch").apply()
 
     // Which assistant the keep-alive parks (its launcher activity). adb DEBUG_CONFIG --es keepAlivePackage.
     var keepAlivePackage: String
