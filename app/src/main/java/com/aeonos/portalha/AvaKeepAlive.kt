@@ -787,7 +787,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
                 @Suppress("ClickableViewAccessibility") setOnTouchListener { _, _ -> true }
             }
             val glp = overlayLp(sliver, touchable = false)
-            g.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffset(view) }
+            g.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffsetSoon(view) }
             wm.addView(g, glp)
             guardView = g; guardLp = glp
             Log.i(TAG, "keepalive: corner cover ready at ${coverRect.toShortString()} (sliver ${sliver.toShortString()})")
@@ -808,7 +808,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         runCatching {
             val v = View(ctx).apply { setBackgroundColor(Color.TRANSPARENT) }
             val lp = overlayLp(shieldRect, touchable = false).apply { title = "PortalHA keep-alive tap shield" }
-            v.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffset(view); registerShield(view) }
+            v.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> measureOverlayOffsetSoon(view); registerShield(view) }
             wm.addView(v, lp)
             shieldView = v; shieldLp = lp
             Log.i(TAG, "keepalive: corner tap shield window at ${shieldRect.toShortString()}")
@@ -830,6 +830,14 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
      * display frame) moves all three windows so they cover the real corner again. Converges in one
      * step (the shift doesn't depend on the requested position).
      */
+    // Measured a moment after the layout, not in its callback: right after we move a window the callback can
+    // report the NEW params with the OLD position (seen once on the Portal+: -52 -> -104 -> -52).
+    private val offsetToken = Any()
+    private fun measureOverlayOffsetSoon(view: View) {
+        main.removeCallbacksAndMessages(offsetToken)
+        main.postAtTime({ measureOverlayOffset(view) }, offsetToken, SystemClock.uptimeMillis() + 300L)
+    }
+
     private fun measureOverlayOffset(view: View) {
         val lp = view.layoutParams as? WindowManager.LayoutParams ?: return
         if (view.width <= 0 || view.height <= 0) return
