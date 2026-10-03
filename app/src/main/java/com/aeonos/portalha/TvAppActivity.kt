@@ -505,7 +505,8 @@ class TvAppActivity : Activity() {
 
     private val padHide = Runnable {
         // Keep it up while nothing plays (browsing / the sign-in code screen): it's the only way around.
-        if (!isPlayingVideo()) { schedulePadHide(); return@Runnable }
+        // (playingNow = a video really seen playing - not the launch grace isPlayingVideo() counts.)
+        if (!playingNow) { schedulePadHide(); return@Runnable }
         padShown = false
         pad.visibility = View.GONE
         padHandle.visibility = View.VISIBLE
