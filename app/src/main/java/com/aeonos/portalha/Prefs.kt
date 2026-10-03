@@ -175,9 +175,10 @@ class Prefs(private val context: Context) {
         get() = sp.getBoolean("stream_auto_rotate", true)
         set(v) = sp.edit().putBoolean("stream_auto_rotate", v).apply()
 
-    // Direction of the display delta (+1 / -1); calibrated on aloha, kept as a pref for other hardware.
+    // Direction of the display delta (+1 / -1). -1 = calibrated on aloha (Office, display rotation 1:
+    // base 90 + 270 = 0 deg upright in Frigate; +1 gave 180 = upside down). A pref for other hardware.
     var streamAutoRotateSign: Int
-        get() = sp.getInt("stream_auto_rotate_sign", 1)
+        get() = sp.getInt("stream_auto_rotate_sign", -1)
         set(v) = sp.edit().putInt("stream_auto_rotate_sign", if (v < 0) -1 else 1).apply()
 
     // Portal presence — reads Meta's own face-presence detection by tailing
