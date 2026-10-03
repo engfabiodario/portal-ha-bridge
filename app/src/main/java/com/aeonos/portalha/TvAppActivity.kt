@@ -670,6 +670,14 @@ class TvAppActivity : Activity() {
         openPicker(id, o?.optString("title").orEmpty())
     }
 
+    private fun openClosePicker(group: List<Pair<String, String>>) {
+        val root = rootLayout ?: return
+        picker?.close()
+        picker = WatchPicker(this, root, "", "", group, BridgeService.watchSelf(),
+            onStart = { picked -> BridgeService.watchCloseRequest(picked) },
+            onClose = { picker = null }, closeMode = true).also { it.show() }
+    }
+
     /** The watch-together picker for [video] (also the pad's Together button, for the video playing now). */
     private fun openPicker(video: String, title: String) {
         val root = rootLayout ?: return
@@ -826,7 +834,12 @@ class TvAppActivity : Activity() {
             // Leanback reads Escape (27) as Back; KEYCODE_BACK would be eaten by the WebView.
             "back", "escape" -> KeyEvent.KEYCODE_ESCAPE
             "playpause", "play", "pause" -> -1
-            "close" -> { exitToDashboard("closed on the pad"); return }
+            "close" -> {
+                // In a watch-together session with others: ask which Portals to close (the rest play on).
+                val group = BridgeService.watchSessionMembers()
+                if (group.size > 1) { openClosePicker(group); return }
+                exitToDashboard("closed on the pad"); return
+            }
             "together" -> {
                 webView.evaluateJavascript("(function(){var h=(location.hash||'').match(/[?&]v=([A-Za-z0-9_-]{11})/);" +
                     "return JSON.stringify({id:h?h[1]:'',title:''});})()") { r -> pickerFrom(r) }

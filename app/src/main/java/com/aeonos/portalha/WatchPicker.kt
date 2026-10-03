@@ -27,8 +27,12 @@ class WatchPicker(
     self: String,
     private val onStart: (List<String>) -> Unit,
     private val onClose: () -> Unit,
+    /** 'close' mode (the YouTube Close during a session): the session's Portals, all picked, "Close selected". */
+    private val closeMode: Boolean = false,
 ) {
-    private val picked = LinkedHashSet<String>().apply { if (members.any { it.first == self }) add(self) }
+    private val picked = LinkedHashSet<String>().apply {
+        if (closeMode) members.forEach { add(it.first) } else if (members.any { it.first == self }) add(self)
+    }
     private lateinit var overlay: FrameLayout
     private val chips = ArrayList<Pair<String, TextView>>()   // slug ("*" = All) -> chip
 
@@ -64,10 +68,12 @@ class WatchPicker(
             isClickable = true                       // a tap inside the panel doesn't close it
         }
         panel.addView(TextView(ctx).apply {
-            text = "Watch together"; setTextColor(Color.WHITE); textSize = 22f
+            text = if (closeMode) "Close YouTube on" else "Watch together"; setTextColor(Color.WHITE); textSize = 22f
         })
         panel.addView(TextView(ctx).apply {
-            text = title.ifBlank { "youtu.be/$video" }; setTextColor(Color.argb(170, 255, 255, 255)); textSize = 14f
+            text = if (closeMode) "Picked Portals stop; the others keep playing together. All = end the session."
+                   else title.ifBlank { "youtu.be/$video" }
+            setTextColor(Color.argb(170, 255, 255, 255)); textSize = 14f
             maxLines = 2; setPadding(0, dp(4), 0, dp(14))
         })
         val cols = if (ctx.resources.displayMetrics.widthPixels > ctx.resources.displayMetrics.heightPixels) 4 else 3
@@ -90,7 +96,7 @@ class WatchPicker(
         val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END; setPadding(0, dp(18), 0, 0) }
         row.addView(button("Cancel", false) { close() })
         row.addView(View(ctx), LinearLayout.LayoutParams(dp(12), 1))
-        row.addView(button("Start together", true) {
+        row.addView(button(if (closeMode) "Close selected" else "Start together", true) {
             if (picked.isEmpty()) return@button
             val order = members.map { it.first }.filter { it in picked }
             close(); onStart(order)

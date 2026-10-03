@@ -85,10 +85,17 @@ class WatchTogether(private val host: Host) {
         // Everything else needs us in a session (and the same one when it names one).
         if (!active || (sid.isNotEmpty() && sid != session)) return
         when (cmd) {
-            "play_at" -> { TvAppActivity.watchPlayAt(o.optLong("at"), o.optDouble("pos"), host.calibrationMs); setState("armed") }
-            "pause_at" -> { TvAppActivity.watchPauseAt(o.optLong("at")); setState("pausing") }
-            "cue" -> { TvAppActivity.watchCue(video, o.optDouble("pos"), guest); setState("loading") }
+            "play_at" -> {
+                gPos = o.optDouble("pos"); gAt = o.optLong("at")     // every member keeps the timeline: any can lead next
+                TvAppActivity.watchPlayAt(o.optLong("at"), o.optDouble("pos"), host.calibrationMs); setState("armed")
+            }
+            "pause_at" -> {
+                if (o.has("pos")) gPos = o.optDouble("pos"); gAt = 0L
+                TvAppActivity.watchPauseAt(o.optLong("at")); setState("pausing")
+            }
+            "cue" -> { gPos = o.optDouble("pos"); gAt = 0L; TvAppActivity.watchCue(video, o.optDouble("pos"), guest); setState("loading") }
             "stop" -> end("stop", close = true)
+            "leave" -> onLeave(o)
             "play", "pause", "toggle", "seek" -> if (isLeader) lead(cmd, o)
         }
     }
@@ -197,11 +204,45 @@ class WatchTogether(private val host: Host) {
         val s = o.optString("state")
         if (s.isNotEmpty()) setState(s, force = s == "playing")
         // End of the video: the group's timeline stops at 0, so 'play' starts it again for everyone.
-        if (s == "ended" && isLeader) { gAt = 0L; gPos = 0.0 }
+        if (s == "ended") { gAt = 0L; gPos = 0.0 }
     }
 
     /** The YouTube screen closed (alert, Close, idle...): this Portal leaves the session. */
-    fun onScreenClosed() { if (active) end("YouTube screen closed", close = false) }
+    fun onScreenClosed() {
+        if (!active) return
+        // Tell the rest of the group (they drop this Portal and, if it led, hand over the lead), then leave.
+        if (portals.size > 1) host.publishFleet(JSONObject().put("cmd", "leave").put("session", session)
+            .put("portals", JSONArray(listOf(host.slug))).toString())
+        end("YouTube screen closed", close = false)
+    }
+
+    /** {"cmd":"leave","portals":[..]}: those Portals stop and close YouTube; the rest play on. Every member
+     *  applies the same rule, so they agree: a leaving leader hands over to the first remaining member. */
+    private fun onLeave(o: JSONObject) {
+        val arr = o.optJSONArray("portals") ?: return
+        val gone = (0 until arr.length()).map { arr.optString(it) }.toSet()
+        if (host.slug in gone) { end("closed from the group's close picker", close = true); return }
+        val rest = portals.filter { it !in gone }
+        if (rest.size == portals.size) return
+        val wasLeader = leader
+        portals = rest
+        if (leader in gone) leader = rest.firstOrNull() ?: ""
+        Log.i(TAG, "watch: ${gone.joinToString(",")} left; ${rest.size} remain, leader ${leader}${if (leader != wasLeader) " (was $wasLeader)" else ""}${if (isLeader) " = me" else ""}")
+        setState(state, force = true)
+    }
+
+    /** The Portals of the running session (slug, name) for the close picker; empty outside a session. */
+    fun sessionMembers(): List<Pair<String, String>> =
+        if (!active) emptyList() else portals.map { s -> Pair(s, known[s] ?: displayName(s)) }
+
+    /** The close picker: everyone picked = stop the session; else those leave and the rest play on. */
+    fun closeRequest(picked: List<String>) {
+        if (!active || picked.isEmpty()) return
+        val cmd = if (portals.all { it in picked }) JSONObject().put("cmd", "stop")
+                  else JSONObject().put("cmd", "leave").put("portals", JSONArray(picked))
+        Log.i(TAG, "watch: close request ${cmd}")
+        host.publishFleet(cmd.put("session", session).toString())
+    }
 
     private fun end(why: String, close: Boolean) {
         Log.i(TAG, "watch: leaving session $session ($why)")

@@ -273,6 +273,8 @@ class BridgeService : Service() {
         fun watchMembers(): List<Pair<String, String>> = instance?.watch?.members() ?: emptyList()
         fun watchSelf(): String = instance?.watch?.let { WatchTogether.slugOf(instance?.prefs?.deviceName ?: "") } ?: ""
         fun watchStartRequest(video: String, portals: List<String>) { instance?.watch?.startRequest(video, portals) }
+        fun watchSessionMembers(): List<Pair<String, String>> = instance?.watch?.sessionMembers() ?: emptyList()
+        fun watchCloseRequest(portals: List<String>) { instance?.watch?.closeRequest(portals) }
 
         // The YouTube screen's content moved (a pad key, the pad shown/hidden): re-copy the corner cover.
         fun youtubeFrontChanged() { instance?.keepAlive?.refreshCoverSoon() }
