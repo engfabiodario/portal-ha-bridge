@@ -80,6 +80,7 @@ class TvAppActivity : Activity() {
         private const val PAD_HIDE_MS = 10_000L
         private const val KEY_REPEAT_DELAY_MS = 400L
         private const val KEY_REPEAT_MS = 140L
+        private const val LONG_PRESS_MS = 600L
 
         // A YouTube video id (what "youtube:<id>" / --es youtubeVideo may carry).
         private val VIDEO_ID = Regex("^[A-Za-z0-9_-]{6,20}$")
@@ -350,6 +351,11 @@ class TvAppActivity : Activity() {
     private var tLastX = 0f
     private var tLastY = 0f
     private var tDragging = false
+    // Long-press on a tile = the watch-together picker for that video.
+    private var tLongFired = false
+    private val longPress = Runnable { onLongPress() }
+    private var rootLayout: FrameLayout? = null
+    private var picker: WatchPicker? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -364,6 +370,7 @@ class TvAppActivity : Activity() {
         root.addView(webView, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         buildPad(root)
+        rootLayout = root
         setContentView(root)
 
         webView.settings.apply {
@@ -565,6 +572,7 @@ class TvAppActivity : Activity() {
             gestureOnPad = onPad(ev)
             if (padShown) schedulePadHide()
         }
+        if (picker?.isShowing == true) return super.dispatchTouchEvent(ev)   // the picker's own chips / buttons
         gestures.onTouchEvent(ev)
         if (gestureOnPad) return super.dispatchTouchEvent(ev)
         if (touchMode == "native") return super.dispatchTouchEvent(ev)
@@ -586,11 +594,15 @@ class TvAppActivity : Activity() {
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 tDownX = ev.x; tDownY = ev.y; tLastX = ev.x; tLastY = ev.y
-                tAccX = 0f; tAccY = 0f; tDragging = false
+                tAccX = 0f; tAccY = 0f; tDragging = false; tLongFired = false
+                handler.removeCallbacks(longPress)
+                handler.postDelayed(longPress, LONG_PRESS_MS)
                 return super.dispatchTouchEvent(ev)
             }
             MotionEvent.ACTION_MOVE -> {
+                if (tLongFired) return true
                 if (!tDragging && Math.hypot((ev.x - tDownX).toDouble(), (ev.y - tDownY).toDouble()) > dp(24)) {
+                    handler.removeCallbacks(longPress)
                     tDragging = true
                     val c = MotionEvent.obtain(ev).apply { action = MotionEvent.ACTION_CANCEL }
                     super.dispatchTouchEvent(c); c.recycle()          // the page never sees it as a tap
@@ -612,6 +624,8 @@ class TvAppActivity : Activity() {
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                handler.removeCallbacks(longPress)
+                if (tLongFired) { tLongFired = false; return true }
                 val was = tDragging
                 tDragging = false
                 if (was) {
@@ -627,6 +641,43 @@ class TvAppActivity : Activity() {
             }
         }
         return super.dispatchTouchEvent(ev)
+    }
+
+    /**
+     * Long-press (600 ms, finger still) on the page: the page loses the touch (no click), the tile under the
+     * finger gives its video id (the thumbnail URL /vi/<id>/ - the TV client keeps no id attribute; measured
+     * 2026-10-03), else the video playing now; then the watch-together picker for it.
+     */
+    private fun onLongPress() {
+        if (tDragging || picker?.isShowing == true) return
+        tLongFired = true
+        val t = SystemClock.uptimeMillis()
+        val c = MotionEvent.obtain(t, t, MotionEvent.ACTION_CANCEL, tDownX, tDownY, 0)
+        super.dispatchTouchEvent(c); c.recycle()
+        val js = "(function(px,py,w){var k=window.innerWidth/w;var e=document.elementFromPoint(px*k,py*k);" +
+            "var t=e&&e.closest?e.closest('ytlr-tile-renderer'):null;var id='',ti='';" +
+            "if(t){var m=t.outerHTML.match(new RegExp('/vi(?:_webp)?/([A-Za-z0-9_-]{11})/'));if(m)id=m[1];" +
+            "var f=t.querySelectorAll('yt-formatted-string');for(var i=0;i<f.length;i++){var s=f[i].textContent.trim();if(s.length>ti.length&&!/^[0-9:]+$/.test(s))ti=s;}}" +
+            "if(!id){var h=(location.hash||'').match(/[?&]v=([A-Za-z0-9_-]{11})/);if(h)id=h[1];}" +
+            "return JSON.stringify({id:id,title:ti.slice(0,120)});})(${tDownX},${tDownY},${webView.width})"
+        webView.evaluateJavascript(js) { r -> pickerFrom(r) }
+    }
+
+    private fun pickerFrom(result: String?) {
+        val o = runCatching { org.json.JSONObject(org.json.JSONTokener(result ?: "").nextValue() as String) }.getOrNull()
+        val id = o?.optString("id").orEmpty()
+        if (!isVideoId(id)) { Log.i(TAG, "youtube: long-press - no video there (and none playing)"); return }
+        openPicker(id, o?.optString("title").orEmpty())
+    }
+
+    /** The watch-together picker for [video] (also the pad's Together button, for the video playing now). */
+    private fun openPicker(video: String, title: String) {
+        val root = rootLayout ?: return
+        picker?.close()
+        Log.i(TAG, "youtube: watch-together picker for $video")
+        picker = WatchPicker(this, root, video, title, BridgeService.watchMembers(), BridgeService.watchSelf(),
+            onStart = { portals -> BridgeService.watchStartRequest(video, portals) },
+            onClose = { picker = null }).also { it.show() }
     }
 
     /** Pad up front only in "pad" mode; the other modes keep it one tap away (the Remote handle). */
@@ -716,6 +767,7 @@ class TvAppActivity : Activity() {
         pad.addView(row(padButton("◀", "left", repeat = true), padButton("OK", "ok"), padButton("▶", "right", repeat = true)))
         pad.addView(row(spacer(), padButton("▼", "down", repeat = true), spacer()))
         pad.addView(row(padButton("Back", "back"), padButton("⏯", "playpause"), padButton("Close", "close")))
+        pad.addView(row(padButton("Watch together", "together", sizeDp = 208)))
         val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.START)
         lp.setMargins(dp(20), dp(20), dp(20), dp(20))
@@ -775,6 +827,11 @@ class TvAppActivity : Activity() {
             "back", "escape" -> KeyEvent.KEYCODE_ESCAPE
             "playpause", "play", "pause" -> -1
             "close" -> { exitToDashboard("closed on the pad"); return }
+            "together" -> {
+                webView.evaluateJavascript("(function(){var h=(location.hash||'').match(/[?&]v=([A-Za-z0-9_-]{11})/);" +
+                    "return JSON.stringify({id:h?h[1]:'',title:''});})()") { r -> pickerFrom(r) }
+                return
+            }
             else -> { Log.w(TAG, "youtube: unknown pad key '$key'"); return }
         }
         if (code == -1) { if (!BridgeService.watchPadToggle()) playPause(); return }

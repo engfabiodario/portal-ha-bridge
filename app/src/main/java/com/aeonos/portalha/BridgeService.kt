@@ -270,6 +270,9 @@ class BridgeService : Service() {
         fun watchReport(json: String) { instance?.watch?.onPageReport(json) }
         fun watchPadToggle(): Boolean { val w = instance?.watch ?: return false; if (!w.active) return false; w.padToggle(); return true }
         fun watchScreenClosed() { instance?.watch?.onScreenClosed() }
+        fun watchMembers(): List<Pair<String, String>> = instance?.watch?.members() ?: emptyList()
+        fun watchSelf(): String = instance?.watch?.let { WatchTogether.slugOf(instance?.prefs?.deviceName ?: "") } ?: ""
+        fun watchStartRequest(video: String, portals: List<String>) { instance?.watch?.startRequest(video, portals) }
 
         // The YouTube screen's content moved (a pad key, the pad shown/hidden): re-copy the corner cover.
         fun youtubeFrontChanged() { instance?.keepAlive?.refreshCoverSoon() }
@@ -2310,7 +2313,8 @@ class BridgeService : Service() {
             HaDiscovery.selfHealCommandTopic(p.deviceId),
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             // Watch together: shared by every Portal (never purged or retained).
-            WatchTogether.TOPIC
+            WatchTogether.TOPIC,
+            WatchTogether.MEMBERS_FILTER
         ).forEach { client.subscribe(it, 1) }
 
         // Intercom: subscribe to presence/lock/audio and announce ourselves.
@@ -2453,6 +2457,7 @@ class BridgeService : Service() {
         publishYoutubeState(p)
         pub(HaDiscovery.watchSensorDiscoveryTopic(p.deviceId), HaDiscovery.watchSensorConfigPayload(p.deviceId, p.deviceName))
         watch.republish()
+        watch.announce()
 
         // Camera, motion-enable and streaming-enable switches exist only while
         // the camera service is enabled; motion entities additionally require
@@ -2518,6 +2523,7 @@ class BridgeService : Service() {
     // ── Command router ────────────────────────────────────────────────────────
 
     private fun handleMessage(topic: String, payload: String, p: Prefs) {
+        if (topic.startsWith(WatchTogether.MEMBERS_PREFIX)) { watch.onMember(topic, payload); return }
         when (topic) {
             HaDiscovery.commandTopic(p.deviceId)                  -> handleScreenCommand(payload)
             HaDiscovery.sensitivityCommandTopic(p.deviceId)       -> handleSensitivityCommand(payload, p)
@@ -4608,6 +4614,9 @@ class BridgeService : Service() {
             override val slug: String get() = WatchTogether.slugOf(prefs?.deviceName ?: "")
             override val calibrationMs: Int get() = prefs?.watchCalibrationMs ?: 0
             override fun publishFleet(json: String) { commandExecutor.submit { publishRaw(WatchTogether.TOPIC, json, 1) } }
+            override fun publishMember(slug: String, json: String) {
+                commandExecutor.submit { publishRaw(WatchTogether.MEMBERS_PREFIX + slug, json, 1, retained = true) }
+            }
             override fun publishState(state: String, attrs: org.json.JSONObject) {
                 val p = prefs ?: return
                 commandExecutor.submit {

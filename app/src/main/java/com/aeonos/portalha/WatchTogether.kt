@@ -29,6 +29,8 @@ class WatchTogether(private val host: Host) {
         val slug: String
         val calibrationMs: Int
         fun publishFleet(json: String)
+        /** Retained: this Portal on the members list every wall's picker shows. */
+        fun publishMember(slug: String, json: String)
         fun publishState(state: String, attrs: JSONObject)
         fun openYouTube()
         fun closeYouTube(why: String)
@@ -37,6 +39,14 @@ class WatchTogether(private val host: Host) {
     companion object {
         private const val TAG = "PortalHA"
         const val TOPIC = "portal/watch/set"
+        /** Every Bridge announces itself here (retained), so a wall's picker knows the Portals without HA. */
+        const val MEMBERS_PREFIX = "portal/watch/members/"
+        const val MEMBERS_FILTER = "portal/watch/members/+"
+
+        /** The page-title rule (drop portal_ then plus_/tv_/go_/mini_, spaces, title case): "Coffee Area". */
+        fun displayName(slug: String): String =
+            slug.removePrefix("portal_").replace(Regex("^(plus|tv|go|mini)_"), "").split('_')
+                .joinToString(" ") { w -> w.replaceFirstChar { it.uppercase() } }
         private const val START_LEAD_MS = 3_000L     // play_at this far ahead: every member gets the message and seeks
         private const val PAUSE_LEAD_MS = 600L
 
@@ -141,6 +151,37 @@ class WatchTogether(private val host: Host) {
     private fun broadcast(o: JSONObject) {
         o.put("session", session)
         host.publishFleet(o.toString())
+    }
+
+    private val known = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** portal/watch/members/<slug>: a Portal announced (or, empty, withdrew) itself. */
+    fun onMember(topic: String, payload: String) {
+        val slug = topic.removePrefix(MEMBERS_PREFIX)
+        if (!Regex("^portal_[a-z0-9_]+$").matches(slug)) return
+        if (payload.isBlank()) { known.remove(slug); return }
+        known[slug] = runCatching { JSONObject(payload).optString("name") }.getOrNull()?.ifBlank { null } ?: displayName(slug)
+    }
+
+    /** The Portals for the picker: (slug, name), by name; this Portal is always there. */
+    fun members(): List<Pair<String, String>> {
+        val m = HashMap(known)
+        if (host.slug.isNotEmpty()) m.putIfAbsent(host.slug, displayName(host.slug))
+        return m.entries.map { Pair(it.key, it.value) }.sortedBy { it.second.lowercase() }
+    }
+
+    fun announce() {
+        val s = host.slug
+        if (s.isEmpty()) return
+        host.publishMember(s, JSONObject().put("slug", s).put("name", displayName(s)).toString())
+    }
+
+    /** The wall's picker: ask HA to start a session (automation watch_together_requests -> script.portal_qa_watch). */
+    fun startRequest(video: String, portals: List<String>) {
+        val order = (listOf(host.slug).filter { it in portals }) + portals.filter { it != host.slug }
+        Log.i(TAG, "watch: start request for $video on ${order.joinToString(",")}")
+        host.publishFleet(JSONObject().put("cmd", "start").put("video", video).put("portals", JSONArray(order))
+            .put("from", host.slug).toString())
     }
 
     /** A member's own pad play/pause: ask the leader to do it for the group. */
