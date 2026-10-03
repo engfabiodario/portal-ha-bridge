@@ -145,6 +145,11 @@ class TvAppActivity : Activity() {
             return true
         }
 
+        /** Touch mode changed (DEBUG_CONFIG youtubeTouch): applies to the showing screen at once. */
+        fun setTouchMode(mode: String) {
+            instance?.let { a -> a.runOnUiThread { a.touchMode = mode; a.applyTouchMode() } }
+        }
+
         /** One status line (DEBUG_CONFIG --ez youtubeStatus true, and once a minute while showing). */
         fun status(): String = instance?.statusLine() ?: "youtube: status not showing"
 
@@ -192,6 +197,17 @@ class TvAppActivity : Activity() {
     private lateinit var padHandle: TextView
     private var padShown = true
     private var gestureOnPad = false
+    // How touches on the page drive it (Prefs.youtubeTouch): "mouse" / "native" / "pad".
+    private var touchMode = "mouse"
+    // mouse mode: the gesture in progress (window coordinates = WebView coordinates, it fills the window).
+    private var mDownX = 0f
+    private var mDownY = 0f
+    private var mLastX = 0f
+    private var mLastY = 0f
+    private var mDownTime = 0L
+    private var mDragging = false
+    private var mScrollAccX = 0f
+    private var mScrollAccY = 0f
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -248,6 +264,8 @@ class TvAppActivity : Activity() {
             override fun onLongPress(e: MotionEvent) { if (!standalone && !gestureOnPad) exitToDashboard("long-press") }
         })
 
+        touchMode = runCatching { Prefs(this).youtubeTouch }.getOrDefault("mouse")
+        applyTouchMode()
         loadFromIntent(intent, fresh = true)
         handler.postDelayed(pollRunnable, POLL_MS)
         BridgeService.youtubeStateChanged()
@@ -265,7 +283,7 @@ class TvAppActivity : Activity() {
         lastTouchMs = now; lastPlayingMs = now                     // fresh grace period
         if (wantsStandalone) {
             standalone = true
-            showPad()
+            applyTouchMode()
             when {
                 video.isNotEmpty() -> load("$TV_URL#/watch?v=$video")
                 fresh -> load(TV_URL)
@@ -367,7 +385,7 @@ class TvAppActivity : Activity() {
         val now = System.currentTimeMillis()
         return "youtube: status mode=${if (standalone) "standalone" else "cast"} visible=$visibleNow " +
             "playing=${isPlayingVideo()} video=${lastVideoId.ifEmpty { "-" }} $lastPoll " +
-            "touch=${(now - lastTouchMs) / 1000}s ago played=${(now - lastPlayingMs) / 1000}s ago pad=${if (padShown) "shown" else "hidden"}"
+            "touch=${(now - lastTouchMs) / 1000}s ago played=${(now - lastPlayingMs) / 1000}s ago pad=${if (padShown) "shown" else "hidden"} touchMode=$touchMode"
     }
 
     private fun flushCookies() {
@@ -399,10 +417,96 @@ class TvAppActivity : Activity() {
         }
         gestures.onTouchEvent(ev)
         if (gestureOnPad) return super.dispatchTouchEvent(ev)
+        if (touchMode == "native") return super.dispatchTouchEvent(ev)
+        if (touchMode == "mouse") { mouseFromTouch(ev); return true }
         // youtube.com/tv is remote-driven: a touch on the page itself only brings the pad up
         // (a click would switch the Leanback client into its pointer mode).
         if (ev.actionMasked == MotionEvent.ACTION_DOWN && !padShown) showPad()
         return true
+    }
+
+    // ── Touch as a pointer remote ("mouse" mode) ─────────────────────────────
+    // youtube.com/tv supports a pointer remote (a mouse): hover highlights, click selects, the wheel
+    // scrolls. A finger becomes that pointer: a tap = move + click right where it landed, a drag =
+    // wheel notches along the drag (rows left/right, the page up/down), the finger never "clicks" after a drag.
+
+    private fun mouseEvent(action: Int, x: Float, y: Float, buttons: Int, downTime: Long): MotionEvent {
+        val pp = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE }
+        val pc = MotionEvent.PointerCoords().apply { this.x = x; this.y = y; pressure = 1f; size = 1f }
+        return MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(pp), arrayOf(pc),
+            0, buttons, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_MOUSE, 0)
+    }
+
+    private fun hover(x: Float, y: Float) {
+        val e = mouseEvent(MotionEvent.ACTION_HOVER_MOVE, x, y, 0, SystemClock.uptimeMillis())
+        webView.dispatchGenericMotionEvent(e); e.recycle()
+    }
+
+    private fun click(x: Float, y: Float) {
+        val t = SystemClock.uptimeMillis()
+        val primary = MotionEvent.BUTTON_PRIMARY
+        listOf(
+            mouseEvent(MotionEvent.ACTION_DOWN, x, y, primary, t),
+            mouseEvent(MotionEvent.ACTION_UP, x, y, 0, t)
+        ).forEach { e -> webView.dispatchTouchEvent(e); e.recycle() }
+    }
+
+    private fun wheel(x: Float, y: Float, h: Float, v: Float) {
+        val pp = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE }
+        val pc = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            setAxisValue(MotionEvent.AXIS_HSCROLL, h); setAxisValue(MotionEvent.AXIS_VSCROLL, v)
+        }
+        val t = SystemClock.uptimeMillis()
+        val e = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, 1, arrayOf(pp), arrayOf(pc), 0, 0, 1f, 1f, 0, 0,
+            android.view.InputDevice.SOURCE_MOUSE, 0)
+        webView.dispatchGenericMotionEvent(e); e.recycle()
+    }
+
+    private fun mouseFromTouch(ev: MotionEvent) {
+        val x = ev.x; val y = ev.y
+        val step = dp(48).toFloat()      // finger travel per wheel notch
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                mDownX = x; mDownY = y; mLastX = x; mLastY = y; mDownTime = SystemClock.uptimeMillis()
+                mDragging = false; mScrollAccX = 0f; mScrollAccY = 0f
+                hover(x, y)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!mDragging && Math.hypot((x - mDownX).toDouble(), (y - mDownY).toDouble()) > dp(14)) mDragging = true
+                if (mDragging) {
+                    // Finger left = see more to the right (HSCROLL +); finger up = see further down (VSCROLL -).
+                    mScrollAccX += mLastX - x; mScrollAccY += mLastY - y
+                    val nx = (mScrollAccX / step).toInt(); val ny = (mScrollAccY / step).toInt()
+                    if (nx != 0 || ny != 0) {
+                        wheel(mDownX, mDownY, nx.toFloat(), -ny.toFloat())
+                        mScrollAccX -= nx * step; mScrollAccY -= ny * step
+                        BridgeService.youtubeFrontChanged()
+                    }
+                }
+                mLastX = x; mLastY = y
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!mDragging && SystemClock.uptimeMillis() - mDownTime < 600L) {
+                    click(x, y)
+                    BridgeService.youtubeFrontChanged()
+                }
+                mDragging = false
+            }
+            MotionEvent.ACTION_CANCEL -> mDragging = false
+        }
+    }
+
+    /** Pad up front only in "pad" mode; the other modes keep it one tap away (the Remote handle). */
+    fun applyTouchMode() {
+        if (touchMode == "pad") showPad() else hidePadNow()
+    }
+
+    private fun hidePadNow() {
+        handler.removeCallbacks(padHide)
+        padShown = false
+        pad.visibility = View.GONE
+        padHandle.visibility = View.VISIBLE
     }
 
     private fun onPad(ev: MotionEvent): Boolean {
@@ -506,7 +610,7 @@ class TvAppActivity : Activity() {
     private val padHide = Runnable {
         // Keep it up while nothing plays (browsing / the sign-in code screen): it's the only way around.
         // (playingNow = a video really seen playing - not the launch grace isPlayingVideo() counts.)
-        if (!playingNow) { schedulePadHide(); return@Runnable }
+        if (!playingNow && touchMode == "pad") { schedulePadHide(); return@Runnable }
         padShown = false
         pad.visibility = View.GONE
         padHandle.visibility = View.VISIBLE

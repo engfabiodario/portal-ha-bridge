@@ -2014,6 +2014,12 @@ class BridgeService : Service() {
                     if (!TvAppActivity.pressKey(k)) Log.i(TAG, "youtube: key '$k' ignored - not showing")
                 }
                 if (intent.getBooleanExtra("youtubeStatus", false)) Log.i(TAG, TvAppActivity.status())
+                //   --es youtubeTouch mouse|native|pad  how touches drive the YouTube screen (kept; applies at once)
+                intent.getStringExtra("youtubeTouch")?.let { m ->
+                    p.youtubeTouch = m
+                    TvAppActivity.setTouchMode(p.youtubeTouch)
+                    Log.i(TAG, "config: youtube touch '${p.youtubeTouch}'")
+                }
                 var changed = false
                 intent.getStringExtra("name")?.let { p.deviceName = it; changed = true }
                 intent.getStringExtra("broker")?.let { p.brokerHost = it; changed = true }
