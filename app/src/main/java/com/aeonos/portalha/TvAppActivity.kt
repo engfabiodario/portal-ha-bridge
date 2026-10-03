@@ -178,9 +178,11 @@ class TvAppActivity : Activity() {
   var sel=document.querySelector('ytlr-account-selector');
   if (vis(sel)) {
    var names=Array.prototype.filter.call(sel.querySelectorAll('ytlr-carousel-account yt-formatted-string'), function(e){ var t=e.textContent.trim(); return t && !NOT_ACCOUNTS[t] && vis(e) && !/^@/.test(t) && !/Premium/.test(t); });
-   if (names.length) { var f=sel.querySelector('.zylon-focus'); var pick=names[0];
-     for (var i=0;i<names.length;i++) if (f && f.contains(names[i])) pick=names[i];
-     if (Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); tap(pick); } return 'profile'; }
+   if (names.length) { var f=sel.querySelector('.zylon-focus'); var foc=null;
+     for (var i=0;i<names.length;i++) if (f && f.contains(names[i])) foc=names[i];
+     /* the remote's OK on the focused real account (a tap on a tile only focuses it); none focused: tap the first */
+     if (Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); if (foc) PortalWatch.key('ok'); else tap(names[0].closest('ytlr-tile-renderer')||names[0]); }
+     return 'profile'; }
    if (!W.guest) return 'signin';
    var g=byText('Watch as guest'); if (g && Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); tap(g); } return 'profile';
   }
@@ -820,9 +822,11 @@ class TvAppActivity : Activity() {
                 val k = webView.width / cssWidth
                 val x = (cssX * k).toFloat(); val y = (cssY * k).toFloat()
                 val t = SystemClock.uptimeMillis()
-                listOf(MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0),
-                       MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, x, y, 0)).forEach { e ->
-                    e.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+                val pp = arrayOf(MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER })
+                fun ev(a: Int, et: Long) = MotionEvent.obtain(t, et, a, 1, pp,
+                    arrayOf(MotionEvent.PointerCoords().apply { this.x = x; this.y = y; pressure = 1f; size = 1f }),
+                    0, 0, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_TOUCHSCREEN, 0)
+                listOf(ev(MotionEvent.ACTION_DOWN, t), ev(MotionEvent.ACTION_UP, t + 60)).forEach { e ->
                     webView.dispatchTouchEvent(e); e.recycle()
                 }
             }
