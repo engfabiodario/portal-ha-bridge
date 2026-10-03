@@ -155,6 +155,7 @@ class WatchTogether(private val host: Host) {
         lastReport = o
         val s = o.optString("state")
         if (s.isNotEmpty()) setState(s, force = s == "playing")
+        // End of the video: the group's timeline stops at 0, so 'play' starts it again for everyone.
         if (s == "ended" && isLeader) { gAt = 0L; gPos = 0.0 }
     }
 
