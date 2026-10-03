@@ -36,7 +36,7 @@ class WatchTogether(private val host: Host) {
     companion object {
         private const val TAG = "PortalHA"
         const val TOPIC = "portal/watch/set"
-        private const val START_LEAD_MS = 2_000L     // play_at this far ahead: every member gets the message and seeks
+        private const val START_LEAD_MS = 3_000L     // play_at this far ahead: every member gets the message and seeks
         private const val PAUSE_LEAD_MS = 600L
 
         /** Bridge device name -> HA slug ("Portal_Plus_Kitchen" -> "portal_plus_kitchen"). */
