@@ -256,6 +256,19 @@ class BridgeService : Service() {
         // sync the DIAL app state so the phone offers a fresh launch next time.
         fun castScreenClosed() { instance?.dialServer?.appRunning = false }
 
+        // YouTube screen (TvAppActivity): its showing / mode / playing / video changed -> HA binary sensor.
+        fun youtubeStateChanged() {
+            val svc = instance ?: return
+            svc.commandExecutor.submit { runCatching { svc.prefs?.let { svc.publishYoutubeState(it) } } }
+        }
+
+        // The YouTube screen came to the front (created, or back from a pause): the keep-alive parks Ava
+        // next to it (allowed, see keepAliveHost.parkBlocker) and its corner cover now copies that screen.
+        fun youtubeInFront() { instance?.keepAlive?.onFrontScreenChanged("youtube in front") }
+
+        // The YouTube screen's content moved (a pad key, the pad shown/hidden): re-copy the corner cover.
+        fun youtubeFrontChanged() { instance?.keepAlive?.refreshCoverSoon() }
+
         // Re-evaluate the PTT overlays after a pref/config change.
         fun applyIntercomOverlay(context: Context) =
             context.startForegroundService(Intent(context, BridgeService::class.java)
@@ -710,14 +723,14 @@ class BridgeService : Service() {
     private val ourActivityWatch = object : android.app.Application.ActivityLifecycleCallbacks {
         override fun onActivityResumed(a: android.app.Activity) {
             ourActivitiesResumed++
-            if (a !is DashboardActivity && a !is AvaKeepAliveActivity) otherScreensResumed++
+            if (a !is DashboardActivity && a !is AvaKeepAliveActivity && a !is TvAppActivity) otherScreensResumed++
             // Settings screens and the like have no touch hook of their own; the dashboard and the
             // cast screen do (dispatchTouchEvent), so they're left alone.
             if (a !is DashboardActivity && a !is TvAppActivity) runCatching { noteTouchesOn(a.window) }
         }
         override fun onActivityPaused(a: android.app.Activity) {
             if (ourActivitiesResumed > 0) ourActivitiesResumed--
-            if (a !is DashboardActivity && a !is AvaKeepAliveActivity && otherScreensResumed > 0) otherScreensResumed--
+            if (a !is DashboardActivity && a !is AvaKeepAliveActivity && a !is TvAppActivity && otherScreensResumed > 0) otherScreensResumed--
         }
         override fun onActivityCreated(a: android.app.Activity, b: android.os.Bundle?) {}
         override fun onActivityStarted(a: android.app.Activity) {}
@@ -1733,6 +1746,8 @@ class BridgeService : Service() {
         // Nor over an app the user deliberately opened: waking the screen is not a request to
         // abandon whatever they were watching.
         if (userLeftDashboard) return
+        // Nor over our own YouTube screen (it closes itself when the screen goes off).
+        if (TvAppActivity.isShowing()) return
         runCatching {
             startActivity(Intent(this, DashboardActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
@@ -1986,6 +2001,19 @@ class BridgeService : Service() {
                 if (intent.getBooleanExtra("selfHealStatus", false)) {
                     Log.i("SelfHeal", selfHeal?.status() ?: "status n/a (service starting)")
                 }
+                // YouTube screen (TvAppActivity standalone):
+                //   --ez youtube true|false        open / close (= HA "YouTube" / "YouTube Close")
+                //   --es youtubeVideo <id>         open on that video
+                //   --es youtubeKey up|down|left|right|ok|back|playpause   press a pad key
+                //   --ez youtubeStatus true        logs one "youtube: status ..." line
+                if (intent.hasExtra("youtube")) {
+                    if (intent.getBooleanExtra("youtube", true)) openYouTube("adb") else closeYouTube("adb")
+                }
+                intent.getStringExtra("youtubeVideo")?.let { openYouTube("adb", it.trim()) }
+                intent.getStringExtra("youtubeKey")?.let { k ->
+                    if (!TvAppActivity.pressKey(k)) Log.i(TAG, "youtube: key '$k' ignored - not showing")
+                }
+                if (intent.getBooleanExtra("youtubeStatus", false)) Log.i(TAG, TvAppActivity.status())
                 var changed = false
                 intent.getStringExtra("name")?.let { p.deviceName = it; changed = true }
                 intent.getStringExtra("broker")?.let { p.brokerHost = it; changed = true }
@@ -2217,7 +2245,8 @@ class BridgeService : Service() {
             HaDiscovery.sendspinCommandTopic(p.deviceId),
             HaDiscovery.npOverlayCommandTopic(p.deviceId),
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId),
-            HaDiscovery.selfHealCommandTopic(p.deviceId)
+            HaDiscovery.selfHealCommandTopic(p.deviceId),
+            HaDiscovery.youtubeCommandTopic(p.deviceId)
         ).forEach { client.subscribe(it, 1) }
 
         // Intercom: subscribe to presence/lock/audio and announce ourselves.
@@ -2353,6 +2382,11 @@ class BridgeService : Service() {
         pub(HaDiscovery.selfHealSensorDiscoveryTopic(p.deviceId), HaDiscovery.selfHealSensorConfigPayload(p.deviceId, p.deviceName))
         publishSelfHealSwitchState(p)
         selfHeal?.republish()
+        // YouTube screen: open / close buttons + the showing sensor (TvAppActivity).
+        pub(HaDiscovery.youtubeOpenDiscoveryTopic(p.deviceId), HaDiscovery.youtubeOpenConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.youtubeCloseDiscoveryTopic(p.deviceId), HaDiscovery.youtubeCloseConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.youtubeSensorDiscoveryTopic(p.deviceId), HaDiscovery.youtubeSensorConfigPayload(p.deviceId, p.deviceName))
+        publishYoutubeState(p)
 
         // Camera, motion-enable and streaming-enable switches exist only while
         // the camera service is enabled; motion entities additionally require
@@ -2448,6 +2482,7 @@ class BridgeService : Service() {
             HaDiscovery.npOverlayCommandTopic(p.deviceId)         -> handleNpOverlayCommand(payload, p)
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId)      -> handleAvaKeepAliveCommand(payload, p)
             HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
+            HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
         }
     }
 
@@ -2580,9 +2615,12 @@ class BridgeService : Service() {
         override fun parkBlocker(): String? = when {
             inCall -> "a call is on"
             ringing -> "a call is ringing"
-            TvAppActivity.isShowing() -> "a cast is showing"
             otherScreensResumed > 0 -> "a Bridge screen is open"
             micYieldedForWake -> "a wake hand-off is running"
+            // Our own YouTube screen in front (HA-opened or a phone cast): park next to it like next
+            // to the dashboard, so Ava keeps hearing while a video plays (fleet 2026-10-02).
+            TvAppActivity.isVisible() -> null
+            TvAppActivity.isShowing() -> "the YouTube screen is hidden"
             userLeftDashboard -> "another app in front (the user's choice)"
             screenIsOn && !dashboardForeground -> "another app in front"
             else -> null
@@ -2590,6 +2628,7 @@ class BridgeService : Service() {
         override val screenIsOn: Boolean
             get() = getSystemService(PowerManager::class.java)?.isInteractive ?: screenOn
         override val dashboardInFront: Boolean get() = dashboardForeground
+        override val youtubeInFront: Boolean get() = TvAppActivity.isVisible()
         override val fullScreenOverlayUp: Boolean
             get() = screensaver.isShowing || sleepCover.isShowing ||
                 nowPlayingOverlay?.isShowing == true || wakeCoverView != null
@@ -4332,12 +4371,24 @@ class BridgeService : Service() {
      * included - bringing the dashboard forward PiPs the call UI) and never over a YouTube cast.
      */
     private fun handleNavigateCommand(payload: String, p: Prefs) {
+        // "youtube" / "youtube:<video id>": open the YouTube screen (same as the HA button).
+        youtubeNavigate(payload)?.let { video -> openYouTube("navigate", video.ifEmpty { null }); return }
         val req = parseNavigate(payload)
         if (req == null) { Log.w(TAG, "navigate: refused '$payload' (not a path)"); return }
-        if (req.path.isEmpty()) { wakeHandler.post { returnFromNavigate(timed = false) }; return }
+        if (req.path.isEmpty()) {
+            if (TvAppActivity.isShowing()) { Log.i(TAG, "navigate: 'home' ignored - YouTube is showing"); return }
+            wakeHandler.post { returnFromNavigate(timed = false) }; return
+        }
         if (inCall || ringing) { Log.i(TAG, "navigate: ignored '${req.path}' - a call has the screen"); return }
         if (TvAppActivity.isShowing() || dialServer?.appRunning == true) {
-            Log.i(TAG, "navigate: ignored '${req.path}' - casting"); return
+            // An ALERT (doorbell, intruder: a timed "look at this" - the alerts always send seconds -
+            // or any /portal-alerts page) outranks YouTube: close it, then show the page. Anything else waits.
+            if (!isAlertNavigate(req)) {
+                Log.i(TAG, "navigate: ignored '${req.path}' - YouTube is showing (not an alert)"); return
+            }
+            Log.i(TAG, "navigate: alert '${req.path}' - closing YouTube first")
+            dialServer?.appRunning = false
+            TvAppActivity.close("alert ${req.path}")
         }
         val url = DashboardUrls.page(p.haUrl, req.path)
         if (url.isEmpty()) { Log.w(TAG, "navigate: no Home Assistant URL set"); return }
@@ -4368,6 +4419,71 @@ class BridgeService : Service() {
             }
             if (req.seconds > 0) wakeHandler.postDelayed(navReturn, req.seconds * 1000L)
         }
+    }
+
+    /** An alert-style navigate: shown with dismiss and either timed (seconds) or a /portal-alerts page. */
+    private fun isAlertNavigate(req: NavRequest): Boolean =
+        req.dismiss && (req.seconds > 0 || req.path.startsWith("/portal-alerts"))
+
+    /** "youtube" -> "", "youtube:<id>" (or a JSON path of either) -> the id; null = not a YouTube request. */
+    private fun youtubeNavigate(payload: String): String? {
+        var s = payload.trim()
+        if (s.startsWith("{")) s = runCatching { org.json.JSONObject(s).optString("path", "") }.getOrDefault("").trim()
+        s = s.trimStart('/')
+        if (s.equals("youtube", ignoreCase = true)) return ""
+        if (s.startsWith("youtube:", ignoreCase = true)) {
+            val id = s.substring(8).trim()
+            return if (TvAppActivity.isVideoId(id)) id else ""
+        }
+        return null
+    }
+
+    // -- YouTube screen (TvAppActivity standalone) ----------------------------------
+    private fun handleYoutubeCommand(payload: String) {
+        val s = payload.trim()
+        when {
+            s.equals("open", true) || s.equals("on", true) -> openYouTube("HA button")
+            s.startsWith("open:", true) -> openYouTube("HA", s.substring(5).trim())
+            s.equals("close", true) || s.equals("off", true) -> closeYouTube("HA button")
+            else -> Log.w(TAG, "youtube: unknown command '${s.take(40)}'")
+        }
+    }
+
+    /**
+     * Open the YouTube screen. One of OUR activities, in the dashboard's task: the camera keeps
+     * streaming and the keep-alive parks Ava next to it. Never over a call or an alert page.
+     */
+    private fun openYouTube(why: String, video: String? = null) {
+        wakeHandler.post {
+            if (inCall || ringing) { Log.i(TAG, "youtube: open refused ($why) - a call has the screen"); return@post }
+            if (navPath.startsWith("/portal-alerts")) { Log.i(TAG, "youtube: open refused ($why) - an alert page is showing ($navPath)"); return@post }
+            if (navPath.isNotEmpty()) returnFromNavigate(timed = false)   // the dashboard waits at home underneath
+            Log.i(TAG, "youtube: open ($why${if (video != null) ", video $video" else ""})")
+            val now = System.currentTimeMillis()
+            lastActivityMs = now; lastInteractionMs = now
+            screensaver.hide()
+            ScreenControl.wake(this)
+            runCatching { TvAppActivity.launchStandalone(this, video) }
+                .onFailure { Log.w(TAG, "youtube: open failed: ${it.message}") }
+        }
+    }
+
+    private fun closeYouTube(why: String) {
+        if (!TvAppActivity.isShowing()) { Log.i(TAG, "youtube: close ($why) - not showing"); publishYoutubeStateAsync(); return }
+        dialServer?.appRunning = false
+        TvAppActivity.close(why)
+    }
+
+    private fun publishYoutubeStateAsync() { prefs?.let { p -> commandExecutor.submit { runCatching { publishYoutubeState(p) } } } }
+
+    private fun publishYoutubeState(p: Prefs) {
+        val showing = TvAppActivity.isShowing()
+        publishRaw(HaDiscovery.youtubeStateTopic(p.deviceId), if (showing) "ON" else "OFF", 1, retained = true)
+        val attrs = org.json.JSONObject()
+            .put("mode", TvAppActivity.mode().ifEmpty { "none" })
+            .put("playing", TvAppActivity.isPlayingVideo())
+            .put("video", TvAppActivity.videoId())
+        publishRaw(HaDiscovery.youtubeAttributesTopic(p.deviceId), attrs.toString(), 1, retained = true)
     }
 
     /** Back to the dashboard path. [timed]: the navigate's own timer, which waits out active use. */

@@ -81,7 +81,9 @@ import android.widget.ImageView
  *  - on screen on/off,
  *  - when our logcat reader sees the assistant's uid lose its visible activity or get silenced,
  *  - on a periodic safety tick, and once at start (boot).
- * Never while a call, a cast, one of our own settings screens or another app has the screen, never
+ * Our own YouTube screen (TvAppActivity, HA-opened or a phone cast) counts like the dashboard: the
+ * assistant is parked next to it and the corner cover copies ITS window (fleet 2026-10-02).
+ * Never while a call, one of our own settings screens or another app has the screen, never
  * in a tight loop (minimum gap + rate limit with exponential backoff), and every park is logged with
  * its reason ("keepalive: park #n (<reason>) ...").
  *
@@ -104,6 +106,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         /** The dashboard is in front, possibly next to the parked window (Android 10: resumed;
          *  Android 9: visible - the park pauses it there). */
         val dashboardInFront: Boolean
+        /** Our YouTube screen (TvAppActivity) is visible in front: park next to it, cover from it. */
+        val youtubeInFront: Boolean
         /** One of our full-screen overlays (photos, sleep cover, now playing) is up. */
         val fullScreenOverlayUp: Boolean
         /** elapsedRealtime of the last touch on one of our windows (0 = never). */
@@ -424,6 +428,15 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         main.post { updateCover() }
     }
 
+    /** Another of our full-screen screens (YouTube) came to the front: park next to it, cover from it. */
+    fun onFrontScreenChanged(reason: String) {
+        request(reason, 800L)
+        main.post { updateCover() }
+        refreshCoverSoon()
+    }
+
+    private fun frontInFront(): Boolean = host.dashboardInFront || host.youtubeInFront
+
     // ── Park ─────────────────────────────────────────────────────────────────────
 
     private val attemptRunnable = Runnable {
@@ -574,7 +587,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
 
     /** Cover the corner before the sliver appears (the park itself is a few frames away). */
     private fun coverBeforePark() {
-        if (host.screenIsOn && host.dashboardInFront && !host.fullScreenOverlayUp && !coverShown) setCoverVisible(true)
+        if (host.screenIsOn && frontInFront() && !host.fullScreenOverlayUp && !coverShown) setCoverVisible(true)
     }
 
     private fun freeformOptions(bounds: Rect): android.os.Bundle {
@@ -846,7 +859,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     // the cover shows the very pixels behind it).
     private fun wantCover(): Boolean =
         enabled && freeformOk != false && lastParkMs != 0L &&
-            host.screenIsOn && host.dashboardInFront && !host.fullScreenOverlayUp
+            host.screenIsOn && frontInFront() && !host.fullScreenOverlayUp
 
     private fun updateCover(forceCopy: Boolean = false) {
         val want = wantCover()
@@ -869,9 +882,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val h = copier() ?: return
         h.post {
             val t0 = SystemClock.elapsedRealtimeNanos()
-            DashboardActivity.copyRegion(r) { bmp: Bitmap? ->
-                if (bmp != null && coverShown) coverView?.setImageBitmap(bmp)
-            }
+            val cb = { bmp: Bitmap? -> if (bmp != null && coverShown) coverView?.setImageBitmap(bmp) }
+            if (host.youtubeInFront) TvAppActivity.copyRegion(r, cb) else DashboardActivity.copyRegion(r, cb)
             val us = (SystemClock.elapsedRealtimeNanos() - t0) / 1000L
             if (copyCount == Int.MAX_VALUE) { copyCount = 0; copyTotalUs = 0L }
             copyCount++; copyTotalUs += us

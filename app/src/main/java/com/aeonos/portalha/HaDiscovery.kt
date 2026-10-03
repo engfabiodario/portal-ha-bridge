@@ -297,6 +297,34 @@ object HaDiscovery {
         return """{"name":"Show Dashboard","unique_id":"${deviceId}_show_dashboard","device":${device(deviceId, name)},"command_topic":"${showDashboardCommandTopic(deviceId)}","payload_press":"show","icon":"mdi:monitor-dashboard"}"""
     }
 
+    // ── YouTube (TvAppActivity standalone) ─────────────────────────────────────
+    // Buttons "YouTube" (open) and "YouTube Close" share one command topic; the binary sensor
+    // "YouTube" = the YouTube screen is showing (attributes: mode standalone|cast, playing, video).
+    // Not camera-related; left unexposed to voice like every Bridge entity (expose-new is off).
+
+    fun youtubeCommandTopic(deviceId: String) = "portal/$deviceId/youtube/set"
+    fun youtubeStateTopic(deviceId: String) = "portal/$deviceId/youtube/state"
+    fun youtubeAttributesTopic(deviceId: String) = "portal/$deviceId/youtube/attributes"
+
+    fun youtubeOpenDiscoveryTopic(deviceId: String) = "homeassistant/button/${deviceId}_youtube/config"
+    fun youtubeCloseDiscoveryTopic(deviceId: String) = "homeassistant/button/${deviceId}_youtube_close/config"
+    fun youtubeSensorDiscoveryTopic(deviceId: String) = "homeassistant/binary_sensor/${deviceId}_youtube/config"
+
+    fun youtubeOpenConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"YouTube","unique_id":"${deviceId}_youtube","device":${device(deviceId, name)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"open","icon":"mdi:youtube"}"""
+    }
+
+    fun youtubeCloseConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"YouTube Close","unique_id":"${deviceId}_youtube_close","device":${device(deviceId, name)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"close","icon":"mdi:youtube-tv"}"""
+    }
+
+    fun youtubeSensorConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"YouTube","unique_id":"${deviceId}_youtube_showing","device":${device(deviceId, name)},"state_topic":"${youtubeStateTopic(deviceId)}","json_attributes_topic":"${youtubeAttributesTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:youtube"}"""
+    }
+
     // ── Volume mute switch ────────────────────────────────────────────────────
 
     fun volumeMuteDiscoveryTopic(deviceId: String) =
@@ -584,7 +612,8 @@ object HaDiscovery {
         sendspinCommandTopic(deviceId),
         npOverlayCommandTopic(deviceId),
         avaKeepAliveCommandTopic(deviceId),
-        selfHealCommandTopic(deviceId)
+        selfHealCommandTopic(deviceId),
+        youtubeCommandTopic(deviceId)
     )
 
     // ── Shared helpers ────────────────────────────────────────────────────────
