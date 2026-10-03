@@ -20,7 +20,8 @@ import org.json.JSONObject
  * starts at `at`, then nudges playbackRate (+-3 %, +-6 % above 100 ms) toward
  * pos + (now - at) + its calibration, and seeks only past 0.5 s. A pad play/pause on any member is
  * sent as a "toggle" intent for the whole group. Each member publishes its own state (HA sensor
- * "Watch Together": idle / loading / profile / ready / playing / paused / ended + error, clock).
+ * "Watch Together": idle / loading / profile / signin / ready / armed / playing / pausing / paused / ended
+ * + error, clock). signin = this Portal is not signed in to YouTube (yt.be/activate) and the session did not allow a guest.
  */
 class WatchTogether(private val host: Host) {
 
@@ -48,6 +49,8 @@ class WatchTogether(private val host: Host) {
     @Volatile private var portals: List<String> = emptyList()
     @Volatile private var leader = ""
     @Volatile private var video = ""
+    // The session lets a signed-out Portal play as a guest (HA allow_guest; ads there break the sync).
+    @Volatile private var guest = false
     @Volatile var state = "idle"; private set
     @Volatile private var lastReport = JSONObject()
 
@@ -74,7 +77,7 @@ class WatchTogether(private val host: Host) {
         when (cmd) {
             "play_at" -> { TvAppActivity.watchPlayAt(o.optLong("at"), o.optDouble("pos"), host.calibrationMs); setState("armed") }
             "pause_at" -> { TvAppActivity.watchPauseAt(o.optLong("at")); setState("pausing") }
-            "cue" -> { TvAppActivity.watchCue(video, o.optDouble("pos")); setState("loading") }
+            "cue" -> { TvAppActivity.watchCue(video, o.optDouble("pos"), guest); setState("loading") }
             "stop" -> end("stop", close = true)
             "play", "pause", "toggle", "seek" -> if (isLeader) lead(cmd, o)
         }
@@ -93,12 +96,13 @@ class WatchTogether(private val host: Host) {
         portals = members
         leader = o.optString("leader").ifEmpty { members.first() }
         video = v
+        guest = o.optBoolean("guest", false)
         gPos = o.optDouble("pos", 0.0).coerceAtLeast(0.0); gAt = 0L
         val ntp = o.optString("ntp")
         if (ntp.isNotBlank()) SyncClock.start(ntp)
         Log.i(TAG, "watch: session $session video $video from ${gPos}s, ${members.size} Portals, leader $leader${if (isLeader) " (me)" else ""}, clock $ntp")
         host.openYouTube()
-        TvAppActivity.watchCue(video, gPos)
+        TvAppActivity.watchCue(video, gPos, guest)
         setState("loading")
     }
 

@@ -159,14 +159,38 @@ class TvAppActivity : Activity() {
         private const val WATCH_JS = """
 (function(){
  if (window.__phaW) return;
- var W = window.__phaW = {off:0, mode:'idle', video:'', pos:0, at:0, calib:0, lead:800, seekLead:0.3,
+ var W = window.__phaW = {guest:false, off:0, mode:'idle', video:'', pos:0, at:0, calib:0, lead:800, seekLead:0.3,
    lastKey:0, lastRep:0, pauseAt:0, settleAt:0, fix:'', seeks:0};
- try { var L = JSON.parse(localStorage.getItem('__phaWlearn')||'{}'); if (L.lead) { W.lead=L.lead; W.leadN=1; } if (L.seekLead!=null) W.seekLead=L.seekLead; } catch(e){}
- function save(){ try{ localStorage.setItem('__phaWlearn', JSON.stringify({lead:W.lead, seekLead:W.seekLead})); }catch(e){} }
+ try { var L = JSON.parse(localStorage.getItem('__phaWlearn2')||'{}'); if (L.lead) { W.lead=L.lead; W.leadN=1; } if (L.seekLead!=null) W.seekLead=L.seekLead; } catch(e){}
+ function save(){ try{ localStorage.setItem('__phaWlearn2', JSON.stringify({lead:W.lead, seekLead:W.seekLead})); }catch(e){} }
  function now(){ return Date.now() + W.off; }
  function P(){ return document.querySelector('.html5-video-player'); }
  function V(){ return document.querySelector('video'); }
- function picker(){ var e=document.querySelector('ytlr-account-selector'); return !!(e && e.getBoundingClientRect().width>0); }
+ function vis(e){ if(!e) return false; var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }
+ function byText(t){ var all=document.querySelectorAll('yt-formatted-string,span,div'); for (var i=0;i<all.length;i++){ var e=all[i];
+   if (e.children.length===0 && e.textContent.trim()===t && vis(e)) return e; } return null; }
+ function tap(e){ var r=e.getBoundingClientRect(); PortalWatch.tap(r.left+r.width/2, r.top+r.height/2, window.innerWidth); }
+ var NOT_ACCOUNTS = {'Add account':1, 'Add a kid account':1};
+ /* Account / sign-in screens before a video can play. null = none showing; else a state to report. Signed in:
+    tap the focused account (else the first) - never 'Add account'. Signed out: 'signin' unless the session allows
+    guest playback (W.guest; ads break the sync), then Get started -> Watch as guest. */
+ function gate(){
+  var sel=document.querySelector('ytlr-account-selector');
+  if (vis(sel)) {
+   var names=Array.prototype.filter.call(sel.querySelectorAll('ytlr-carousel-account yt-formatted-string'), function(e){ var t=e.textContent.trim(); return t && !NOT_ACCOUNTS[t] && vis(e) && !/^@/.test(t) && !/Premium/.test(t); });
+   if (names.length) { var f=sel.querySelector('.zylon-focus'); var pick=names[0];
+     for (var i=0;i<names.length;i++) if (f && f.contains(names[i])) pick=names[i];
+     if (Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); tap(pick); } return 'profile'; }
+   if (!W.guest) return 'signin';
+   var g=byText('Watch as guest'); if (g && Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); tap(g); } return 'profile';
+  }
+  var gs=byText('Get started'), act=document.body && document.body.innerText.indexOf('yt.be/activate')>=0;
+  if (!gs && !act) return null;
+  if (!W.guest) return 'signin';
+  var w=byText('Watch as guest');
+  if (Date.now()-W.lastKey>3000) { W.lastKey=Date.now(); if (w) tap(w); else if (gs) tap(gs); else PortalWatch.key('back'); }
+  return 'profile';
+ }
  function curId(){ var m=(location.hash||'').match(/[?&]v=([A-Za-z0-9_-]+)/); return m?m[1]:''; }
  function rep(state, extra){ try{ var v=V(); var o={state:state, t: v?Math.round(v.currentTime*1000)/1000:-1, rate: v?v.playbackRate:1, lead:W.lead, seekLead:W.seekLead, seeks:W.seeks};
    for (var k in (extra||{})) o[k]=extra[k]; PortalWatch.report(JSON.stringify(o)); }catch(e){} }
@@ -179,7 +203,7 @@ class TvAppActivity : Activity() {
  function step(){
   var v=V(), p=P(), n=now();
   if (W.mode==='idle') return null;
-  if (picker()) { if (Date.now()-W.lastKey>3000){ W.lastKey=Date.now(); PortalWatch.key('ok'); } rep('profile'); return 500; }
+  var g=gate(); if (g) { rep(g); return g==='signin' ? 2000 : 500; }
   if (W.mode==='cue' || W.mode==='ready') {
     if (curId()!==W.video) { location.hash='#/watch?v='+W.video; rep('loading'); return 800; }
     if (!v || !p || v.readyState<1) { rep('loading'); return 400; }
@@ -247,7 +271,7 @@ class TvAppActivity : Activity() {
             a.runOnUiThread { a.runWatch(js) }
         }
 
-        fun watchCue(video: String, pos: Double) = watchJs("W.cue('$video',$pos)")
+        fun watchCue(video: String, pos: Double, guest: Boolean = false) = watchJs("W.guest=$guest;W.cue('$video',$pos)")
         fun watchPlayAt(at: Long, pos: Double, calibMs: Int) = watchJs("W.playAt($at,$pos,$calibMs)")
         fun watchPauseAt(at: Long) = watchJs("W.pauseAtT($at)")
         fun watchStop() { if (instance != null) watchJs("W.stop()") else synchronized(pendingWatch) { pendingWatch.clear() } }
@@ -787,6 +811,22 @@ class TvAppActivity : Activity() {
 
         @JavascriptInterface
         fun key(name: String) { runOnUiThread { padKey(name) } }
+
+        /** A real finger tap at a CSS-pixel point of the page (the TV client ignores script clicks). */
+        @JavascriptInterface
+        fun tap(cssX: Double, cssY: Double, cssWidth: Double) {
+            runOnUiThread {
+                if (cssWidth <= 0) return@runOnUiThread
+                val k = webView.width / cssWidth
+                val x = (cssX * k).toFloat(); val y = (cssY * k).toFloat()
+                val t = SystemClock.uptimeMillis()
+                listOf(MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0),
+                       MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, x, y, 0)).forEach { e ->
+                    e.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+                    webView.dispatchTouchEvent(e); e.recycle()
+                }
+            }
+        }
     }
 
     // Fed by the JS shim below with the number of connected remotes each time
