@@ -191,10 +191,11 @@ class TvAppActivity : Activity() {
   if (W.mode==='armed') {
     if (!v || !p) return 200;
     if (curId()!==W.video) { location.hash='#/watch?v='+W.video; return 800; }
-    if (n < W.at - 500) {
+    var hold = W.at - W.lead - 300;
+    if (n < hold) {
       if (!v.paused) p.pauseVideo();
       if (Math.abs(v.currentTime-W.pos)>0.05 && !v.seeking) p.seekTo(W.pos,true);
-      return Math.max(20, Math.min(200, W.at-500-n));
+      return Math.max(20, Math.min(200, hold-n));
     }
     var wait = W.at - W.lead - n;
     if (wait > 4) return Math.min(wait-2, 50);
