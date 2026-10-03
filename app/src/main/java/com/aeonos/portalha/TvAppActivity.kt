@@ -230,12 +230,14 @@ class TvAppActivity : Activity() {
   }
   if (W.mode==='paused') return null;
   if (W.mode==='ended') {   // the client autoplays the next video unsynced: keep it paused until the group plays again
+    // Only the autoplay right after the end (30 s): a video someone picks by hand later is left alone.
+    if (Date.now()-W.endedAt > 30000) return 5000;
     if (v && p && curId()!==W.video && !v.paused) p.pauseVideo();
     return 1000;
   }
   if (W.mode==='playing') {
     if (!v || !p) return 250;
-    if (v.ended || curId()!==W.video) { W.mode='ended'; v.playbackRate=1; rep('ended'); return 500; }
+    if (v.ended || curId()!==W.video) { W.mode='ended'; W.endedAt=Date.now(); v.playbackRate=1; rep('ended'); return 500; }
     if (W.pauseAt && n >= W.pauseAt - 2) { p.pauseVideo(); v.playbackRate=1; W.mode='paused'; W.pauseAt=0; rep('paused'); return null; }
     if (W.pauseAt && W.pauseAt - n < 250) return Math.max(1, W.pauseAt - n - 2);
     if (v.paused && !v.seeking && v.readyState>=3) p.playVideo();
