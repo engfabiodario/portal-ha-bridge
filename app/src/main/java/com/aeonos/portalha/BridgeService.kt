@@ -3748,6 +3748,14 @@ class BridgeService : Service() {
     // HA "Show Dashboard" button: wake the screen and bring the dashboard forward.
     // During a call the call auto-floats into picture-in-picture and keeps running.
     private fun showDashboard() {
+        // Not over our YouTube screen: HA's "Portal proximity - show dashboard" presses this whenever
+        // someone walks up to the Portal - i.e. whoever is watching. "YouTube Close", an alert navigate
+        // and the pad's Close end YouTube; this button only wakes the screen then.
+        if (TvAppActivity.isShowing()) {
+            Log.i(TAG, "show dashboard ignored - YouTube is showing (use YouTube Close)")
+            wakeHandler.post { ScreenControl.wake(this); lastActivityMs = System.currentTimeMillis() }
+            return
+        }
         Log.i(TAG, "show dashboard requested (inCall=$inCall)")
         wakeHandler.post {
             ScreenControl.wake(this)
