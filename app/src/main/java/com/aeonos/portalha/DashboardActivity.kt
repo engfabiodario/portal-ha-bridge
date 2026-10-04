@@ -422,7 +422,40 @@ class DashboardActivity : AppCompatActivity() {
         val home = homeUrl()
         val current = webView.url ?: ""
         if (returned && navUrl == null && home.isNotEmpty() && !DashboardUrls.isAtHome(current, home)) {
+            comeHome(home, current)
+        }
+    }
+
+    /**
+     * Fleet: bring the kiosk home on a resume WITHOUT a full page load whenever the page is still Home Assistant.
+     * Android 10 resumes the dashboard on EVERY screen wake, and a loadUrl() there boots the whole HA frontend again
+     * (white screen + HA logo, ~10 s on a Portal) - measured on the Upstairs Hallway wall 2026-10-04, where the page
+     * itself had moved its address off the start page (/floor-upstairs/<room> -> /this-portal/<room>), so every wake
+     * reloaded. Now:
+     *  - the page declares it is at its home under another address (window.__kioskHomeAlias == location.pathname,
+     *    set by the house's dashboard JS) -> nothing to do;
+     *  - any other page of the same Home Assistant -> the soft navigate (pushState + location-changed, like a navigate
+     *    command): HA's router follows it instantly, no reload;
+     *  - not HA / another origin / no answer to the script -> the full load, as before.
+     */
+    private fun comeHome(home: String, current: String) {
+        if (!DashboardUrls.sameOrigin(current, DashboardUrls.origin(home))) {
+            android.util.Log.i("PortalHA", "resume: not on Home Assistant ('${current.take(80)}') - loading home")
             loadDashboard()
+            return
+        }
+        webView.evaluateJavascript(HOME_CHECK_JS) { r ->
+            when (r?.trim()?.trim('"')) {
+                "alias" -> android.util.Log.i("PortalHA", "resume: page is at its home alias (${current.take(80)}) - kept, no reload")
+                "ha" -> {
+                    android.util.Log.i("PortalHA", "resume: HA page '${current.take(80)}' is not home - soft navigate home")
+                    if (navUrl == null) showTarget()
+                }
+                else -> {
+                    android.util.Log.i("PortalHA", "resume: page is not the HA frontend - loading home")
+                    loadDashboard()
+                }
+            }
         }
     }
 
@@ -561,6 +594,11 @@ class DashboardActivity : AppCompatActivity() {
             }
         }
     }
+
+    // The resume check (comeHome): 'alias' = the page says it is at its home under another address, 'ha' = some other
+    // page of the HA frontend, 'x' = not the HA frontend.
+    private val HOME_CHECK_JS = "(function(){try{if(!document.querySelector('home-assistant'))return 'x';" +
+        "var a=window.__kioskHomeAlias;return (a&&location.pathname===a)?'alias':'ha';}catch(e){return 'x';}})()"
 
     // HA's navigate(): history.pushState + a "location-changed" event on window. Returns 1 when
     // the page is the HA frontend (and was moved), 0 otherwise.
