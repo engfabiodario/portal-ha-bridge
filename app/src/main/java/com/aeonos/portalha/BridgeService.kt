@@ -1550,7 +1550,8 @@ class BridgeService : Service() {
         ensureNowPlayingOverlay()
         sendspinPlayer = SendspinPlayer(this, deviceName = { prefs?.deviceName ?: "Portal" },
                 serverUrl = { prefs?.sendspinServerUrl ?: "" },
-                clientId = { prefs?.deviceId?.let { "portal-ha-bridge-$it" } ?: "" }).apply {
+                clientId = { prefs?.deviceId?.let { "portal-ha-bridge-$it" } ?: "" },
+                codec = { prefs?.sendspinCodec ?: "opus" }).apply {
             onTrack = { t -> onSendspinTrack(t) }
             onArtwork = { bytes -> nowPlayingOverlay?.setArtwork(bytes) }
             start()
@@ -2111,6 +2112,15 @@ class BridgeService : Service() {
                                 if (it.isStreaming) { it.restart(); noteRtspStarted() }
                             }
                         }
+                    }
+                    if (!changed) return
+                }
+                intent.getStringExtra("sendspinCodec")?.let { c ->
+                    val want = if (c.trim().equals("pcm", ignoreCase = true)) "pcm" else "opus"
+                    if (want != p.sendspinCodec) {
+                        p.sendspinCodec = want
+                        Log.i(TAG, "config: sendspin codec '$want'")
+                        restartSendspin()
                     }
                     if (!changed) return
                 }
