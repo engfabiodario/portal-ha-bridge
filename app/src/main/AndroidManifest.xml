@@ -217,6 +217,9 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- fleet: an update installed without adb (Immortal Fleet Agent, in-app updater) kills the
+                     process and nothing restarts it; come back on our own replacement. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
