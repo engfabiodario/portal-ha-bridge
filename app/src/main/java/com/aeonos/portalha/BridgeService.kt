@@ -339,6 +339,11 @@ class BridgeService : Service() {
         // A touch or key reached the dashboard — restart the photo-frame countdown.
         fun noteUserInteraction() { instance?.lastInteractionMs = System.currentTimeMillis() }
 
+        // Fleet (Portal TV): a remote key while the photos are on screen drives the photos instead of the
+        // hidden dashboard (ScreensaverOverlay.onRemoteKey). False = not for the photos, deliver it normally.
+        fun screensaverRemoteKey(keyCode: Int): Boolean =
+            runCatching { instance?.screensaver?.onRemoteKey(keyCode) ?: false }.getOrDefault(false)
+
         // Real input only — see DashboardActivity.dispatchTouchEvent for why this can't just
         // read lastInteractionMs. Starts at 0 so a freshly started service correctly believes
         // nobody has touched anything yet.

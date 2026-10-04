@@ -356,7 +356,33 @@ class DashboardActivity : AppCompatActivity() {
     override fun dispatchKeyEvent(ev: android.view.KeyEvent): Boolean {
         BridgeService.noteUserInput()
         BridgeService.noteTouch()
+        // Fleet (Portal TV "ripley": no touchscreen, D-pad remote): the photo screensaver is a non-focusable
+        // overlay, so the remote's keys arrive HERE, under the photos. Give them to the photos first (left/right
+        // browse, OK/up/down/Back exit) and swallow the rest of that key press (repeats + the up). Touch
+        // Portals never get here: their only keys are volume, which this leaves alone.
+        if (noTouchscreen && isRemoteNavKey(ev.keyCode)) {
+            if (ev.action == android.view.KeyEvent.ACTION_DOWN) {
+                if (photoKey == ev.keyCode) return true
+                if (ev.repeatCount == 0 && BridgeService.screensaverRemoteKey(ev.keyCode)) { photoKey = ev.keyCode; return true }
+            } else if (ev.action == android.view.KeyEvent.ACTION_UP && photoKey == ev.keyCode) {
+                photoKey = -1
+                return true
+            }
+        }
         return super.dispatchKeyEvent(ev)
+    }
+
+    private val noTouchscreen by lazy {
+        !packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TOUCHSCREEN)
+    }
+    private var photoKey = -1          // the remote key whose press went to the photo screensaver
+
+    private fun isRemoteNavKey(code: Int): Boolean = when (code) {
+        android.view.KeyEvent.KEYCODE_DPAD_UP, android.view.KeyEvent.KEYCODE_DPAD_DOWN,
+        android.view.KeyEvent.KEYCODE_DPAD_LEFT, android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+        android.view.KeyEvent.KEYCODE_DPAD_CENTER, android.view.KeyEvent.KEYCODE_ENTER,
+        android.view.KeyEvent.KEYCODE_NUMPAD_ENTER, android.view.KeyEvent.KEYCODE_BACK -> true
+        else -> false
     }
 
     // Someone — or something — is putting another screen in front of us. This catches a

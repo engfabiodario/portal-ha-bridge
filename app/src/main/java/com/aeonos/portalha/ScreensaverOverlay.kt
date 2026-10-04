@@ -219,6 +219,25 @@ class ScreensaverOverlay(private val context: Context) {
         }
     }
 
+    /**
+     * Portal TV (no touchscreen, a D-pad remote): the overlay is not focusable, so remote keys land on the
+     * dashboard under the photos - DashboardActivity hands them here first. While the photos are on screen:
+     * left / right = previous / next photo (like the side thirds), any other navigation key (OK, up, down,
+     * Back) = exit (like the centre tap). Returns true when the key was used for the photos.
+     */
+    fun onRemoteKey(keyCode: Int): Boolean {
+        if (!isShowing) return false
+        when (keyCode) {
+            android.view.KeyEvent.KEYCODE_DPAD_LEFT -> sendKey("ArrowLeft", "previous (remote)")
+            android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> sendKey("ArrowRight", "next (remote)")
+            else -> {
+                android.util.Log.i(TAG, "screensaver: remote key $keyCode -> exit")
+                onExit?.invoke()
+            }
+        }
+        return true
+    }
+
     private fun onTap(x: Float, width: Int) {
         if (width <= 0) return
         when {
