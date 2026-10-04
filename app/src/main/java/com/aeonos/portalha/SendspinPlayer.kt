@@ -56,9 +56,6 @@ class SendspinPlayer(
     // app restart or reboot shows up in Music Assistant as a NEW player (stale duplicates, and HA's
     // media_player points at a dead one). Blank = library default (random).
     private val clientId: () -> String = { "" },
-    // 'opus' (default) = ask Music Assistant for Opus first (~130 kbps instead of 1.5 Mbps PCM) and decode
-    // it here; 'pcm' = raw PCM only (the old behaviour). DEBUG_CONFIG --es sendspinCodec opus|pcm.
-    private val codec: () -> String = { "opus" },
 ) {
     private companion object { const val TAG = "PortalHA" }
 
@@ -176,24 +173,14 @@ class SendspinPlayer(
             .addLast(KotlinJsonAdapterFactory())
             .build()
 
-        // Opus first (when this Portal has an Opus decoder): raw PCM is 1.5 Mbps per Portal, and a
-        // Portal+ on weak Wi-Fi (Coffee Area 2026-10-03: ~420 ms ping) stalled for seconds and played
-        // nothing. Opus is ~10x smaller and cheap to decode (MediaCodec). The server takes the FIRST
-        // format it can encode (spec: priority order), so PCM stays listed as the fallback.
-        val wantOpus = !codec().equals("pcm", ignoreCase = true) && SendspinAudioPlayer.opusDecoderAvailable()
-        val formats = buildList {
-            if (wantOpus) add(AudioFormat(codec = "opus", channels = 2, sampleRate = 48000, bitDepth = 16))
-            add(AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16))
-            add(AudioFormat(codec = "pcm", channels = 2, sampleRate = 44100, bitDepth = 16))
-        }
-        Log.i(TAG, "sendspin: formats offered ${formats.joinToString { it.codec + "/" + it.sampleRate }}")
+        // PCM only: the Portal has no spare headroom for decoding, and on a LAN the bandwidth
+        // is irrelevant. Artwork is requested at a size that suits the now-playing overlay.
         val prefs = ClientPreferences(
-            supportedFormats = formats,
+            supportedFormats = listOf(
+                AudioFormat(codec = "pcm", channels = 2, sampleRate = 44100, bitDepth = 16),
+                AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
+            ),
             artworkChannels = listOf(ArtworkChannel(source = "album", format = "jpeg")),
-            // 4 MB (~21 s of 48 kHz PCM) instead of the library's 256 KB (~1.4 s): the server may only run as far
-            // ahead as this, and a Portal+ on weak Wi-Fi (Coffee Area 2026-10-03: ~420 ms ping, one 9.5 s TCP stall)
-            // drained 1.4 s at once and played nothing. MAX_FUTURE in the library is 30 s, so 21 s is inside it.
-            playerBufferCapacity = 4 * 1024 * 1024,
             supportedOptionalRoles = setOf(
                 OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER),
         )

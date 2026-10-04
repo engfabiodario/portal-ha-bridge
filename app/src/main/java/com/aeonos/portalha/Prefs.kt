@@ -72,11 +72,6 @@ class Prefs(private val context: Context) {
         get() = sp.getString("sendspin_server_url", "") ?: ""
         set(v) = sp.edit().putString("sendspin_server_url", v.trim()).apply()
 
-    // Sendspin codec preference: "opus" (default, ~130 kbps, decoded on the Portal) or "pcm" (1.5 Mbps raw).
-    var sendspinCodec: String
-        get() = sp.getString("sendspin_codec", "opus") ?: "opus"
-        set(v) = sp.edit().putString("sendspin_codec", v.trim().lowercase()).apply()
-
     // Show the on-screen now-playing overlay (art / title / controls / lyrics) while the Portal
     // is playing as a DLNA speaker. Independent of dlnaEnabled so playback can be silent-screen.
     var nowPlayingOverlayEnabled: Boolean
