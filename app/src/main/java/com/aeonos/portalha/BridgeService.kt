@@ -2294,6 +2294,7 @@ class BridgeService : Service() {
             HaDiscovery.screensaverCommandTopic(p.deviceId),
             HaDiscovery.screensaverDismissCommandTopic(p.deviceId),
             HaDiscovery.screensaverHoldCommandTopic(p.deviceId),
+            HaDiscovery.screensaverBrightnessCommandTopic(p.deviceId),
             // Shared across the fleet, so one HA action clears the photos everywhere.
             HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC,
             HaDiscovery.navigateCommandTopic(p.deviceId),
@@ -2430,6 +2431,8 @@ class BridgeService : Service() {
         pub(HaDiscovery.screensaverDiscoveryTopic(p.deviceId), HaDiscovery.screensaverConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverDismissDiscoveryTopic(p.deviceId), HaDiscovery.screensaverDismissConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverHoldDiscoveryTopic(p.deviceId), HaDiscovery.screensaverHoldConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.screensaverBrightnessDiscoveryTopic(p.deviceId), HaDiscovery.screensaverBrightnessConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.screensaverShowingDiscoveryTopic(p.deviceId), HaDiscovery.screensaverShowingConfigPayload(p.deviceId, p.deviceName))
         // Fleet button: identical payload from every Portal, so HA keeps exactly one entity.
         pub(HaDiscovery.fleetScreensaverDismissDiscoveryTopic(), HaDiscovery.fleetScreensaverDismissConfigPayload())
         // Navigate: per Portal, plus one fleet-wide entity (identical from every Portal).
@@ -2543,6 +2546,7 @@ class BridgeService : Service() {
             HaDiscovery.screensaverDismissCommandTopic(p.deviceId),
             HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC           -> dismissScreensaverFromHa(payload, p)
             HaDiscovery.screensaverHoldCommandTopic(p.deviceId)   -> handleScreensaverHoldCommand(payload, p)
+            HaDiscovery.screensaverBrightnessCommandTopic(p.deviceId) -> handleScreensaverBrightnessCommand(payload, p)
             HaDiscovery.navigateCommandTopic(p.deviceId),
             HaDiscovery.NAVIGATE_FLEET_TOPIC                      -> handleNavigateCommand(payload, p)
             HaDiscovery.brightnessCommandTopic(p.deviceId)        -> handleBrightnessCommand(payload, p)
@@ -3355,7 +3359,16 @@ class BridgeService : Service() {
     private var alexaBar: AlexaBarOverlay? = null
     private var falconReadiness: FalconReadiness? = null
 
-    private val screensaver by lazy { ScreensaverOverlay(this) }
+    private val screensaver by lazy {
+        ScreensaverOverlay(this).also { s ->
+            s.brightnessPct = prefs?.screensaverBrightness ?: 0
+            s.onShowingChanged = { on ->
+                prefs?.let { pp ->
+                    publishRaw(HaDiscovery.screensaverShowingStateTopic(pp.deviceId), if (on) "ON" else "OFF", 1, retained = true)
+                }
+            }
+        }
+    }
     private val sleepCover by lazy { SleepCover(this) }
     private var dreamObserver: android.database.ContentObserver? = null
     @Volatile private var lastDreamClaimMs = 0L
@@ -4787,6 +4800,14 @@ class BridgeService : Service() {
         }.onFailure { Log.w(TAG, "os timeout reconcile failed: ${it.message}") }
     }
 
+    private fun handleScreensaverBrightnessCommand(payload: String, p: Prefs) {
+        val pct = payload.trim().toFloatOrNull()?.toInt() ?: return
+        p.screensaverBrightness = pct
+        screensaver.brightnessPct = p.screensaverBrightness
+        publishScreensaverState(p)
+        Log.i(TAG, "screensaver: photo brightness set to ${p.screensaverBrightness}%")
+    }
+
     private fun handleScreensaverHoldCommand(payload: String, p: Prefs) {
         val secs = payload.trim().toFloatOrNull()?.toInt() ?: return
         p.screensaverDismissHoldSecs = secs
@@ -4799,6 +4820,10 @@ class BridgeService : Service() {
             if (p.screensaverEnabled) "ON" else "OFF", 1, retained = true)
         publishRaw(HaDiscovery.screensaverHoldStateTopic(p.deviceId),
             p.screensaverDismissHoldSecs.toString(), 1, retained = true)
+        publishRaw(HaDiscovery.screensaverBrightnessStateTopic(p.deviceId),
+            p.screensaverBrightness.toString(), 1, retained = true)
+        publishRaw(HaDiscovery.screensaverShowingStateTopic(p.deviceId),
+            if (screensaver.isShowing) "ON" else "OFF", 1, retained = true)
     }
 
     private fun publishDisplayStates(p: Prefs) {

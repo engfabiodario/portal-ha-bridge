@@ -540,6 +540,14 @@ class Prefs(private val context: Context) {
         get() = sp.getInt("screensaver_dismiss_hold_secs", 60)
         set(v) = sp.edit().putInt("screensaver_dismiss_hold_secs", v.coerceIn(0, 3600)).apply()
 
+    // Fleet: screen brightness (%) while the photo screensaver is ON SCREEN; 0 = the dashboard's
+    // brightness (no change). Applied as the photo window's own brightness override, so it ends by
+    // itself the moment the photos are concealed or gone - the system brightness HA sets is never
+    // touched. Only ever DIMS: at or above the system brightness it does nothing.
+    var screensaverBrightness: Int
+        get() = sp.getInt("screensaver_brightness", 0)
+        set(v) = sp.edit().putInt("screensaver_brightness", v.coerceIn(0, 100)).apply()
+
     // Shorten Portal OS's own screen timeout (its "ambient display" setting, plain
     // system screen_off_timeout, 5 minutes by default). It has no effect while our dashboard is
     // in front — FLAG_KEEP_SCREEN_ON blocks that path entirely — so this only matters in the

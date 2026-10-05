@@ -57,6 +57,40 @@ class ScreensaverOverlay(private val context: Context) {
     // The window's params, kept so a concealed (prestaged) frame can be made untouchable.
     private var winLp: WindowManager.LayoutParams? = null
 
+    /** Fleet: brightness % while the photos are on screen (0 = no override). Any thread. */
+    @Volatile var brightnessPct: Int = 0
+        set(v) { field = v.coerceIn(0, 100); main.post { applyBrightness() } }
+
+    /** Fleet: called (main thread) whenever the photos appear on / leave the screen. */
+    var onShowingChanged: ((Boolean) -> Unit)? = null
+    private var lastReported: Boolean? = null
+
+    /**
+     * The photo window's own screenBrightness override: [brightnessPct] while visible, none while
+     * concealed (removing the window ends it by itself). Never at or above the system brightness.
+     * Main thread.
+     */
+    private fun applyBrightness() {
+        val v = root
+        val lp = winLp
+        val showing = v != null && lp != null && visible
+        if (v != null && lp != null) {
+            val sys = runCatching {
+                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, 255) / 255f
+            }.getOrDefault(1f)
+            val want = if (showing && brightnessPct in 1..100 && brightnessPct / 100f < sys) brightnessPct / 100f
+                else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            if (lp.screenBrightness != want) {
+                lp.screenBrightness = want
+                runCatching { wm.updateViewLayout(v, lp) }
+                    .onFailure { android.util.Log.w(TAG, "screensaver: brightness failed: ${it.message}") }
+                android.util.Log.i(TAG, "screensaver: brightness override " +
+                    (if (want < 0) "none" else "${(want * 100).toInt()}%"))
+            }
+        }
+        if (lastReported != showing) { lastReported = showing; onShowingChanged?.invoke(showing) }
+    }
+
     /** Photos are on screen right now. */
     val isShowing: Boolean get() = root != null && visible
 
@@ -102,6 +136,7 @@ class ScreensaverOverlay(private val context: Context) {
             // animation would just be work nobody can see.
             if (want) v.animate().alpha(1f).setDuration(FADE_MS).start() else v.alpha = 0f
             android.util.Log.i(TAG, "screensaver: ${if (want) "revealed (prestaged)" else "concealed"}")
+            applyBrightness()
         }
     }
 
@@ -186,6 +221,7 @@ class ScreensaverOverlay(private val context: Context) {
                 wv.loadUrl(url)
                 android.util.Log.i(TAG,
                     if (showNow) "screensaver: shown ($url)" else "screensaver: prestaged ($url)")
+                applyBrightness()
             }.onFailure {
                 android.util.Log.w(TAG, "screensaver: show failed: ${it.message}")
                 root = null
@@ -216,6 +252,7 @@ class ScreensaverOverlay(private val context: Context) {
                 }
             }.start()
             android.util.Log.i(TAG, "screensaver: hidden")
+            if (lastReported != false) { lastReported = false; onShowingChanged?.invoke(false) }
         }
     }
 

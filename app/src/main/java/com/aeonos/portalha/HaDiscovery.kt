@@ -371,6 +371,23 @@ object HaDiscovery {
         return """{"name":"Screensaver Dismiss Hold","unique_id":"${deviceId}_screensaver_hold","device":${device(deviceId, name)},"state_topic":"${screensaverHoldStateTopic(deviceId)}","command_topic":"${screensaverHoldCommandTopic(deviceId)}","min":0,"max":3600,"step":15,"unit_of_measurement":"s","mode":"box","icon":"mdi:timer-pause-outline"}"""
     }
 
+    // Fleet: brightness while the photos are on screen (0 = same as the dashboard) + whether they are.
+    fun screensaverBrightnessDiscoveryTopic(deviceId: String) =
+        "homeassistant/number/${deviceId}_screensaver_brightness/config"
+    fun screensaverBrightnessStateTopic(deviceId: String) = "portal/$deviceId/screensaver/brightness/state"
+    fun screensaverBrightnessCommandTopic(deviceId: String) = "portal/$deviceId/screensaver/brightness/set"
+    fun screensaverBrightnessConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Photo Brightness","unique_id":"${deviceId}_screensaver_brightness","device":${device(deviceId, name)},"state_topic":"${screensaverBrightnessStateTopic(deviceId)}","command_topic":"${screensaverBrightnessCommandTopic(deviceId)}","min":0,"max":100,"step":1,"unit_of_measurement":"%","mode":"slider","entity_category":"config","icon":"mdi:brightness-6"}"""
+    }
+    fun screensaverShowingDiscoveryTopic(deviceId: String) =
+        "homeassistant/binary_sensor/${deviceId}_photos_showing/config"
+    fun screensaverShowingStateTopic(deviceId: String) = "portal/$deviceId/screensaver/showing"
+    fun screensaverShowingConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Photos Showing","unique_id":"${deviceId}_photos_showing","device":${device(deviceId, name)},"state_topic":"${screensaverShowingStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:image-frame"}"""
+    }
+
     fun screensaverDismissCommandTopic(deviceId: String) = "portal/$deviceId/screensaver/dismiss"
 
     fun screensaverDismissDiscoveryTopic(deviceId: String) =
