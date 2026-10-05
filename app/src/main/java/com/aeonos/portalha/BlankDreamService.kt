@@ -28,6 +28,14 @@ import android.view.View
  */
 class BlankDreamService : DreamService() {
 
+    override fun onCreate() {
+        super.onCreate()
+        // fleet: the system starts this dream at the screen timeout even when our process had died -
+        // it then re-creates the process for the dream alone (black screen, no camera, no MQTT; a tap
+        // shows the launcher). Bring the Bridge service back with it.
+        BridgeService.revive(this, "dream started")
+    }
+
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         // Interactive so a tap can dismiss it; not bright, because there is nothing to light up.

@@ -399,6 +399,14 @@ class TvAppActivity : Activity() {
                 view: WebView, request: WebResourceRequest
             ): Boolean = false   // keep everything in the TV client
 
+            // fleet: an unhandled renderer death kills the WHOLE app (camera, MQTT, dashboard) -
+            // close the TV screen instead; the dashboard handles its own renderer loss.
+            override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+                android.util.Log.w("PortalHA", "youtube: WebView renderer gone (crash=${detail.didCrash()}) - closing the TV screen")
+                finish()   // onDestroy tears the WebView down
+                return true
+            }
+
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 view.evaluateJavascript(loungeShimJs(), null)
             }

@@ -23,6 +23,9 @@ class ScreenAccessibility : AccessibilityService() {
 
     override fun onServiceConnected() {
         instance = this
+        // fleet: Android rebinds an enabled accessibility service as soon as our process is
+        // re-created (e.g. after a crash) - the most reliable hook to bring the Bridge back.
+        BridgeService.revive(this, "accessibility service connected")
         // Event types come from the XML config (typeWindowStateChanged). Do NOT override
         // serviceInfo here — a runtime setServiceInfo after a package update could land before
         // the system finishes wiring event delivery and leave us bound but deaf to events

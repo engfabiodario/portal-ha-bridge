@@ -11,6 +11,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -183,7 +184,19 @@ class ScreensaverOverlay(private val context: Context) {
                     useWideViewPort = true
                 }
                 // Keep any navigation the page does inside this WebView.
-                wv.webViewClient = WebViewClient()
+                // fleet: the overlay (prestaged) lives for the whole process, and every WebView of an
+                // app shares ONE renderer. When that renderer dies (OOM / LMK - 2026-10-05: Dining Room
+                // + Upstairs Hallway while HA hung), a WebViewClient that does not handle
+                // onRenderProcessGone makes Android KILL THE WHOLE APP: camera, MQTT and the dashboard
+                // were gone and only the launcher was left. Drop the overlay instead; it is rebuilt on
+                // the next show.
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                        android.util.Log.w(TAG, "screensaver: WebView renderer gone (crash=${detail.didCrash()}) - overlay dropped, app kept alive")
+                        main.post { dropAfterRendererGone(view) }
+                        return true
+                    }
+                }
                 container.addView(wv, FrameLayout.LayoutParams(MATCH, MATCH))
 
                 // Transparent catcher ABOVE the page: added last, so it wins every touch.
@@ -230,6 +243,21 @@ class ScreensaverOverlay(private val context: Context) {
                 visible = false
             }
         }
+    }
+
+    /** The renderer died under this overlay: remove it at once (no fade - the page is gone). */
+    private fun dropAfterRendererGone(wv: WebView) {
+        val v = root
+        if (v != null && web === wv) {
+            root = null
+            onExit = null
+            visible = false
+            winLp = null
+            web = null
+            runCatching { wm.removeView(v) }
+            if (lastReported != false) { lastReported = false; onShowingChanged?.invoke(false) }
+        }
+        runCatching { (wv.parent as? ViewGroup)?.removeView(wv); wv.destroy() }
     }
 
     fun hide() {

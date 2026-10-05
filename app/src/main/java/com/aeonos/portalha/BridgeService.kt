@@ -194,6 +194,7 @@ class BridgeService : Service() {
         private const val EXTRA_ROTATION = "rotation"
         private const val ACTION_ENSURE_CAMERA = "com.aeonos.portalha.ENSURE_CAMERA"
         private const val ACTION_BOOTED = "com.aeonos.portalha.BOOTED"
+        private const val ACTION_REVIVE = "com.aeonos.portalha.REVIVE"
         private const val ACTION_APPLY_DISPLAY = "com.aeonos.portalha.APPLY_DISPLAY"
         private const val ACTION_APPLY_MEDIA = "com.aeonos.portalha.APPLY_MEDIA"
 
@@ -382,6 +383,26 @@ class BridgeService : Service() {
 
         fun start(context: Context) =
             context.startForegroundService(Intent(context, BridgeService::class.java))
+
+        /** True between onCreate and onDestroy of the service in THIS process. */
+        @Volatile var serviceAlive = false
+            private set
+
+        /**
+         * fleet (2026-10-05): the app process can come back WITHOUT this service - Android re-spawns
+         * it for our dream (BlankDreamService) or the accessibility service after a crash, and a
+         * crashed sticky service is not always restarted (Dining Room / Upstairs Hallway: process
+         * alive, no MQTT, no camera, launcher on screen for hours). Any of our components that
+         * Android starts on its own calls this: no service in this process = start it, and treat
+         * it like a sticky restart (dashboard back when nothing else is in front).
+         */
+        fun revive(context: Context, why: String) {
+            if (serviceAlive) return
+            Log.w(TAG, "revive: Bridge service not running in this process ($why) - starting it")
+            runCatching {
+                context.startForegroundService(Intent(context, BridgeService::class.java).setAction(ACTION_REVIVE))
+            }.onFailure { Log.w(TAG, "revive: start failed: ${it.message}") }
+        }
 
         fun startFromBoot(context: Context) =
             context.startForegroundService(Intent(context, BridgeService::class.java)
@@ -980,6 +1001,7 @@ class BridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        serviceAlive = true
         installRtspCrashGuard()
         createChannel()
         startForeground(NOTIF_ID, notification("Starting…"))
@@ -1211,7 +1233,7 @@ class BridgeService : Service() {
         // Android restarted only this service, with a null intent. Nothing brought the dashboard
         // back (Office 19:19: no resumed activity, no camera, RTSP not listening until it was
         // started by hand), so do what the boot path does - our own DashboardActivity only.
-        if (intent == null) scheduleRestartFront()
+        if (intent == null || intent.action == ACTION_REVIVE) scheduleRestartFront()
         if (intent?.action == ACTION_BOOTED) {
             val p = prefs ?: Prefs(this).also { prefs = it }
             if (p.startOnBoot) {
@@ -1280,6 +1302,7 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
+        serviceAlive = false
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
         runCatching { selfHeal?.stop() }; selfHeal = null
