@@ -195,6 +195,8 @@ class BridgeService : Service() {
         private const val ACTION_ENSURE_CAMERA = "com.aeonos.portalha.ENSURE_CAMERA"
         private const val ACTION_BOOTED = "com.aeonos.portalha.BOOTED"
         private const val ACTION_REVIVE = "com.aeonos.portalha.REVIVE"
+        private const val HA_STATUS_TOPIC = "homeassistant/status"          // HA's MQTT birth / last will
+        private const val REPUBLISH_AFTER_CONNECT_MS = 20_000L
         private const val ACTION_APPLY_DISPLAY = "com.aeonos.portalha.APPLY_DISPLAY"
         private const val ACTION_APPLY_MEDIA = "com.aeonos.portalha.APPLY_MEDIA"
 
@@ -2345,7 +2347,8 @@ class BridgeService : Service() {
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             // Watch together: shared by every Portal (never purged or retained).
             WatchTogether.TOPIC,
-            WatchTogether.MEMBERS_FILTER
+            WatchTogether.MEMBERS_FILTER,
+            HA_STATUS_TOPIC
         ).forEach { client.subscribe(it, 1) }
 
         // Intercom: subscribe to presence/lock/audio and announce ourselves.
@@ -2363,23 +2366,14 @@ class BridgeService : Service() {
         publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
 
         // Initial states
-        val pm = getSystemService(PowerManager::class.java)
-        publishState(if (pm.isInteractive) "ON" else "OFF")
-        publishSensitivityState(p)
-        publishMicState(p)
-        publishVolumeState(p)
-        publishVolumeMuteState(p)
-        publishBrightnessState(p)
-        publishDisplayStates(p)
-        publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
-        publishDashboardPathState(p)
-        publishNavigateState(p)
-        if (sensorBridge?.hasTemperature == true)
-            publishRaw(HaDiscovery.tempOffsetStateTopic(p.deviceId), "%.1f".format(p.tempOffset), 1, retained = true)
+        publishAllStates(p)
+        // fleet (2026-10-05): a state published while HA's own broker session was down is lost for HA - an empty
+        // retained publish (navigate cleared) leaves nothing for HA to re-read, so text.<slug>_navigate stayed
+        // '/portal-alerts/doorbell' after the HA/broker hang and the proximity wake skipped every Portal. Publish
+        // everything again 20 s after each connect (HA's MQTT usually reconnects in the same seconds) and whenever
+        // HA announces itself (homeassistant/status online, see handleMessage).
+        scheduleRepublish(client, REPUBLISH_AFTER_CONNECT_MS, "20 s after the broker connect")
         if (p.cameraServiceEnabled) {
-            publishRaw(HaDiscovery.cameraStateTopic(p.deviceId), if (cameraActive) "ON" else "OFF", 1, retained = true)
-            publishFeatureSwitchStates(p)
-            if (p.motionEnabled) publishMotionSensitivityState(p)
             // Restore desired camera state after an app restart / reboot
             // (commands are no longer retained on the broker, so we do this ourselves).
             // MUST run on the commandExecutor: every other stream start/stop/restart
@@ -2406,6 +2400,50 @@ class BridgeService : Service() {
             mqtt = null
             runCatching { client.disconnect(0) }
         }
+    }
+
+    /** Every state the Bridge keeps retained for HA (no side effects: never starts or stops anything). */
+    private fun publishAllStates(p: Prefs) {
+        val pm = getSystemService(PowerManager::class.java)
+        publishState(if (pm.isInteractive) "ON" else "OFF")
+        publishSensitivityState(p)
+        publishMicState(p)
+        publishVolumeState(p)
+        publishVolumeMuteState(p)
+        publishBrightnessState(p)
+        publishDisplayStates(p)
+        publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
+        publishDashboardPathState(p)
+        publishNavigateState(p)
+        publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
+        if (sensorBridge?.hasTemperature == true)
+            publishRaw(HaDiscovery.tempOffsetStateTopic(p.deviceId), "%.1f".format(p.tempOffset), 1, retained = true)
+        if (p.cameraServiceEnabled) {
+            publishRaw(HaDiscovery.cameraStateTopic(p.deviceId), if (cameraActive) "ON" else "OFF", 1, retained = true)
+            publishFeatureSwitchStates(p)
+            if (p.motionEnabled) publishMotionSensitivityState(p)
+        }
+    }
+
+    /**
+     * Discovery + every retained state again, [delayMs] from now, if [client] is still the live session (a newer
+     * session publishes for itself). Runs on the command executor like every other publish burst.
+     */
+    private fun scheduleRepublish(client: MqttClient, delayMs: Long, why: String) {
+        timeoutHandler.postDelayed({
+            if (mqtt !== client || !client.isConnected) return@postDelayed
+            runCatching {
+                commandExecutor.submit {
+                    runCatching {
+                        val p = prefs ?: return@runCatching
+                        if (mqtt !== client || !client.isConnected) return@runCatching
+                        publishDiscovery(client, p)
+                        publishAllStates(p)
+                        Log.i(TAG, "mqtt: re-published discovery + states ($why)")
+                    }.onFailure { Log.w(TAG, "mqtt: re-publish failed: ${it.message}") }
+                }
+            }
+        }, delayMs)
     }
 
     private fun publishDiscovery(client: MqttClient, p: Prefs) {
@@ -2557,6 +2595,13 @@ class BridgeService : Service() {
 
     private fun handleMessage(topic: String, payload: String, p: Prefs) {
         if (topic.startsWith(WatchTogether.MEMBERS_PREFIX)) { watch.onMember(topic, payload); return }
+        if (topic == HA_STATUS_TOPIC) {
+            // HA's birth message: HA (re)started or its MQTT client reconnected - it may have missed our states.
+            if (payload == "online") mqtt?.let { c ->
+                scheduleRepublish(c, 3_000L + (Math.random() * 9_000).toLong(), "Home Assistant came online")
+            }
+            return
+        }
         when (topic) {
             HaDiscovery.commandTopic(p.deviceId)                  -> handleScreenCommand(payload)
             HaDiscovery.sensitivityCommandTopic(p.deviceId)       -> handleSensitivityCommand(payload, p)
