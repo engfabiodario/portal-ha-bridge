@@ -149,7 +149,10 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             fun encSize(full: Boolean): Pair<Int, Int> = when {
                 full -> 1440 to 1080
                 override != null -> override
-                corrected -> if (isCipher) 640 to 480 else 720 to 720
+                // aloha: Meta's full-field view is 16:9 (sensor landscape) squeezed into
+                // the buffer; with the landscape base rot=90 these dims give a 1280x720
+                // landscape stream (720x1280 when the Portal+ stands portrait).
+                corrected -> if (isCipher) 640 to 480 else 720 to 1280
                 else -> width to height
             }
             var (encW, encH) = encSize(fullSensor)
@@ -173,6 +176,18 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
                 fullSensor = false
                 encSize(false).let { encW = it.first; encH = it.second }
                 videoOk = prepare(encW, encH)
+            }
+            if (videoOk) {
+                // Fill the whole encoder frame. RootEncoder letter/pillarboxes a ROTATED camera
+                // (rot 90/270 = "portrait") to the buffer's own aspect; Meta's virtual camera
+                // stretches its view to any buffer, so the buffer aspect means nothing and the
+                // encoder size alone must decide the picture's aspect (fleet, 2026-10-06).
+                val outLandscape = if (rot == 90 || rot == 270) encH >= encW else encW >= encH
+                runCatching {
+                    s.getGlInterface().forceOrientation(
+                        if (outLandscape) com.pedro.library.view.OrientationForced.LANDSCAPE
+                        else com.pedro.library.view.OrientationForced.PORTRAIT)
+                }.onFailure { Log.w(TAG, "forceOrientation failed: ${it.message}") }
             }
             // Always prepare the audio encoder — startStream() requires it even with
             // NoAudioSource (NoAudioSource just means no mic is opened, no data fed).
