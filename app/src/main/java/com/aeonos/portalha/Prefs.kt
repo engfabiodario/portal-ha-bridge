@@ -96,6 +96,27 @@ class Prefs(private val context: Context) {
         get() = sp.getString("stream_camera_id", "") ?: ""
         set(v) = sp.edit().putString("stream_camera_id", v.trim()).apply()
 
+    // Fleet: Meta smart-camera framing for the stream (SmartCamera.kt). "wide" = fixed full field
+    // (default: no AI zoom/pan), "fixed" = fixed crop smartCameraX/Y/Scale, "auto" = Meta's own.
+    var smartCamera: String
+        get() = sp.getString("smart_camera", "wide") ?: "wide"
+        set(v) = sp.edit().putString("smart_camera", v.trim().lowercase()).apply()
+    var smartCameraX: Float
+        get() = sp.getFloat("smart_camera_x", 0.5f)
+        set(v) = sp.edit().putFloat("smart_camera_x", v).apply()
+    var smartCameraY: Float
+        get() = sp.getFloat("smart_camera_y", 0.5f)
+        set(v) = sp.edit().putFloat("smart_camera_y", v).apply()
+    var smartCameraScale: Float
+        get() = sp.getFloat("smart_camera_scale", 1.0f)
+        set(v) = sp.edit().putFloat("smart_camera_scale", v).apply()
+
+    // Fleet: encoder size override "WxH" (landscape, before rotation); "" = model default
+    // (Portal+ 720x720, Portal 10" / TV 1280x720). See RtspStreamer.sizeOverride.
+    var streamSize: String
+        get() = sp.getString("stream_size", "") ?: ""
+        set(v) = sp.edit().putString("stream_size", v.trim().lowercase()).apply()
+
     // Carry an existing HA identity over to a reinstall that got a new ANDROID_ID (Android 8+
     // derives it from the signing key, so a differently-signed build would otherwise show up in
     // HA as a second device with "_2" entities).

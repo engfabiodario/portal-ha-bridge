@@ -50,6 +50,16 @@
     <uses-permission android:name="android.permission.CAMERA" />
 
     <!--
+        Fleet: Meta's public Portal SDK smart-camera control (normal protection level, granted at
+        install). SmartCamera.kt binds com.facebook.portal.aiservice's external control service and
+        sets a FIXED full-field view, so the stream isn't the AI cameraman's zoomed/panning crop.
+    -->
+    <uses-permission android:name="com.facebook.portal.permission.SMART_CAMERA_CONTROL" />
+    <queries>
+        <package android:name="com.facebook.portal.aiservice" />
+    </queries>
+
+    <!--
         Granted at setup time via ADB:
             adb shell appops set com.aeonos.portalha SYSTEM_ALERT_WINDOW allow
         Used to keep a 1x1 transparent overlay on screen so the process stays in

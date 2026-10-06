@@ -546,6 +546,8 @@ class BridgeService : Service() {
     // Camera
     private var cameraStream: CameraStream? = null
     private var rtspStreamer: RtspStreamer? = null
+    // Fleet: Meta smart-camera framing (fixed full field instead of the AI cameraman's zoom).
+    private var smartCamera: SmartCamera? = null
     private val mediaKeepAlive = MediaKeepAlive()
     private var cameraOverlay: View? = null
     private val motionDetector = MotionDetector()
@@ -894,7 +896,59 @@ class BridgeService : Service() {
     }
 
     // Call after every RTSP (re)start attempt.
+    // "WxH" (even, 160..1920 x 160..1440) -> pair; anything else -> null (model default).
+    private fun parseStreamSize(s: String): Pair<Int, Int>? {
+        val m = Regex("^(\\d{3,4})x(\\d{3,4})$").find(s.trim().lowercase()) ?: return null
+        val w = m.groupValues[1].toInt(); val h = m.groupValues[2].toInt()
+        if (w % 2 != 0 || h % 2 != 0 || w !in 160..1920 || h !in 160..1440) return null
+        return w to h
+    }
+
+    private fun cameraViewTopic(deviceId: String) = "portal/$deviceId/config/camera_view/set"
+
+    private fun cameraViewStatus(p: Prefs): String =
+        "cameraview: size=${p.streamSize.ifEmpty { "default" }} " +
+            (smartCamera?.status() ?: "smartcamera: unavailable (no aiservice)")
+
+    // Fleet camera view (MQTT portal/<id>/config/camera_view/set, not an HA entity; or DEBUG_CONFIG
+    // --es cameraView): "wide" (fixed full field, default) | "auto" (Meta AI framing) |
+    // "fixed:x,y,scale" | "size:WxH" ("size:" = model default; restarts the stream) | "status".
+    private fun handleCameraViewCommand(payload: String, p: Prefs) {
+        val cmd = payload.trim()
+        val lc = cmd.lowercase()
+        when {
+            lc == "wide" || lc == "auto" -> {
+                p.smartCamera = lc
+                smartCamera?.configure(lc)
+            }
+            lc.startsWith("fixed") -> {
+                val v = lc.substringAfter(":", "").split(',').mapNotNull { it.trim().toFloatOrNull() }
+                if (v.size == 3) { p.smartCameraX = v[0]; p.smartCameraY = v[1]; p.smartCameraScale = v[2] }
+                p.smartCamera = "fixed"
+                smartCamera?.configure("fixed", p.smartCameraX, p.smartCameraY, p.smartCameraScale)
+            }
+            lc.startsWith("size") -> {
+                val raw = lc.substringAfter(":", "").trim()
+                val size = parseStreamSize(raw)
+                val newVal = if (size != null) "${size.first}x${size.second}" else ""
+                if (raw.isNotEmpty() && size == null) Log.w(TAG, "cameraview: bad size '$raw' (WxH, even) - using the default")
+                if (newVal != p.streamSize) {
+                    p.streamSize = newVal
+                    commandExecutor.submit {
+                        rtspStreamer?.let {
+                            it.sizeOverride = parseStreamSize(p.streamSize)
+                            if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                        }
+                    }
+                }
+            }
+            lc != "status" -> Log.w(TAG, "cameraview: unknown command '$cmd'")
+        }
+        Log.i(TAG, cameraViewStatus(p))
+    }
+
     private fun noteRtspStarted() {
+        smartCamera?.reassert("stream start")   // the virtual camera was (re)attached
         lastRtspStartMs = System.currentTimeMillis()
         wakeHandler.removeCallbacks(rtspHealthCheck)
         wakeHandler.postDelayed(rtspHealthCheck, RTSP_HEALTH_CHECK_MS)
@@ -1152,6 +1206,11 @@ class BridgeService : Service() {
         if (kaPause != p.keepAlivePausedUntil) p.keepAlivePausedUntil = kaPause
         keepAlive = AvaKeepAlive(this, keepAliveHost).also { it.start(p.avaKeepAlive, p.keepAlivePackage, kaPause) }
         selfHeal = SelfHeal(this, selfHealHost).also { it.start(p.selfHeal) }
+        smartCamera = SmartCamera(this).takeIf { it.available() }?.also { sc ->
+            sc.mode = p.smartCamera; sc.cropX = p.smartCameraX; sc.cropY = p.smartCameraY; sc.cropScale = p.smartCameraScale
+            sc.start()   // "auto" = no connection (the tick only acts in wide/fixed)
+            Log.i(TAG, "smart camera: ${p.smartCamera} (crop ${p.smartCameraX},${p.smartCameraY},${p.smartCameraScale})")
+        }
         reconcilePresence(p)
         reconcileDreamSlot(p)
         startDreamWatch()          // and take it back whenever the launcher grabs it
@@ -1308,6 +1367,7 @@ class BridgeService : Service() {
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
         runCatching { selfHeal?.stop() }; selfHeal = null
+        runCatching { smartCamera?.stop() }; smartCamera = null
         runCatching { screensaver.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
@@ -2073,6 +2133,8 @@ class BridgeService : Service() {
                     }
                 }
                 if (intent.getBooleanExtra("rotationStatus", false)) Log.i(TAG, rotationStatus())
+                // Camera view (fleet, SmartCamera.kt): --es cameraView wide|auto|fixed:x,y,scale|size:WxH|status
+                intent.getStringExtra("cameraView")?.let { v -> handleCameraViewCommand(v, p) }
                 //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
@@ -2345,6 +2407,7 @@ class BridgeService : Service() {
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId),
             HaDiscovery.selfHealCommandTopic(p.deviceId),
             HaDiscovery.youtubeCommandTopic(p.deviceId),
+            cameraViewTopic(p.deviceId),
             // Watch together: shared by every Portal (never purged or retained).
             WatchTogether.TOPIC,
             WatchTogether.MEMBERS_FILTER,
@@ -2634,6 +2697,7 @@ class BridgeService : Service() {
             HaDiscovery.avaKeepAliveCommandTopic(p.deviceId)      -> handleAvaKeepAliveCommand(payload, p)
             HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
+            cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
             WatchTogether.TOPIC                                   -> watch.handle(payload)
         }
     }
@@ -2974,6 +3038,7 @@ class BridgeService : Service() {
                 r.rotationOffset = p.streamRotation
                 if (isAloha) r.autoRotation = displayAutoRotation(p)
                 r.cameraId = p.streamCameraId
+                r.sizeOverride = parseStreamSize(p.streamSize)
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
                     // stream itself never opens the mic, so calls/Alexa/wake word

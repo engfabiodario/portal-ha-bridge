@@ -4,9 +4,7 @@ import android.content.Context
 import android.media.MediaCodecInfo
 import android.util.Log
 import com.pedro.common.ConnectChecker
-import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.util.sources.audio.NoAudioSource
-import com.pedro.library.util.sources.video.Camera2Source
 import com.aeonos.portalha.rtspserver.FleetRtspServerStream
 import com.aeonos.portalha.rtspserver.IpType
 
@@ -66,6 +64,11 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // never reaches CameraService. Kept as an inert option (default off) for other hardware.
     @Volatile var cameraId: String = ""
 
+    // Fleet: encoder size override (landscape WxH, before rotation), null = model default.
+    // Camera 0 is Meta's virtual camera: aiservice renders its (fixed, see SmartCamera) view
+    // into whatever surface size we ask for, so this only sets the output size/aspect.
+    @Volatile var sizeOverride: Pair<Int, Int>? = null
+
     // Capture params from the last start(), reused by restart() on rotation change.
     private var baseWidth = 1280
     private var baseHeight = 720
@@ -92,8 +95,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
         return runCatching {
             // Portal cameras are all front-facing; RootEncoder defaults to BACK
             // (empty here), so build the source explicitly on FRONT.
-            val video = Camera2Source(context)
-            if (video.getCameraFacing() != CameraHelper.Facing.FRONT) video.switchCamera()
+            // FleetCameraSource opens FRONT at exactly the encoder size (Camera2Source would
+            // swap e.g. 960x720 for a listed 640x480 and upscale it).
+            val video = FleetCameraSource(context)
             // Neither source opens the mic — critical so the RTSP stream doesn't
             // hold the capture slot and starve/garble Portal calls or fight the
             // SoundMonitor. withAudio uses MicTapSource: a copy of SoundMonitor's
@@ -141,8 +145,10 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             val corrected = squashedFrontCam && width * 9 == height * 16
             val isCipher = android.os.Build.DEVICE.equals("cipher", true)
             var fullSensor = cameraId.isNotBlank() && cameraId != "0"
+            val override = sizeOverride
             fun encSize(full: Boolean): Pair<Int, Int> = when {
                 full -> 1440 to 1080
+                override != null -> override
                 corrected -> if (isCipher) 640 to 480 else 720 to 720
                 else -> width to height
             }
