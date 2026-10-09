@@ -12,7 +12,7 @@ object HaDiscovery {
 
     fun configPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Screen","unique_id":"${deviceId}_screen","device":${device(deviceId, name)},"state_topic":"${stateTopic(deviceId)}","command_topic":"${commandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF"}"""
+        return """{"name":"Screen","unique_id":"${deviceId}_screen","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${stateTopic(deviceId)}","command_topic":"${commandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF"}"""
     }
 
     // ── Light sensor ──────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ object HaDiscovery {
 
     fun lightConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Ambient Light","unique_id":"${deviceId}_light","device":${device(deviceId, name)},"state_topic":"${lightStateTopic(deviceId)}","device_class":"illuminance","unit_of_measurement":"lx","state_class":"measurement"}"""
+        return """{"name":"Ambient Light","unique_id":"${deviceId}_light","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${lightStateTopic(deviceId)}","device_class":"illuminance","unit_of_measurement":"lx","state_class":"measurement"}"""
     }
 
     // ── Ambient temperature sensor (Portal+ only; absent on Portal/Mini) ──────
@@ -36,7 +36,7 @@ object HaDiscovery {
 
     fun tempConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Temperature","unique_id":"${deviceId}_temperature","device":${device(deviceId, name)},"state_topic":"${tempStateTopic(deviceId)}","device_class":"temperature","unit_of_measurement":"°C","state_class":"measurement"}"""
+        return """{"name":"Temperature","unique_id":"${deviceId}_temperature","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${tempStateTopic(deviceId)}","device_class":"temperature","unit_of_measurement":"°C","state_class":"measurement"}"""
     }
 
     // Calibration offset for the temperature sensor (HA number).
@@ -48,7 +48,7 @@ object HaDiscovery {
 
     fun tempOffsetConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Temperature Offset","unique_id":"${deviceId}_temp_offset","device":${device(deviceId, name)},"state_topic":"${tempOffsetStateTopic(deviceId)}","command_topic":"${tempOffsetCommandTopic(deviceId)}","min":-20,"max":20,"step":0.5,"mode":"box","unit_of_measurement":"°C","icon":"mdi:thermometer-plus","entity_category":"config"}"""
+        return """{"name":"Temperature Offset","unique_id":"${deviceId}_temp_offset","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${tempOffsetStateTopic(deviceId)}","command_topic":"${tempOffsetCommandTopic(deviceId)}","min":-20,"max":20,"step":0.5,"mode":"box","unit_of_measurement":"°C","icon":"mdi:thermometer-plus","entity_category":"config"}"""
     }
 
     // HA long-lived token, settable FROM Home Assistant (so it never has to be typed
@@ -62,7 +62,7 @@ object HaDiscovery {
 
     fun haTokenConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"HA Token","unique_id":"${deviceId}_hatoken","device":${device(deviceId, name)},"command_topic":"${haTokenCommandTopic(deviceId)}","mode":"password","max":255,"icon":"mdi:key","entity_category":"config"}"""
+        return """{"name":"HA Token","unique_id":"${deviceId}_hatoken","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${haTokenCommandTopic(deviceId)}","mode":"password","max":255,"icon":"mdi:key","entity_category":"config"}"""
     }
 
     // The dashboard the kiosk opens on, as a path on the Home Assistant at haUrl
@@ -76,7 +76,7 @@ object HaDiscovery {
 
     fun dashboardPathConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Dashboard Path","unique_id":"${deviceId}_dashboard_path","device":${device(deviceId, name)},"state_topic":"${dashboardPathStateTopic(deviceId)}","command_topic":"${dashboardPathCommandTopic(deviceId)}","mode":"text","min":0,"max":255,"icon":"mdi:view-dashboard","entity_category":"config"}"""
+        return """{"name":"Dashboard Path","unique_id":"${deviceId}_dashboard_path","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${dashboardPathStateTopic(deviceId)}","command_topic":"${dashboardPathCommandTopic(deviceId)}","mode":"text","min":0,"max":255,"icon":"mdi:view-dashboard","entity_category":"config"}"""
     }
 
     // ── Accelerometer ─────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ object HaDiscovery {
 
     fun accelConfigPayload(deviceId: String, deviceName: String, axis: String): String {
         val name = deviceName.escape()
-        return """{"name":"Accel ${axis.uppercase()}","unique_id":"${deviceId}_accel_$axis","device":${device(deviceId, name)},"state_topic":"${accelStateTopic(deviceId)}","value_template":"{{ value_json.$axis }}","unit_of_measurement":"m/s²","state_class":"measurement"}"""
+        return """{"name":"Accel ${axis.uppercase()}","unique_id":"${deviceId}_accel_$axis","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${accelStateTopic(deviceId)}","value_template":"{{ value_json.$axis }}","unit_of_measurement":"m/s²","state_class":"measurement"}"""
     }
 
     // ── RGB light sensor (Portal custom type 65537) ───────────────────────────
@@ -104,7 +104,7 @@ object HaDiscovery {
     fun rgbConfigPayload(deviceId: String, deviceName: String, channel: String): String {
         val name = deviceName.escape()
         val label = channel.uppercase()
-        return """{"name":"Light $label","unique_id":"${deviceId}_rgb_$channel","device":${device(deviceId, name)},"state_topic":"${rgbStateTopic(deviceId)}","value_template":"{{ value_json.$channel if value_json is defined else (this.state if is_number(this.state) else none) }}","unit_of_measurement":"lx","state_class":"measurement","icon":"mdi:palette"}"""
+        return """{"name":"Light $label","unique_id":"${deviceId}_rgb_$channel","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${rgbStateTopic(deviceId)}","value_template":"{{ value_json.$channel if value_json is defined else (this.state if is_number(this.state) else none) }}","unit_of_measurement":"lx","state_class":"measurement","icon":"mdi:palette"}"""
     }
 
     // ── Tap / slap direction ──────────────────────────────────────────────────
@@ -123,7 +123,7 @@ object HaDiscovery {
 
     fun tapConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"$tapLabel","unique_id":"${deviceId}_tap","device":${device(deviceId, name)},"state_topic":"${tapStateTopic(deviceId)}","icon":"$tapIcon"}"""
+        return """{"name":"$tapLabel","unique_id":"${deviceId}_tap","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${tapStateTopic(deviceId)}","icon":"$tapIcon"}"""
     }
 
     // ── Tap sensitivity number (slider) ───────────────────────────────────────
@@ -136,7 +136,7 @@ object HaDiscovery {
 
     fun sensitivityConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"$tapLabel Sensitivity","unique_id":"${deviceId}_tap_sensitivity","device":${device(deviceId, name)},"state_topic":"${sensitivityStateTopic(deviceId)}","command_topic":"${sensitivityCommandTopic(deviceId)}","min":2.0,"max":15.0,"step":0.5,"mode":"slider","icon":"$tapSensIcon"}"""
+        return """{"name":"$tapLabel Sensitivity","unique_id":"${deviceId}_tap_sensitivity","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${sensitivityStateTopic(deviceId)}","command_topic":"${sensitivityCommandTopic(deviceId)}","min":2.0,"max":15.0,"step":0.5,"mode":"slider","icon":"$tapSensIcon"}"""
     }
 
     // ── Double knock (event entity) ───────────────────────────────────────────
@@ -152,7 +152,7 @@ object HaDiscovery {
 
     fun knockConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Knock","unique_id":"${deviceId}_knock","device":${device(deviceId, name)},"state_topic":"${knockStateTopic(deviceId)}","event_types":["double_knock"],"icon":"mdi:gesture-double-tap"}"""
+        return """{"name":"Knock","unique_id":"${deviceId}_knock","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${knockStateTopic(deviceId)}","event_types":["double_knock"],"icon":"mdi:gesture-double-tap"}"""
     }
 
     // ── Sound level sensor ────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ object HaDiscovery {
 
     fun soundConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Sound Level","unique_id":"${deviceId}_sound","device":${device(deviceId, name)},"state_topic":"${soundStateTopic(deviceId)}","unit_of_measurement":"%","state_class":"measurement","icon":"mdi:microphone"}"""
+        return """{"name":"Sound Level","unique_id":"${deviceId}_sound","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${soundStateTopic(deviceId)}","unit_of_measurement":"%","state_class":"measurement","icon":"mdi:microphone"}"""
     }
 
     // ── Mic mute switch ───────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ object HaDiscovery {
 
     fun micMuteConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Mic Mute","unique_id":"${deviceId}_mic_mute","device":${device(deviceId, name)},"state_topic":"${micMuteStateTopic(deviceId)}","command_topic":"${micMuteCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:microphone-off"}"""
+        return """{"name":"Mic Mute","unique_id":"${deviceId}_mic_mute","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${micMuteStateTopic(deviceId)}","command_topic":"${micMuteCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:microphone-off"}"""
     }
 
     // ── Music-speaker (DLNA) switch + now-playing overlay switch ────────────────
@@ -188,7 +188,7 @@ object HaDiscovery {
 
     fun dlnaConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Music Speaker","unique_id":"${deviceId}_dlna","device":${device(deviceId, name)},"state_topic":"${dlnaStateTopic(deviceId)}","command_topic":"${dlnaCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:cast-audio","entity_category":"config"}"""
+        return """{"name":"Music Speaker","unique_id":"${deviceId}_dlna","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${dlnaStateTopic(deviceId)}","command_topic":"${dlnaCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:cast-audio","entity_category":"config"}"""
     }
 
     fun sendspinDiscoveryTopic(deviceId: String) = "homeassistant/switch/${deviceId}_sendspin/config"
@@ -197,7 +197,7 @@ object HaDiscovery {
 
     fun sendspinConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.ifBlank { "Portal" }
-        return """{"name":"Synced Speaker","unique_id":"${deviceId}_sendspin","device":${device(deviceId, name)},"state_topic":"${sendspinStateTopic(deviceId)}","command_topic":"${sendspinCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:speaker-multiple","entity_category":"config"}"""
+        return """{"name":"Synced Speaker","unique_id":"${deviceId}_sendspin","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${sendspinStateTopic(deviceId)}","command_topic":"${sendspinCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:speaker-multiple","entity_category":"config"}"""
     }
 
     fun npOverlayDiscoveryTopic(deviceId: String) = "homeassistant/switch/${deviceId}_np_overlay/config"
@@ -206,7 +206,7 @@ object HaDiscovery {
 
     fun npOverlayConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Now Playing Screen","unique_id":"${deviceId}_np_overlay","device":${device(deviceId, name)},"state_topic":"${npOverlayStateTopic(deviceId)}","command_topic":"${npOverlayCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:playlist-play","entity_category":"config"}"""
+        return """{"name":"Now Playing Screen","unique_id":"${deviceId}_np_overlay","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${npOverlayStateTopic(deviceId)}","command_topic":"${npOverlayCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:playlist-play","entity_category":"config"}"""
     }
 
     // ── Ava keep-alive switch (Android 10, see AvaKeepAlive) ──────────────────
@@ -217,7 +217,7 @@ object HaDiscovery {
 
     fun avaKeepAliveConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Ava Keep-Alive","unique_id":"${deviceId}_ava_keepalive","device":${device(deviceId, name)},"state_topic":"${avaKeepAliveStateTopic(deviceId)}","command_topic":"${avaKeepAliveCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:microphone-message","entity_category":"config"}"""
+        return """{"name":"Ava Keep-Alive","unique_id":"${deviceId}_ava_keepalive","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${avaKeepAliveStateTopic(deviceId)}","command_topic":"${avaKeepAliveCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:microphone-message","entity_category":"config"}"""
     }
 
     // ── Self heal: switch + status sensor (see SelfHeal) ──────────────────────
@@ -231,12 +231,12 @@ object HaDiscovery {
 
     fun selfHealSwitchConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal","device":${device(deviceId, name)},"state_topic":"${selfHealSwitchStateTopic(deviceId)}","command_topic":"${selfHealCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:medical-bag","entity_category":"config"}"""
+        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${selfHealSwitchStateTopic(deviceId)}","command_topic":"${selfHealCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:medical-bag","entity_category":"config"}"""
     }
 
     fun selfHealSensorConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal_status","device":${device(deviceId, name)},"state_topic":"${selfHealStateTopic(deviceId)}","json_attributes_topic":"${selfHealAttributesTopic(deviceId)}","icon":"mdi:heart-pulse","entity_category":"diagnostic"}"""
+        return """{"name":"Self Heal","unique_id":"${deviceId}_self_heal_status","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${selfHealStateTopic(deviceId)}","json_attributes_topic":"${selfHealAttributesTopic(deviceId)}","icon":"mdi:heart-pulse","entity_category":"diagnostic"}"""
     }
 
     // ── Volume number (slider) ────────────────────────────────────────────────
@@ -249,7 +249,7 @@ object HaDiscovery {
 
     fun volumeConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Volume","unique_id":"${deviceId}_volume","device":${device(deviceId, name)},"state_topic":"${volumeStateTopic(deviceId)}","command_topic":"${volumeCommandTopic(deviceId)}","min":0,"max":100,"step":1,"mode":"slider","icon":"mdi:volume-high"}"""
+        return """{"name":"Volume","unique_id":"${deviceId}_volume","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${volumeStateTopic(deviceId)}","command_topic":"${volumeCommandTopic(deviceId)}","min":0,"max":100,"step":1,"mode":"slider","icon":"mdi:volume-high"}"""
     }
 
     // ── Sound buttons (doorbell / alert tones) ────────────────────────────────
@@ -264,12 +264,12 @@ object HaDiscovery {
 
     fun doorbellConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Doorbell","unique_id":"${deviceId}_doorbell","device":${device(deviceId, name)},"command_topic":"${soundCommandTopic(deviceId)}","payload_press":"doorbell","icon":"mdi:bell-ring"}"""
+        return """{"name":"Doorbell","unique_id":"${deviceId}_doorbell","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${soundCommandTopic(deviceId)}","payload_press":"doorbell","icon":"mdi:bell-ring"}"""
     }
 
     fun alertConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Alert","unique_id":"${deviceId}_alert","device":${device(deviceId, name)},"command_topic":"${soundCommandTopic(deviceId)}","payload_press":"alert","icon":"mdi:alert"}"""
+        return """{"name":"Alert","unique_id":"${deviceId}_alert","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${soundCommandTopic(deviceId)}","payload_press":"alert","icon":"mdi:alert"}"""
     }
 
     // ── In-call sensor + Show Dashboard button ────────────────────────────────
@@ -284,7 +284,7 @@ object HaDiscovery {
 
     fun inCallConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"In Call","unique_id":"${deviceId}_in_call","device":${device(deviceId, name)},"state_topic":"${inCallStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:phone-in-talk"}"""
+        return """{"name":"In Call","unique_id":"${deviceId}_in_call","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${inCallStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:phone-in-talk"}"""
     }
 
     fun showDashboardCommandTopic(deviceId: String) = "portal/$deviceId/show_dashboard"
@@ -294,7 +294,7 @@ object HaDiscovery {
 
     fun showDashboardConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Show Dashboard","unique_id":"${deviceId}_show_dashboard","device":${device(deviceId, name)},"command_topic":"${showDashboardCommandTopic(deviceId)}","payload_press":"show","icon":"mdi:monitor-dashboard"}"""
+        return """{"name":"Show Dashboard","unique_id":"${deviceId}_show_dashboard","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${showDashboardCommandTopic(deviceId)}","payload_press":"show","icon":"mdi:monitor-dashboard"}"""
     }
 
     // ── YouTube (TvAppActivity standalone) ─────────────────────────────────────
@@ -312,12 +312,12 @@ object HaDiscovery {
 
     fun youtubeOpenConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"YouTube","unique_id":"${deviceId}_youtube","device":${device(deviceId, name)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"open","icon":"mdi:youtube"}"""
+        return """{"name":"YouTube","unique_id":"${deviceId}_youtube","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"open","icon":"mdi:youtube"}"""
     }
 
     fun youtubeCloseConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"YouTube Close","unique_id":"${deviceId}_youtube_close","device":${device(deviceId, name)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"close","icon":"mdi:youtube-tv"}"""
+        return """{"name":"YouTube Close","unique_id":"${deviceId}_youtube_close","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${youtubeCommandTopic(deviceId)}","payload_press":"close","icon":"mdi:youtube-tv"}"""
     }
 
     // Watch together (WatchTogether): one fleet command topic, this Portal's state sensor.
@@ -326,12 +326,12 @@ object HaDiscovery {
     fun watchSensorDiscoveryTopic(deviceId: String) = "homeassistant/sensor/${deviceId}_watch_together/config"
     fun watchSensorConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Watch Together","unique_id":"${deviceId}_watch_together","device":${device(deviceId, name)},"state_topic":"${watchStateTopic(deviceId)}","json_attributes_topic":"${watchAttributesTopic(deviceId)}","icon":"mdi:youtube-subscription"}"""
+        return """{"name":"Watch Together","unique_id":"${deviceId}_watch_together","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${watchStateTopic(deviceId)}","json_attributes_topic":"${watchAttributesTopic(deviceId)}","icon":"mdi:youtube-subscription"}"""
     }
 
     fun youtubeSensorConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"YouTube","unique_id":"${deviceId}_youtube_showing","device":${device(deviceId, name)},"state_topic":"${youtubeStateTopic(deviceId)}","json_attributes_topic":"${youtubeAttributesTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:youtube"}"""
+        return """{"name":"YouTube","unique_id":"${deviceId}_youtube_showing","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${youtubeStateTopic(deviceId)}","json_attributes_topic":"${youtubeAttributesTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:youtube"}"""
     }
 
     // ── Volume mute switch ────────────────────────────────────────────────────
@@ -344,7 +344,7 @@ object HaDiscovery {
 
     fun volumeMuteConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Volume Mute","unique_id":"${deviceId}_volume_mute","device":${device(deviceId, name)},"state_topic":"${volumeMuteStateTopic(deviceId)}","command_topic":"${volumeMuteCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:volume-off"}"""
+        return """{"name":"Volume Mute","unique_id":"${deviceId}_volume_mute","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${volumeMuteStateTopic(deviceId)}","command_topic":"${volumeMuteCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:volume-off"}"""
     }
 
     // ── Photo screensaver ─────────────────────────────────────────────────────
@@ -357,7 +357,7 @@ object HaDiscovery {
 
     fun screensaverConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Photo Screensaver","unique_id":"${deviceId}_screensaver","device":${device(deviceId, name)},"state_topic":"${screensaverStateTopic(deviceId)}","command_topic":"${screensaverCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:image-multiple"}"""
+        return """{"name":"Photo Screensaver","unique_id":"${deviceId}_screensaver","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screensaverStateTopic(deviceId)}","command_topic":"${screensaverCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:image-multiple"}"""
     }
 
     fun screensaverHoldDiscoveryTopic(deviceId: String) =
@@ -368,7 +368,7 @@ object HaDiscovery {
 
     fun screensaverHoldConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Screensaver Dismiss Hold","unique_id":"${deviceId}_screensaver_hold","device":${device(deviceId, name)},"state_topic":"${screensaverHoldStateTopic(deviceId)}","command_topic":"${screensaverHoldCommandTopic(deviceId)}","min":0,"max":3600,"step":15,"unit_of_measurement":"s","mode":"box","icon":"mdi:timer-pause-outline"}"""
+        return """{"name":"Screensaver Dismiss Hold","unique_id":"${deviceId}_screensaver_hold","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screensaverHoldStateTopic(deviceId)}","command_topic":"${screensaverHoldCommandTopic(deviceId)}","min":0,"max":3600,"step":15,"unit_of_measurement":"s","mode":"box","icon":"mdi:timer-pause-outline"}"""
     }
 
     // Fleet: brightness while the photos are on screen (0 = same as the dashboard) + whether they are.
@@ -378,14 +378,14 @@ object HaDiscovery {
     fun screensaverBrightnessCommandTopic(deviceId: String) = "portal/$deviceId/screensaver/brightness/set"
     fun screensaverBrightnessConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Photo Brightness","unique_id":"${deviceId}_screensaver_brightness","device":${device(deviceId, name)},"state_topic":"${screensaverBrightnessStateTopic(deviceId)}","command_topic":"${screensaverBrightnessCommandTopic(deviceId)}","min":0,"max":100,"step":1,"unit_of_measurement":"%","mode":"slider","entity_category":"config","icon":"mdi:brightness-6"}"""
+        return """{"name":"Photo Brightness","unique_id":"${deviceId}_screensaver_brightness","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screensaverBrightnessStateTopic(deviceId)}","command_topic":"${screensaverBrightnessCommandTopic(deviceId)}","min":0,"max":100,"step":1,"unit_of_measurement":"%","mode":"slider","entity_category":"config","icon":"mdi:brightness-6"}"""
     }
     fun screensaverShowingDiscoveryTopic(deviceId: String) =
         "homeassistant/binary_sensor/${deviceId}_photos_showing/config"
     fun screensaverShowingStateTopic(deviceId: String) = "portal/$deviceId/screensaver/showing"
     fun screensaverShowingConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Photos Showing","unique_id":"${deviceId}_photos_showing","device":${device(deviceId, name)},"state_topic":"${screensaverShowingStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:image-frame"}"""
+        return """{"name":"Photos Showing","unique_id":"${deviceId}_photos_showing","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screensaverShowingStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:image-frame"}"""
     }
 
     fun screensaverDismissCommandTopic(deviceId: String) = "portal/$deviceId/screensaver/dismiss"
@@ -395,7 +395,7 @@ object HaDiscovery {
 
     fun screensaverDismissConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Dismiss Screensaver","unique_id":"${deviceId}_screensaver_dismiss","device":${device(deviceId, name)},"command_topic":"${screensaverDismissCommandTopic(deviceId)}","payload_press":"dismiss","icon":"mdi:image-off"}"""
+        return """{"name":"Dismiss Screensaver","unique_id":"${deviceId}_screensaver_dismiss","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${screensaverDismissCommandTopic(deviceId)}","payload_press":"dismiss","icon":"mdi:image-off"}"""
     }
 
     /**
@@ -437,7 +437,7 @@ object HaDiscovery {
 
     fun navigateConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Navigate","unique_id":"${deviceId}_navigate","device":${device(deviceId, name)},"state_topic":"${navigateStateTopic(deviceId)}","command_topic":"${navigateCommandTopic(deviceId)}","mode":"text","min":0,"max":255,"icon":"mdi:compass-outline"}"""
+        return """{"name":"Navigate","unique_id":"${deviceId}_navigate","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${navigateStateTopic(deviceId)}","command_topic":"${navigateCommandTopic(deviceId)}","mode":"text","min":0,"max":255,"icon":"mdi:compass-outline"}"""
     }
 
     /** Fleet-wide navigate: one publish moves every Portal (same idea as the fleet dismiss). */
@@ -462,7 +462,7 @@ object HaDiscovery {
 
     fun brightnessConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Brightness","unique_id":"${deviceId}_brightness","device":${device(deviceId, name)},"state_topic":"${brightnessStateTopic(deviceId)}","command_topic":"${brightnessCommandTopic(deviceId)}","min":0,"max":100,"step":1,"mode":"slider","icon":"mdi:brightness-6"}"""
+        return """{"name":"Brightness","unique_id":"${deviceId}_brightness","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${brightnessStateTopic(deviceId)}","command_topic":"${brightnessCommandTopic(deviceId)}","min":0,"max":100,"step":1,"mode":"slider","icon":"mdi:brightness-6"}"""
     }
 
     // ── Camera switch ─────────────────────────────────────────────────────────
@@ -475,7 +475,7 @@ object HaDiscovery {
 
     fun cameraConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Camera","unique_id":"${deviceId}_camera","device":${device(deviceId, name)},"state_topic":"${cameraStateTopic(deviceId)}","command_topic":"${cameraCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:camera"}"""
+        return """{"name":"Camera","unique_id":"${deviceId}_camera","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${cameraStateTopic(deviceId)}","command_topic":"${cameraCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:camera"}"""
     }
 
     // ── Motion detection enable switch ────────────────────────────────────────
@@ -488,7 +488,7 @@ object HaDiscovery {
 
     fun motionEnableConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Motion Detection","unique_id":"${deviceId}_motion_enable","device":${device(deviceId, name)},"state_topic":"${motionEnableStateTopic(deviceId)}","command_topic":"${motionEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:motion-sensor"}"""
+        return """{"name":"Motion Detection","unique_id":"${deviceId}_motion_enable","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${motionEnableStateTopic(deviceId)}","command_topic":"${motionEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:motion-sensor"}"""
     }
 
     // ── Camera streaming enable switch ────────────────────────────────────────
@@ -501,7 +501,7 @@ object HaDiscovery {
 
     fun streamEnableConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Camera Streaming","unique_id":"${deviceId}_stream_enable","device":${device(deviceId, name)},"state_topic":"${streamEnableStateTopic(deviceId)}","command_topic":"${streamEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:video"}"""
+        return """{"name":"Camera Streaming","unique_id":"${deviceId}_stream_enable","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${streamEnableStateTopic(deviceId)}","command_topic":"${streamEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:video"}"""
     }
 
     // ── Motion binary sensor ──────────────────────────────────────────────────
@@ -513,7 +513,7 @@ object HaDiscovery {
 
     fun motionConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Motion","unique_id":"${deviceId}_motion","device":${device(deviceId, name)},"state_topic":"${motionStateTopic(deviceId)}","device_class":"motion","payload_on":"ON","payload_off":"OFF"}"""
+        return """{"name":"Motion","unique_id":"${deviceId}_motion","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${motionStateTopic(deviceId)}","device_class":"motion","payload_on":"ON","payload_off":"OFF"}"""
     }
 
     // ── Motion sensitivity number (slider) ────────────────────────────────────
@@ -529,7 +529,7 @@ object HaDiscovery {
 
     fun motionSensitivityConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Motion Sensitivity","unique_id":"${deviceId}_motion_sensitivity","device":${device(deviceId, name)},"state_topic":"${motionSensitivityStateTopic(deviceId)}","command_topic":"${motionSensitivityCommandTopic(deviceId)}","min":1,"max":100,"step":1,"mode":"slider","icon":"mdi:motion-sensor"}"""
+        return """{"name":"Motion Sensitivity","unique_id":"${deviceId}_motion_sensitivity","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${motionSensitivityStateTopic(deviceId)}","command_topic":"${motionSensitivityCommandTopic(deviceId)}","min":1,"max":100,"step":1,"mode":"slider","icon":"mdi:motion-sensor"}"""
     }
 
     // Topics to clear when motion detection is disabled
@@ -547,7 +547,7 @@ object HaDiscovery {
 
     fun presenceConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Portal Presence","unique_id":"${deviceId}_presence","device":${device(deviceId, name)},"state_topic":"${presenceStateTopic(deviceId)}","device_class":"occupancy","payload_on":"ON","payload_off":"OFF"}"""
+        return """{"name":"Portal Presence","unique_id":"${deviceId}_presence","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${presenceStateTopic(deviceId)}","device_class":"occupancy","payload_on":"ON","payload_off":"OFF"}"""
     }
 
     // ── Presence detection enable switch ──────────────────────────────────────
@@ -560,7 +560,7 @@ object HaDiscovery {
 
     fun presenceEnableConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Presence Detection","unique_id":"${deviceId}_presence_enable","device":${device(deviceId, name)},"state_topic":"${presenceEnableStateTopic(deviceId)}","command_topic":"${presenceEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:account-eye"}"""
+        return """{"name":"Presence Detection","unique_id":"${deviceId}_presence_enable","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${presenceEnableStateTopic(deviceId)}","command_topic":"${presenceEnableCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:account-eye"}"""
     }
 
     // ── Screen-off timer enable switch ────────────────────────────────────────
@@ -573,7 +573,7 @@ object HaDiscovery {
 
     fun screenTimeoutConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Screen Timeout","unique_id":"${deviceId}_screen_timeout","device":${device(deviceId, name)},"state_topic":"${screenTimeoutStateTopic(deviceId)}","command_topic":"${screenTimeoutCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:timer-off"}"""
+        return """{"name":"Screen Timeout","unique_id":"${deviceId}_screen_timeout","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screenTimeoutStateTopic(deviceId)}","command_topic":"${screenTimeoutCommandTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","state_on":"ON","state_off":"OFF","icon":"mdi:timer-off"}"""
     }
 
     // ── Screen-off timer minutes number ───────────────────────────────────────
@@ -586,7 +586,7 @@ object HaDiscovery {
 
     fun screenTimeoutMinsConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"Screen Timeout Minutes","unique_id":"${deviceId}_screen_timeout_mins","device":${device(deviceId, name)},"state_topic":"${screenTimeoutMinsStateTopic(deviceId)}","command_topic":"${screenTimeoutMinsCommandTopic(deviceId)}","min":1,"max":240,"step":1,"mode":"box","unit_of_measurement":"min","icon":"mdi:timer-cog"}"""
+        return """{"name":"Screen Timeout Minutes","unique_id":"${deviceId}_screen_timeout_mins","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screenTimeoutMinsStateTopic(deviceId)}","command_topic":"${screenTimeoutMinsCommandTopic(deviceId)}","min":1,"max":240,"step":1,"mode":"box","unit_of_measurement":"min","icon":"mdi:timer-cog"}"""
     }
 
     // ── IP address sensor (diagnostic) ────────────────────────────────────────
@@ -598,7 +598,7 @@ object HaDiscovery {
 
     fun ipConfigPayload(deviceId: String, deviceName: String): String {
         val name = deviceName.escape()
-        return """{"name":"IP Address","unique_id":"${deviceId}_ip","device":${device(deviceId, name)},"state_topic":"${ipStateTopic(deviceId)}","icon":"mdi:ip-network","entity_category":"diagnostic"}"""
+        return """{"name":"IP Address","unique_id":"${deviceId}_ip","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${ipStateTopic(deviceId)}","icon":"mdi:ip-network","entity_category":"diagnostic"}"""
     }
 
     // ── Stale entity cleanup ──────────────────────────────────────────────────
@@ -646,6 +646,22 @@ object HaDiscovery {
 
     private fun device(deviceId: String, escapedName: String) =
         """{"identifiers":["$deviceId"],"name":"$escapedName","model":"Meta Portal","manufacturer":"Meta"}"""
+
+    // ── Availability (fleet 2026-10-08) ───────────────────────────────────────
+    // Every per-Portal entity follows portal/<id>/availability: the broker publishes the retained
+    // last will 'offline' when the Bridge's session dies (keepalive x 1.5 without a packet), the
+    // Bridge publishes 'online' (retained) right after every connect and 'offline' on a clean stop.
+    // The two "Portal Fleet" entities (identical config from every Portal) deliberately carry none:
+    // one Portal going away must not grey out the fleet-wide button / text.
+
+    const val AVAILABILITY_ONLINE = "online"
+    const val AVAILABILITY_OFFLINE = "offline"
+
+    fun availabilityTopic(deviceId: String) = "portal/$deviceId/availability"
+
+    /** JSON members (no braces) added after "device" in every per-Portal discovery config. */
+    private fun availability(deviceId: String) =
+        "\"availability_topic\":\"${availabilityTopic(deviceId)}\",\"payload_available\":\"$AVAILABILITY_ONLINE\",\"payload_not_available\":\"$AVAILABILITY_OFFLINE\""
 
     private fun String.escape() = replace("\"", "\\\"")
 }

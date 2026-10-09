@@ -196,6 +196,12 @@ class BridgeService : Service() {
         private const val ACTION_BOOTED = "com.aeonos.portalha.BOOTED"
         private const val ACTION_REVIVE = "com.aeonos.portalha.REVIVE"
         private const val HA_STATUS_TOPIC = "homeassistant/status"          // HA's MQTT birth / last will
+        // MQTT link (fleet 2026-10-08): reconnect backoff, connect timeout, keepalive, offline-on-stop wait.
+        private const val MQTT_BACKOFF_MIN_MS = 5_000L
+        private const val MQTT_BACKOFF_MAX_MS = 15_000L
+        private const val MQTT_CONNECT_TIMEOUT_S = 10
+        private const val MQTT_KEEPALIVE_S = 30
+        private const val MQTT_OFFLINE_PUBLISH_WAIT_MS = 1_500L
         private const val REPUBLISH_AFTER_CONNECT_MS = 20_000L
         private const val ACTION_APPLY_DISPLAY = "com.aeonos.portalha.APPLY_DISPLAY"
         private const val ACTION_APPLY_MEDIA = "com.aeonos.portalha.APPLY_MEDIA"
@@ -1373,6 +1379,8 @@ class BridgeService : Service() {
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
         dreamObserver = null
         commandExecutor.shutdownNow()
+        // fleet: a clean stop tells HA right away (the broker drops the last will on a clean DISCONNECT).
+        publishOfflineBeforeStop()
         runCatching { mqtt?.disconnect(0) }
         screenReceiver?.let { unregisterReceiver(it) }
         audioReceiver?.let { unregisterReceiver(it) }
@@ -2312,20 +2320,42 @@ class BridgeService : Service() {
         Log.i(TAG, "config: dropped the broker connection — reconnecting with the new settings")
     }
 
+    // fleet (2026-10-08): reconnect backoff 5 s -> 10 s -> 15 s cap (was 60 s) with up to +20 % jitter, so a
+    // Portal is back within ~15 s of the broker / LAN returning and 16 Portals don't hit it in lockstep.
     private fun mqttLoop() {
-        var backoff = 5_000L
+        var backoff = MQTT_BACKOFF_MIN_MS
         while (running.get()) {
             try {
                 connectAndRun()
-                backoff = 5_000L
+                backoff = MQTT_BACKOFF_MIN_MS
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
-                Log.w(TAG, "MQTT error, retry in ${backoff / 1000}s: ${e.message}")
+                Log.w(TAG, "MQTT error, retry in ~${backoff / 1000}s: ${e.message}")
             }
-            if (running.get()) sleep(backoff)
-            backoff = minOf(backoff * 2, 60_000L)
+            if (running.get()) sleep(backoff + (Math.random() * backoff * 0.2).toLong())
+            backoff = minOf(backoff * 2, MQTT_BACKOFF_MAX_MS)
         }
+    }
+
+    /**
+     * Clean stop: publish 'offline' (retained) on the availability topic. Bounded: runs on a helper thread and
+     * waits at most [MQTT_OFFLINE_PUBLISH_WAIT_MS] (onDestroy is on the main thread).
+     */
+    private fun publishOfflineBeforeStop() {
+        val c = mqtt ?: return
+        val id = prefs?.deviceId ?: return
+        if (!c.isConnected) return
+        val t = Thread({
+            runCatching {
+                c.publish(HaDiscovery.availabilityTopic(id),
+                    MqttMessage(HaDiscovery.AVAILABILITY_OFFLINE.toByteArray()).also { it.qos = 1; it.isRetained = true })
+                Log.i(TAG, "mqtt: published availability offline (clean stop)")
+            }.onFailure { Log.w(TAG, "mqtt: offline publish on stop failed: ${it.message}") }
+        }, "portal-ha-mqtt-offline")
+        t.isDaemon = true
+        t.start()
+        runCatching { t.join(MQTT_OFFLINE_PUBLISH_WAIT_MS) }
     }
 
     private fun connectAndRun() {
@@ -2356,14 +2386,21 @@ class BridgeService : Service() {
 
         client.connect(MqttConnectOptions().apply {
             isCleanSession = true
-            connectionTimeout = 15
-            keepAliveInterval = 30
+            // fleet (2026-10-08): 10 s connect timeout (was 15); keepalive 30 s = the broker fires the last will
+            // ~45 s (1.5 x keepalive) after the link dies, Paho notices a dead link within ~30-60 s.
+            connectionTimeout = MQTT_CONNECT_TIMEOUT_S
+            keepAliveInterval = MQTT_KEEPALIVE_S
             maxInflight = 100
             if (p.username.isNotEmpty()) { userName = p.username; password = p.password.toCharArray() }
-            setWill(HaDiscovery.stateTopic(p.deviceId), "OFF".toByteArray(), 1, true)
+            // Last will = every per-Portal entity unavailable in HA (availability_topic in each discovery
+            // config). Was screen OFF (retained) - only one will per session, availability covers it.
+            setWill(HaDiscovery.availabilityTopic(p.deviceId), HaDiscovery.AVAILABILITY_OFFLINE.toByteArray(), 1, true)
         })
         mqtt = client
         Log.i(TAG, "MQTT connected to ${p.brokerUri}")
+        // Online first (retained), before discovery and states, so HA never sees the entities unavailable
+        // once this session is up.
+        client.publish(HaDiscovery.availabilityTopic(p.deviceId), retained(HaDiscovery.AVAILABILITY_ONLINE))
 
         // Purge retained commands left by old builds BEFORE subscribing, so the
         // broker has nothing stale to replay at us (screen OFF, camera OFF, …).
@@ -2467,6 +2504,9 @@ class BridgeService : Service() {
 
     /** Every state the Bridge keeps retained for HA (no side effects: never starts or stops anything). */
     private fun publishAllStates(p: Prefs) {
+        // Availability again with every burst (20 s re-publish, HA birth): a last will of a taken-over old
+        // session that reached the broker late can never leave the Portal 'unavailable' for long.
+        publishRaw(HaDiscovery.availabilityTopic(p.deviceId), HaDiscovery.AVAILABILITY_ONLINE, 1, retained = true)
         val pm = getSystemService(PowerManager::class.java)
         publishState(if (pm.isInteractive) "ON" else "OFF")
         publishSensitivityState(p)
