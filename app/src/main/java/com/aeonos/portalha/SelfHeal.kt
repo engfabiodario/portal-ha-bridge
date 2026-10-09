@@ -28,6 +28,13 @@ import java.util.Locale
  *  - keepalive the Ava keep-alive is on but not parked             -> the keep-alive's own re-park
  *  - wifi      the Wi-Fi link is down for 2 ticks -> Android 9: WifiManager.reconnect() once per
  *              outage; Android 10: reported only
+ *  - lan       (fleet 2026-10-08) Wi-Fi says connected but neither the MQTT broker (host:port) nor the
+ *              LAN probe (default the broker's /24 .1 = main Deco, :80) accepts a TCP connect in 3 s
+ *              (a refused connect counts as reachable), on 2 consecutive checks -> Android 9:
+ *              WifiManager.reconnect(), from the 2nd action of an outage disconnect() + reconnect();
+ *              Android 10: state 'failing' (reason 'lan unreachable') and reconnect() is still tried
+ *              (it returns false there - no API). While the self-heal state is not ok, or lan is bad,
+ *              the lan check alone runs every [LAN_FAST_MS] (60 s) instead of every tick.
  *
  * It never reboots, never toggles the Wi-Fi radio, never changes a camera switch or preference,
  * never drives another app's UI. A tick is skipped while a call / ringing / alarm / cast / intercom
@@ -63,9 +70,11 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         fun keepAliveParked(): Boolean?
         fun keepAliveRepark(): String
         fun publish(state: String, attributesJson: String)
+        /** lan check: TCP targets (host to port), the MQTT broker first. Empty = n/a. */
+        fun lanTargets(): List<Pair<String, Int>> = emptyList()
     }
 
-    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), RTSPCLIENTS("rtspclients"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi") }
+    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), RTSPCLIENTS("rtspclients"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi"), LAN("lan") }
 
     private class CheckState {
         var last = "unknown"     // ok / bad: <why> / n/a: <why>
@@ -90,6 +99,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     @Volatile private var lastReason = ""
     @Volatile private var lastSkip = ""
     @Volatile private var ticks = 0
+    @Volatile private var lanTargetsText = ""
+    @Volatile private var lanBadSinceWall = 0L
+    private var lastLanRunMs = 0L
+    @Volatile private var lanFastScheduled = false
     private var actionsToday = 0
     private var actionsDay = -1
 
@@ -98,6 +111,24 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             runCheck("tick")
             handler.postDelayed(this, TICK_MS)
         }
+    }
+
+    // The lan check alone, every LAN_FAST_MS while anything is unhealthy (stops itself once all is ok).
+    private val lanFast = object : Runnable {
+        override fun run() {
+            lanFastScheduled = false
+            if (!started || !enabled || !unhealthy()) return
+            runLanOnly("lan 60 s")
+            scheduleLanFast()
+        }
+    }
+
+    private fun unhealthy() = state != "ok" || checks.getValue(Check.LAN).bad > 0
+
+    private fun scheduleLanFast() {
+        if (lanFastScheduled || !started || !enabled || !unhealthy()) return
+        lanFastScheduled = true
+        handler.postDelayed(lanFast, LAN_FAST_MS)
     }
 
     fun start(on: Boolean) {
@@ -120,7 +151,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         enabled = on
         Log.i(TAG, "switch ${if (on) "ON" else "OFF"}")
         handler.post {
-            if (!on) checks.values.forEach { it.bad = 0; it.streak = 0; it.last = "unknown" }
+            if (!on) { checks.values.forEach { it.bad = 0; it.streak = 0; it.last = "unknown" }; lanBadSinceWall = 0L }
             publish()
         }
     }
@@ -141,7 +172,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     fun status(): String {
         val parts = checks.entries.joinToString(" ") { (c, s) -> "${c.id}=${s.last.substringBefore(':')}/${s.bad}" }
         return "status enabled=$enabled state=${stateNow()} ticks=$ticks $parts fake=${fake?.id ?: "none"} " +
-            "actionsToday=$actionsToday lastAction='$lastAction' lastReason='$lastReason'"
+            "actionsToday=$actionsToday lastAction='$lastAction' lastReason='$lastReason' " +
+            "lan='${checks.getValue(Check.LAN).last}' lanTargets='$lanTargetsText' lanFast=$lanFastScheduled"
     }
 
     private fun stateNow() = if (!enabled) "off" else state
@@ -163,21 +195,64 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val wifi = evalWifi()
         val wifiDown = wifi.startsWith("bad")
         judge(Check.WIFI, wifi)
-        judge(Check.MQTT, evalMqtt(), skipActionWhy = if (wifiDown) "the Wi-Fi link is down" else null)
+        // lan: skipped here when the 60 s lan run did it moments ago (2 checks must be ~a minute apart).
+        if (SystemClock.elapsedRealtime() - lastLanRunMs >= LAN_FAST_MS - 10_000L) judgeLan(wifi)
+        val lanDown = checks.getValue(Check.LAN).last.startsWith("bad")
+        val linkWhy = when {
+            wifiDown -> "the Wi-Fi link is down"
+            lanDown -> "the LAN is unreachable"
+            else -> null
+        }
+        judge(Check.MQTT, evalMqtt(), skipActionWhy = linkWhy)
         judge(Check.STREAM, evalStream())
         judge(Check.RTSPCLIENTS, evalRtspClients())
-        judge(Check.WEBVIEW, evalWebview(), skipActionWhy = if (wifiDown) "the Wi-Fi link is down" else null)
+        judge(Check.WEBVIEW, evalWebview(), skipActionWhy = linkWhy)
         judge(Check.KEEPALIVE, evalKeepAlive())
 
+        updateState(why)
+        publish()
+        scheduleLanFast()
+    }
+
+    /** The lan check on its own (the 60 s cadence while unhealthy). */
+    private fun runLanOnly(why: String) {
+        if (!started || !enabled) return
+        val busy = runCatching { host.busyReason() }.getOrNull()
+        if (busy != null) {
+            if (busy != lastSkip) { lastSkip = busy; Log.i(TAG, "check skipped: $busy") }
+            return
+        }
+        lastCheckWall = System.currentTimeMillis()
+        judgeLan(evalWifi())
+        updateState(why)
+        publish()
+    }
+
+    private fun judgeLan(wifi: String) {
+        lastLanRunMs = SystemClock.elapsedRealtime()
+        judge(Check.LAN, evalLan(wifi))
+        val s = checks.getValue(Check.LAN)
+        if (s.bad > 0) {
+            if (lanBadSinceWall == 0L) lanBadSinceWall = System.currentTimeMillis()
+            if (s.bad >= BAD_TICKS_FOR_ACTION) lastReason = "lan unreachable"
+        } else if (lanBadSinceWall != 0L) {
+            Log.i(TAG, "lan: reachable again after ${(System.currentTimeMillis() - lanBadSinceWall) / 1000}s")
+            lanBadSinceWall = 0L
+        }
+    }
+
+    private fun updateState(why: String) {
         val worst = checks.values.maxOf { it.bad }
+        // Android 10 has no API to bring an associated-but-dead Wi-Fi link back: say so at once.
+        val lanStuck = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            checks.getValue(Check.LAN).bad >= BAD_TICKS_FOR_ACTION
         val newState = when {
-            worst >= FAILING_TICKS -> "failing"
+            worst >= FAILING_TICKS || lanStuck -> "failing"
             worst > 0 -> "fixing"
             else -> "ok"
         }
         if (newState != state) Log.i(TAG, "state $state -> $newState ($why)")
         state = newState
-        publish()
     }
 
     private fun faked(c: Check) = fake == c
@@ -192,6 +267,36 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         } == true
         if (up) "ok" else "bad: Wi-Fi link down"
     }.getOrElse { "n/a: ${it.message}" }
+
+    private fun evalLan(wifi: String): String {
+        if (faked(Check.LAN)) return "bad: test (selfHealTest lan)"
+        if (wifi != "ok") return "n/a: Wi-Fi not connected"
+        val targets = runCatching { host.lanTargets() }.getOrDefault(emptyList())
+        lanTargetsText = targets.joinToString(",") { "${it.first}:${it.second}" }
+        if (targets.isEmpty()) return "n/a: no LAN target"
+        val results = targets.map { (h, port) -> "$h:$port" to probe(h, port) }
+        if (results.any { it.second == null }) return "ok"
+        return "bad: lan unreachable (" + results.joinToString(", ") { "${it.first} ${it.second}" } + ")"
+    }
+
+    /** null = reachable (connected, or actively refused = the host answered); else why not. */
+    private fun probe(host: String, port: Int): String? {
+        val sock = java.net.Socket()
+        return try {
+            sock.connect(java.net.InetSocketAddress(host, port), LAN_PROBE_TIMEOUT_MS)
+            null
+        } catch (e: java.net.SocketTimeoutException) {
+            "timeout ${LAN_PROBE_TIMEOUT_MS / 1000}s"
+        } catch (e: java.net.ConnectException) {
+            if (e.message?.contains("refused", ignoreCase = true) == true) null else "failed: ${e.message}"
+        } catch (e: java.net.UnknownHostException) {
+            "unresolved"
+        } catch (e: Exception) {
+            "failed: ${e.message}"
+        } finally {
+            runCatching { sock.close() }
+        }
+    }
 
     private fun evalMqtt(): String {
         if (faked(Check.MQTT)) return "bad: test (selfHealTest mqtt)"
@@ -256,7 +361,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             Log.w(TAG, "${c.id}: no action - ${s.actions.size} in the last hour (limit $MAX_PER_HOUR)"); return
         }
         if (s.streak > 0) {
-            val wait = (TICK_MS shl (s.streak - 1)).coerceAtMost(HOUR_MS) - 5_000L
+            // lan runs every minute while unhealthy: its repeats back off from 2 min (2, 4, 8 ... min).
+            val base = if (c == Check.LAN) LAN_BACKOFF_BASE_MS else TICK_MS
+            val wait = (base shl (s.streak - 1)).coerceAtMost(HOUR_MS) - 5_000L
             if (now - s.lastActionMs < wait) {
                 Log.i(TAG, "${c.id}: backing off (${(wait - (now - s.lastActionMs)) / 1000}s left)"); return
             }
@@ -269,6 +376,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
                 Check.WEBVIEW -> host.webviewReload()
                 Check.KEEPALIVE -> host.keepAliveRepark()
                 Check.WIFI -> wifiAction(s)
+                Check.LAN -> lanAction(s)
             }
         }.getOrElse { "failed: ${it.message}" }
         if (what.isEmpty()) return   // nothing done (wifi: report only / already used)
@@ -293,6 +401,20 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         return "WifiManager.reconnect() = $ok"
     }
 
+    // reconnect() first; from the 2nd action of the same outage disconnect() + reconnect(). On Android 10
+    // an app targeting API 29+ gets false from both (no API left) - tried anyway, the result is reported.
+    @Suppress("DEPRECATION")
+    private fun lanAction(s: CheckState): String {
+        val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
+        val note = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) " (Android ${Build.VERSION.RELEASE}: no API, reported)" else ""
+        return if (s.streak == 0) {
+            "WifiManager.reconnect() = ${wm.reconnect()}$note"
+        } else {
+            val d = wm.disconnect()
+            "WifiManager.disconnect() = $d + reconnect() = ${wm.reconnect()}$note"
+        }
+    }
+
     private fun countToday() {
         val day = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         if (day != actionsDay) { actionsDay = day; actionsToday = 0 }
@@ -304,15 +426,19 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     private fun publish() {
         val day = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         if (day != actionsDay) { actionsDay = day; actionsToday = 0 }
-        val iso = if (lastCheckWall == 0L) "" else
-            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(Date(lastCheckWall))
-            .let { it.substring(0, it.length - 2) + ":" + it.substring(it.length - 2) }
+        val iso = if (lastCheckWall == 0L) "" else isoOf(lastCheckWall)
         val checksJson = checks.entries.joinToString(",") { (c, s) -> "\"${c.id}\":\"${esc(s.last)}\"" }
         val attrs = "{\"last_check\":${if (iso.isEmpty()) "null" else "\"$iso\""}," +
             "\"last_action\":\"${esc(lastAction)}\",\"last_reason\":\"${esc(lastReason)}\"," +
-            "\"actions_today\":$actionsToday,\"checks\":{$checksJson}}"
+            "\"actions_today\":$actionsToday,\"checks\":{$checksJson}," +
+            "\"lan\":\"${esc(checks.getValue(Check.LAN).last)}\",\"lan_targets\":\"${esc(lanTargetsText)}\"," +
+            "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}}"
         runCatching { host.publish(stateNow(), attrs) }
     }
+
+    private fun isoOf(ms: Long): String =
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(Date(ms))
+            .let { it.substring(0, it.length - 2) + ":" + it.substring(it.length - 2) }
 
     private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
 
@@ -327,5 +453,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         private const val FAILING_TICKS = 3
         private const val MAX_PER_HOUR = 3
         private const val HOUR_MS = 60 * 60_000L
+        const val LAN_FAST_MS = 60_000L
+        private const val LAN_BACKOFF_BASE_MS = 2 * 60_000L
+        private const val LAN_PROBE_TIMEOUT_MS = 3_000
     }
 }

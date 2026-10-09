@@ -390,6 +390,13 @@ class Prefs(private val context: Context) {
         get() = sp.getBoolean("self_heal", true)
         set(v) = sp.edit().putBoolean("self_heal", v).apply()
 
+    // Self-heal 'lan' check (fleet 2026-10-08): the LAN probe besides the MQTT broker, "host" or "host:port"
+    // (port default 80). Empty = the broker host's /24 .1 (192.168.68.1 = the main Deco), port 80.
+    // adb DEBUG_CONFIG --es lanProbe 192.168.68.1:80 ('' = back to the default).
+    var lanProbe: String
+        get() = sp.getString("lan_probe", "") ?: ""
+        set(v) = sp.edit().putString("lan_probe", v.trim()).apply()
+
     // Timed pause of the keep-alive for setup scripts (wall clock ms, 0 = none): off until then, then
     // back on by itself - unlike avaKeepAlive=false, which stays off. adb DEBUG_CONFIG
     // --ei keepAlivePauseMinutes N (max AvaKeepAlive.MAX_PAUSE_MINUTES; 0 ends it).

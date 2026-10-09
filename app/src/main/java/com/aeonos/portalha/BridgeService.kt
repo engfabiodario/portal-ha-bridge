@@ -2117,6 +2117,10 @@ class BridgeService : Service() {
                     publishSelfHealSwitchState(p)
                 }
                 intent.getStringExtra("selfHealTest")?.let { selfHeal?.setTest(it) }
+                intent.getStringExtra("lanProbe")?.let { v ->
+                    p.lanProbe = v
+                    Log.i("SelfHeal", "config: lan probe = ${lanProbeTarget(p)?.let { "${it.first}:${it.second}" } ?: "none"}")
+                }
                 if (intent.getBooleanExtra("selfHealTick", false)) selfHeal?.tickNow()
                 // Stream rotation (fleet):
                 //   --ei streamRotation 0|90|180|270   the landscape base (= the Rotate Stream button)
@@ -2850,6 +2854,26 @@ class BridgeService : Service() {
             publishRaw(HaDiscovery.selfHealStateTopic(p.deviceId), state, 1, retained = true)
             publishRaw(HaDiscovery.selfHealAttributesTopic(p.deviceId), attributesJson, 1, retained = true)
         }
+
+        // lan check targets: the MQTT broker, then Prefs.lanProbe (default: the broker's /24 .1 on :80).
+        override fun lanTargets(): List<Pair<String, Int>> {
+            val p = prefs ?: return emptyList()
+            val out = mutableListOf<Pair<String, Int>>()
+            val broker = p.brokerHost.trim()
+            if (broker.isNotEmpty()) out += broker to p.brokerPort
+            lanProbeTarget(p)?.let { if (it !in out) out += it }
+            return out
+        }
+    }
+
+    private fun lanProbeTarget(p: Prefs): Pair<String, Int>? {
+        val v = p.lanProbe.trim()
+        if (v.isNotEmpty()) {
+            val i = v.lastIndexOf(':')
+            return if (i > 0) v.substring(0, i) to (v.substring(i + 1).toIntOrNull() ?: 80) else v to 80
+        }
+        val m = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.\\d{1,3}$").find(p.brokerHost.trim()) ?: return null
+        return "${m.groupValues[1]}.${m.groupValues[2]}.${m.groupValues[3]}.1" to 80
     }
 
     private fun handleSelfHealCommand(payload: String, p: Prefs) {
