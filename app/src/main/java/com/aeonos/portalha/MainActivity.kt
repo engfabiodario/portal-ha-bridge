@@ -18,6 +18,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashRecorder.install(this)   // fleet: crash/last-crash.txt (idempotent; the service installs it too)
         prefs = Prefs(this)
         setContentView(R.layout.activity_main)
 

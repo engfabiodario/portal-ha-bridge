@@ -17,6 +17,26 @@ the latest GitHub release.
   `portal/navigate`, plus **Navigate** text entities.
 - **Double knock**: knock twice on the Portal's frame and the new **Knock** event entity fires
   `double_knock`. Taps on the screen don't count; the Tap sensitivity sets the threshold.
+- **Home Assistant knows when a Portal is gone.** Every Portal entity now follows
+  `portal/<device_id>/availability`: `online` (retained) right after each broker connect, `offline`
+  when the app stops, and the broker's last will `offline` when the Portal drops off the network
+  (about 45 s, 1.5 x the 30 s keepalive). Entity ids and unique ids are unchanged. The two
+  "Portal Fleet" entities have no availability (one Portal leaving must not grey them out). The
+  last will used to set the **Screen** switch OFF; it now makes the entities unavailable instead.
+- **Self heal: LAN check.** When Wi-Fi says connected but neither the MQTT broker nor the router
+  (the broker's /24 `.1`, port 80; `adb ... DEBUG_CONFIG --es lanProbe host[:port]`) accepts a TCP
+  connect in 3 s on two checks in a row, Android 9 asks Wi-Fi to reconnect (then disconnect +
+  reconnect; at most 3 an hour). Android 10 has no such API: the **Self Heal** sensor goes
+  `failing` with reason `lan unreachable`. While anything is unhealthy this check runs every
+  minute. New sensor attributes `lan`, `lan_targets`, `lan_unreachable_since`.
+- **Crash notes.** An uncaught crash is written to
+  `/sdcard/Android/data/com.aeonos.portalha/files/crash/last-crash.txt` (last 5 kept), and a
+  once-a-minute heartbeat there lets the next start log *previous run ended unexpectedly at ...*
+  (also `crash/previous-exit.txt`) when the app was killed without a clean stop.
+
+**Changed**
+- **Faster MQTT reconnect**: retries after 5, 10, then every 15 s (was up to 60 s) with a little
+  jitter; connect timeout 10 s (was 15).
 
 **Fixed**
 - **The screen no longer goes dark while you're using it.** The on-device Screen Timeout only

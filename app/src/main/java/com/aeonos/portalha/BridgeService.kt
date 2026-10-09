@@ -1064,6 +1064,10 @@ class BridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         serviceAlive = true
+        // fleet: record uncaught crashes + judge how the previous run ended (CrashRecorder), BEFORE the
+        // RTSP guard so the guard still swallows its library exception without it being recorded.
+        CrashRecorder.install(this)
+        CrashRecorder.onServiceStart(this)
         installRtspCrashGuard()
         createChannel()
         startForeground(NOTIF_ID, notification("Starting…"))
@@ -1440,6 +1444,7 @@ class BridgeService : Service() {
         timeoutHandler.removeCallbacks(timeoutRunnable)
         timeoutThread.quitSafely()
         hideCameraOverlay()
+        CrashRecorder.onServiceStop()   // heartbeat clean=true: this run ended normally
         super.onDestroy()
     }
 
@@ -2109,7 +2114,9 @@ class BridgeService : Service() {
                 //   --ez selfHeal true|false                   the switch (HA "Self Heal")
                 //   --es selfHealTest mqtt|stream|webview|none fake that check failing until its action fired once
                 //   --ez selfHealTick true                     run one check now (counts as a tick)
-                //   --ez selfHealStatus true                   logs one "status ..." line (tag SelfHeal)
+                //   --ez selfHealStatus true                   logs one "status ..." line (tag SelfHeal) + the crash recorder line
+                //   --es selfHealTest lan                      fake the lan check failing (Android 9: real WifiManager.reconnect())
+                //   --es lanProbe host[:port]                  the lan check's second target ('' = broker /24 .1:80)
                 if (intent.hasExtra("selfHeal")) {
                     val on = intent.getBooleanExtra("selfHeal", true)
                     p.selfHeal = on
@@ -2153,6 +2160,7 @@ class BridgeService : Service() {
                 }
                 if (intent.getBooleanExtra("selfHealStatus", false)) {
                     Log.i("SelfHeal", selfHeal?.status() ?: "status n/a (service starting)")
+                    Log.i("SelfHeal", CrashRecorder.status())
                 }
                 // YouTube screen (TvAppActivity standalone):
                 //   --ez youtube true|false        open / close (= HA "YouTube" / "YouTube Close")

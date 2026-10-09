@@ -143,6 +143,7 @@ class DashboardActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashRecorder.install(this)   // fleet: crash/last-crash.txt (idempotent; the service installs it too)
         setContentView(R.layout.activity_dashboard)
 
         prefs = Prefs(this)

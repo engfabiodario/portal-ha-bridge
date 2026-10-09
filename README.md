@@ -44,6 +44,8 @@ Everything below appears automatically as one HA **device** (named whatever you 
 
 Camera, Motion, and Camera Streaming are mutually managed: Motion and Streaming each open Camera 0 and are **mutually exclusive**.
 
+**Availability:** every entity of a Portal follows `portal/<device_id>/availability` (`online` / `offline`, retained; the MQTT last will is `offline`), so a Portal that is switched off or drops off the network shows as *unavailable* in HA after about 45 s instead of keeping its last values.
+
 ---
 
 ## Supported devices
@@ -400,6 +402,7 @@ CHANGELOG.md            Version history (features + bugfixes)
 - **No screen sleep** → `WRITE_SECURE_SETTINGS` not granted; run the provisioner (`provision.ps1` / `provision.sh`), or use the single grant in SETUP.md.
 - **Camera "can't open from background"** → re-open the dashboard app (it re-acquires the camera in the foreground).
 - **Provision says "no device"** → check `adb devices`, re-plug, accept the USB-debugging prompt.
+- **The app restarted by itself** → look in `/sdcard/Android/data/com.aeonos.portalha/files/crash/`: `last-crash.txt` (+ `.1`–`.4`) holds the stack trace of an uncaught crash, `previous-exit.txt` says when a run ended without a clean stop (last heartbeat; killed, power loss or an app update). The service logs the same at start (tag `CrashRecorder`).
 
 ---
 
