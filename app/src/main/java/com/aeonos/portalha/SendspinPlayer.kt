@@ -181,11 +181,10 @@ class SendspinPlayer(
                 AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
             ),
             artworkChannels = listOf(ArtworkChannel(source = "album", format = "jpeg")),
-            // set_static_delay: Music Assistant's per-player "Static playback delay" (Settings >
-            // Players > <Portal> > Sendspin) reaches us only when we declare it. It shifts our
-            // playback EARLIER by that many ms - the knob for a model whose speaker path lags
-            // beyond what the AudioTrack timestamps report.
-            playerSupportedCommands = listOf("volume", "mute", "set_static_delay"),
+            // NOT "set_static_delay": Music Assistant 2.10.5 (aiosendspin 10.0.0) rejects the whole
+            // client/hello as malformed when it is listed (2026-10-10 pilot: endless reconnect loop,
+            // player unavailable). The static-delay handler stays for a server that accepts it.
+            playerSupportedCommands = listOf("volume", "mute"),
             supportedOptionalRoles = setOf(
                 OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER),
         )
