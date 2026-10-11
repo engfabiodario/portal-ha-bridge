@@ -181,6 +181,11 @@ class SendspinPlayer(
                 AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
             ),
             artworkChannels = listOf(ArtworkChannel(source = "album", format = "jpeg")),
+            // set_static_delay: Music Assistant's per-player "Static playback delay" (Settings >
+            // Players > <Portal> > Sendspin) reaches us only when we declare it. It shifts our
+            // playback EARLIER by that many ms - the knob for a model whose speaker path lags
+            // beyond what the AudioTrack timestamps report.
+            playerSupportedCommands = listOf("volume", "mute", "set_static_delay"),
             supportedOptionalRoles = setOf(
                 OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER),
         )
@@ -199,6 +204,9 @@ class SendspinPlayer(
             },
         )
         client = c
+        // Building an AudioTrack takes 50-300 ms; ask the server to schedule a stream's first
+        // chunk (start / join / seek) at least this far ahead so nothing is late at start.
+        c.setRequiredLeadTimeMs(400)
 
         // Announce ourselves as media playback so the system ducks/notifies us appropriately.
         val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
