@@ -32,8 +32,10 @@ import java.util.Locale
  *              LAN probe (default the broker's /24 .1 = main Deco, :80) accepts a TCP connect in 3 s
  *              (a refused connect counts as reachable), on 2 consecutive checks -> Android 9:
  *              WifiManager.reconnect(), from the 2nd action of an outage disconnect() + reconnect();
- *              Android 10: state 'failing' (reason 'lan unreachable') and reconnect() is still tried
- *              (it returns false there - no API). While the self-heal state is not ok, or lan is bad,
+ *              Android 10: report only - state 'failing' (reason 'lan unreachable'). NEVER disconnect()
+ *              there (2026-10-13): it does work on the Portal 10", but Android 10 then holds the network
+ *              NETWORK_SELECTION_DISABLED_NO_INTERNET_TEMPORARY and doesn't rejoin it for ~13 min (Upstairs
+ *              Hallway Guest 07:24 -> 07:37: a 2-min LAN glitch became a 13-min outage). While the self-heal state is not ok, or lan is bad,
  *              the lan check alone runs every [LAN_FAST_MS] (30 s).
  *
  * It never reboots, never toggles the Wi-Fi radio, never changes a camera switch or preference,
@@ -379,7 +381,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
                 Check.LAN -> lanAction(s)
             }
         }.getOrElse { "failed: ${it.message}" }
-        if (what.isEmpty()) return   // nothing done (wifi: report only / already used)
+        if (what.isEmpty()) {        // nothing done (wifi / lan on Android 10: report only; already used)
+            if (fake == c) { fake = null; Log.i(TAG, "test: '${c.id}' report-only - fake cleared") }
+            return
+        }
         s.actions.addLast(now); s.streak++; s.lastActionMs = now
         if (fake == c) { fake = null; Log.i(TAG, "test: '${c.id}' action fired - fake cleared") }
         countToday()
@@ -401,17 +406,20 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         return "WifiManager.reconnect() = $ok"
     }
 
-    // reconnect() first; from the 2nd action of the same outage disconnect() + reconnect(). On Android 10
-    // an app targeting API 29+ gets false from both (no API left) - tried anyway, the result is reported.
+    // Android 9: reconnect() first; from the 2nd action of the same outage disconnect() + reconnect().
+    // Android 10+: report only (see the class doc) - like wifiAction.
     @Suppress("DEPRECATION")
     private fun lanAction(s: CheckState): String {
+        if (Build.VERSION.SDK_INT != Build.VERSION_CODES.P) {
+            if (s.bad == BAD_TICKS_FOR_ACTION) Log.w(TAG, "lan: unreachable for ${s.bad} checks - report only on Android ${Build.VERSION.RELEASE}")
+            return ""
+        }
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
-        val note = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) " (Android ${Build.VERSION.RELEASE}: no API, reported)" else ""
         return if (s.streak == 0) {
-            "WifiManager.reconnect() = ${wm.reconnect()}$note"
+            "WifiManager.reconnect() = ${wm.reconnect()}"
         } else {
             val d = wm.disconnect()
-            "WifiManager.disconnect() = $d + reconnect() = ${wm.reconnect()}$note"
+            "WifiManager.disconnect() = $d + reconnect() = ${wm.reconnect()}"
         }
     }
 
