@@ -2158,6 +2158,8 @@ class BridgeService : Service() {
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
                 }
+                //   --ez avaCloseOverlays true                 Ava's ACTION_EXIT_FULLSCREEN_OVERLAYS (clears its setup tip)
+                if (intent.getBooleanExtra("avaCloseOverlays", false)) closeAvaOverlays("adb")
                 if (intent.getBooleanExtra("selfHealStatus", false)) {
                     Log.i("SelfHeal", selfHeal?.status() ?: "status n/a (service starting)")
                     Log.i("SelfHeal", CrashRecorder.status())
@@ -2429,6 +2431,7 @@ class BridgeService : Service() {
             HaDiscovery.showDashboardCommandTopic(p.deviceId),
             HaDiscovery.screensaverCommandTopic(p.deviceId),
             HaDiscovery.screensaverDismissCommandTopic(p.deviceId),
+            HaDiscovery.avaOverlaysCloseCommandTopic(p.deviceId),
             HaDiscovery.screensaverHoldCommandTopic(p.deviceId),
             HaDiscovery.screensaverBrightnessCommandTopic(p.deviceId),
             // Shared across the fleet, so one HA action clears the photos everywhere.
@@ -2606,6 +2609,7 @@ class BridgeService : Service() {
         pub(HaDiscovery.showDashboardDiscoveryTopic(p.deviceId), HaDiscovery.showDashboardConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverDiscoveryTopic(p.deviceId), HaDiscovery.screensaverConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverDismissDiscoveryTopic(p.deviceId), HaDiscovery.screensaverDismissConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.avaOverlaysCloseDiscoveryTopic(p.deviceId), HaDiscovery.avaOverlaysCloseConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverHoldDiscoveryTopic(p.deviceId), HaDiscovery.screensaverHoldConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverBrightnessDiscoveryTopic(p.deviceId), HaDiscovery.screensaverBrightnessConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.screensaverShowingDiscoveryTopic(p.deviceId), HaDiscovery.screensaverShowingConfigPayload(p.deviceId, p.deviceName))
@@ -2728,6 +2732,7 @@ class BridgeService : Service() {
             HaDiscovery.screensaverCommandTopic(p.deviceId)       -> handleScreensaverCommand(payload, p)
             HaDiscovery.screensaverDismissCommandTopic(p.deviceId),
             HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC           -> dismissScreensaverFromHa(payload, p)
+            HaDiscovery.avaOverlaysCloseCommandTopic(p.deviceId)  -> if (payload == "close") closeAvaOverlays("ha")
             HaDiscovery.screensaverHoldCommandTopic(p.deviceId)   -> handleScreensaverHoldCommand(payload, p)
             HaDiscovery.screensaverBrightnessCommandTopic(p.deviceId) -> handleScreensaverBrightnessCommand(payload, p)
             HaDiscovery.navigateCommandTopic(p.deviceId),
@@ -4685,6 +4690,15 @@ class BridgeService : Service() {
      * number of seconds to override the configured default for one press (e.g. publish "300" to
      * hold five minutes); anything else uses [Prefs.screensaverDismissHoldSecs].
      */
+    /** Ava's exported AvaControlReceiver closes every Ava full-screen overlay (incl. the setup tip). Never touches the camera. */
+    private fun closeAvaOverlays(from: String) {
+        runCatching {
+            sendBroadcast(Intent("com.example.ava.ACTION_EXIT_FULLSCREEN_OVERLAYS")
+                .setComponent(android.content.ComponentName("com.example.ava", "com.example.ava.receivers.AvaControlReceiver")))
+        }.onSuccess { Log.i(TAG, "ava: close overlays sent ($from)") }
+            .onFailure { Log.w(TAG, "ava: close overlays failed ($from): ${it.message}") }
+    }
+
     private fun dismissScreensaverFromHa(payload: String, p: Prefs) {
         val hold = payload.trim().toIntOrNull()?.coerceIn(0, 3600) ?: p.screensaverDismissHoldSecs
         val wasShowing = screensaver.isShowing

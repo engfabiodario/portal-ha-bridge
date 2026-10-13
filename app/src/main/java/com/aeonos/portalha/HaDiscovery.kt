@@ -388,6 +388,19 @@ object HaDiscovery {
         return """{"name":"Photos Showing","unique_id":"${deviceId}_photos_showing","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${screensaverShowingStateTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:image-frame"}"""
     }
 
+    // Fleet 2026-10-13: closes Ava's full-screen overlays (its exported ACTION_EXIT_FULLSCREEN_OVERLAYS) - used by
+    // HA after Ava reconnects, to clear the false "allow Home Assistant actions" setup tip (Ava's one-shot probe can
+    // be sent before HA subscribes, then the tip stays up). Config category: never on cards, never voice-exposed.
+    fun avaOverlaysCloseCommandTopic(deviceId: String) = "portal/$deviceId/ava/overlays/close"
+
+    fun avaOverlaysCloseDiscoveryTopic(deviceId: String) =
+        "homeassistant/button/${deviceId}_ava_overlays_close/config"
+
+    fun avaOverlaysCloseConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Close Ava Overlays","unique_id":"${deviceId}_ava_overlays_close","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${avaOverlaysCloseCommandTopic(deviceId)}","payload_press":"close","entity_category":"config","icon":"mdi:close-box-multiple"}"""
+    }
+
     fun screensaverDismissCommandTopic(deviceId: String) = "portal/$deviceId/screensaver/dismiss"
 
     fun screensaverDismissDiscoveryTopic(deviceId: String) =
@@ -627,6 +640,7 @@ object HaDiscovery {
         showDashboardCommandTopic(deviceId),
         screensaverCommandTopic(deviceId),
         screensaverDismissCommandTopic(deviceId),
+        avaOverlaysCloseCommandTopic(deviceId),
         screensaverHoldCommandTopic(deviceId),
         presenceEnableCommandTopic(deviceId),
         screenTimeoutCommandTopic(deviceId),
