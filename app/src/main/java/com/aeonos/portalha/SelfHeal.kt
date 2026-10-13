@@ -15,7 +15,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Soft self-heal: every [TICK_MS] the app checks its OWN components and restarts the ones that
+ * Soft self-heal: every [TICK_MS] (30 s since 2026-10-12, was 5 min; first check 2 min after start) the app checks its OWN components and restarts the ones that
  * stopped working, through the entry points the app already uses for them:
  *
  *  - mqtt      the broker client is disconnected on 2 ticks         -> the app's MQTT reconnect
@@ -34,7 +34,7 @@ import java.util.Locale
  *              WifiManager.reconnect(), from the 2nd action of an outage disconnect() + reconnect();
  *              Android 10: state 'failing' (reason 'lan unreachable') and reconnect() is still tried
  *              (it returns false there - no API). While the self-heal state is not ok, or lan is bad,
- *              the lan check alone runs every [LAN_FAST_MS] (60 s) instead of every tick.
+ *              the lan check alone runs every [LAN_FAST_MS] (30 s).
  *
  * It never reboots, never toggles the Wi-Fi radio, never changes a camera switch or preference,
  * never drives another app's UI. A tick is skipped while a call / ringing / alarm / cast / intercom
@@ -136,7 +136,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         if (started) return
         started = true
         handler.postDelayed(tick, START_DELAY_MS)
-        Log.i(TAG, "service up (enabled=$on, first check in ${START_DELAY_MS / 60_000} min, then every ${TICK_MS / 60_000} min)")
+        Log.i(TAG, "service up (enabled=$on, first check in ${START_DELAY_MS / 1000} s, then every ${TICK_MS / 1000} s)")
         handler.post { publish() }
     }
 
@@ -361,8 +361,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             Log.w(TAG, "${c.id}: no action - ${s.actions.size} in the last hour (limit $MAX_PER_HOUR)"); return
         }
         if (s.streak > 0) {
-            // lan runs every minute while unhealthy: its repeats back off from 2 min (2, 4, 8 ... min).
-            val base = if (c == Check.LAN) LAN_BACKOFF_BASE_MS else TICK_MS
+            // Near-real-time (Fabio 2026-10-12): checks every 30 s; repeats back off from 1 min (1, 2, 4 ... min).
+            val base = if (c == Check.LAN) LAN_BACKOFF_BASE_MS else ACTION_BACKOFF_BASE_MS
             val wait = (base shl (s.streak - 1)).coerceAtMost(HOUR_MS) - 5_000L
             if (now - s.lastActionMs < wait) {
                 Log.i(TAG, "${c.id}: backing off (${(wait - (now - s.lastActionMs)) / 1000}s left)"); return
@@ -444,17 +444,19 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     companion object {
         private const val TAG = "SelfHeal"
-        const val TICK_MS = 5 * 60_000L
-        const val START_DELAY_MS = 10 * 60_000L
+        const val TICK_MS = 30_000L
+        const val START_DELAY_MS = 2 * 60_000L
         private const val WEBVIEW_TIMEOUT_MS = 10_000L
         // No encoded frame for longer than this = stale (a tick is 5 min; 2 such ticks = action).
         private const val STREAM_STALE_MS = 60_000L
         private const val BAD_TICKS_FOR_ACTION = 2
         private const val FAILING_TICKS = 3
-        private const val MAX_PER_HOUR = 3
+        private const val MAX_PER_HOUR = 6
         private const val HOUR_MS = 60 * 60_000L
-        const val LAN_FAST_MS = 60_000L
-        private const val LAN_BACKOFF_BASE_MS = 2 * 60_000L
+        const val LAN_FAST_MS = 30_000L
+        private const val LAN_BACKOFF_BASE_MS = 60_000L
+        /** Repeats of the same (non-lan) action back off 1, 2, 4, 8 ... min (the tick is only 30 s). */
+        private const val ACTION_BACKOFF_BASE_MS = 60_000L
         private const val LAN_PROBE_TIMEOUT_MS = 3_000
     }
 }
