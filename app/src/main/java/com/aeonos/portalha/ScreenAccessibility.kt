@@ -4,7 +4,9 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
 import android.graphics.Path
+import android.content.pm.PackageManager
 import android.util.Log
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 
 /**
@@ -19,6 +21,38 @@ class ScreenAccessibility : AccessibilityService() {
     companion object {
         @Volatile var instance: ScreenAccessibility? = null
         private const val TAG = "PortalHA"
+
+        /** The Portal TV remote's navigation keys (D-pad, OK, Back) - the ones the photo screensaver uses. */
+        fun isRemoteNavKey(code: Int): Boolean = when (code) {
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_BACK -> true
+            else -> false
+        }
+    }
+
+    // Fleet (Portal TV "ripley", 2026-10-17): after a (re)park the Ava keep-alive window holds the input focus,
+    // so the remote's keys went to Ava and never reached DashboardActivity.dispatchKeyEvent - the photo
+    // screensaver could not be closed (logcat: KEYCODE_BACK with AvaKeepAliveActivity on top, no 'screensaver:
+    // remote key'). Key filtering sees every key first, whatever window has the focus: while the photos show,
+    // the whole press (down, repeats, up) goes to them; any other key is left alone. Touch Portals: never.
+    private val noTouchscreen by lazy { !packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN) }
+    private var photoKey = -1
+
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (!noTouchscreen || !isRemoteNavKey(event.keyCode)) return false
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            if (photoKey == event.keyCode) return true
+            if (event.repeatCount == 0 && BridgeService.screensaverRemoteKey(event.keyCode)) {
+                photoKey = event.keyCode
+                return true
+            }
+        } else if (event.action == KeyEvent.ACTION_UP && photoKey == event.keyCode) {
+            photoKey = -1
+            return true
+        }
+        return false
     }
 
     override fun onServiceConnected() {

@@ -4,12 +4,15 @@
     (canPerformGestures) so the service can inject the single tap that dismisses
     Meta's launcher photo-home when we open it for a call. No content/scroll
     events — still a light footprint.
+    Fleet (2026-10-17): key filtering, so a Portal TV remote reaches the photo screensaver even while the
+    parked Ava keep-alive window holds the focus (ScreenAccessibility.onKeyEvent; touch Portals: untouched).
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags=""
+    android:accessibilityFlags="flagRequestFilterKeyEvents"
     android:canPerformGestures="true"
+    android:canRequestFilterKeyEvents="true"
     android:description="@string/accessibility_description"
     android:notificationTimeout="0"
     android:settingsActivity=".MainActivity" />

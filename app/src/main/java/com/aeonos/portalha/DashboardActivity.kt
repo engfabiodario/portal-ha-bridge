@@ -378,13 +378,7 @@ class DashboardActivity : AppCompatActivity() {
     }
     private var photoKey = -1          // the remote key whose press went to the photo screensaver
 
-    private fun isRemoteNavKey(code: Int): Boolean = when (code) {
-        android.view.KeyEvent.KEYCODE_DPAD_UP, android.view.KeyEvent.KEYCODE_DPAD_DOWN,
-        android.view.KeyEvent.KEYCODE_DPAD_LEFT, android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
-        android.view.KeyEvent.KEYCODE_DPAD_CENTER, android.view.KeyEvent.KEYCODE_ENTER,
-        android.view.KeyEvent.KEYCODE_NUMPAD_ENTER, android.view.KeyEvent.KEYCODE_BACK -> true
-        else -> false
-    }
+    private fun isRemoteNavKey(code: Int): Boolean = ScreenAccessibility.isRemoteNavKey(code)
 
     // Someone — or something — is putting another screen in front of us. This catches a
     // deliberate departure (Home, launching an app), which must NOT be undone: "recover a
