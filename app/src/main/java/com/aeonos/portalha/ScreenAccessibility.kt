@@ -40,17 +40,30 @@ class ScreenAccessibility : AccessibilityService() {
     private val noTouchscreen by lazy { !packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN) }
     private var photoKey = -1
 
+    // Fleet 2026-10-19: the same focus problem on the YouTube screen (TvAppActivity, watch together): while
+    // it is up, the remote's D-pad / OK / Back / play-pause go to it (TvAppActivity.remoteKey) - photos first.
+    private var youtubeKey = -1
+
+    private fun isYouTubeKey(code: Int): Boolean = isRemoteNavKey(code) || code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+        code == KeyEvent.KEYCODE_MEDIA_PLAY || code == KeyEvent.KEYCODE_MEDIA_PAUSE
+
     override fun onKeyEvent(event: KeyEvent): Boolean {
-        if (!noTouchscreen || !isRemoteNavKey(event.keyCode)) return false
+        if (!noTouchscreen) return false
+        val code = event.keyCode
         if (event.action == KeyEvent.ACTION_DOWN) {
-            if (photoKey == event.keyCode) return true
-            if (event.repeatCount == 0 && BridgeService.screensaverRemoteKey(event.keyCode)) {
-                photoKey = event.keyCode
+            if (photoKey == code) return true
+            if (youtubeKey == code) { TvAppActivity.remoteKey(code, event.repeatCount); return true }
+            if (event.repeatCount == 0 && isRemoteNavKey(code) && BridgeService.screensaverRemoteKey(code)) {
+                photoKey = code
                 return true
             }
-        } else if (event.action == KeyEvent.ACTION_UP && photoKey == event.keyCode) {
-            photoKey = -1
-            return true
+            if (event.repeatCount == 0 && isYouTubeKey(code) && TvAppActivity.remoteKey(code, 0)) {
+                youtubeKey = code
+                return true
+            }
+        } else if (event.action == KeyEvent.ACTION_UP) {
+            if (photoKey == code) { photoKey = -1; return true }
+            if (youtubeKey == code) { youtubeKey = -1; return true }
         }
         return false
     }

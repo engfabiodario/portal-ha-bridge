@@ -146,6 +146,40 @@ class TvAppActivity : Activity() {
             return true
         }
 
+        /**
+         * Fleet (Portal TV "ripley", 2026-10-19): the remote, from ScreenAccessibility's key filter. On Android 9
+         * the parked Ava keep-alive window takes the input focus (this screen is merely paused next to it), so
+         * the remote's keys never reached the page. While this screen is up: D-pad / OK go into the page
+         * (D-pad repeats too), play/pause = the pad's (the whole group in a watch session); Back in a watch
+         * session = THIS Portal leaves it (the rest play on) and its dashboard comes back; Back otherwise =
+         * the page's own Back (Escape), held = close. [repeat] = KeyEvent.repeatCount. True = taken.
+         */
+        fun remoteKey(code: Int, repeat: Int): Boolean {
+            val a = instance ?: return false
+            if (!visibleNow || a.exiting) return false
+            BridgeService.noteTouch()
+            when (code) {
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT ->
+                    a.runOnUiThread { a.lastTouchMs = System.currentTimeMillis(); a.sendKey(code) }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER ->
+                    if (repeat == 0) a.runOnUiThread { a.lastTouchMs = System.currentTimeMillis(); a.sendKey(KeyEvent.KEYCODE_ENTER) }
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
+                    if (repeat == 0) a.runOnUiThread { a.padKey("playpause") }
+                KeyEvent.KEYCODE_BACK -> {
+                    val inSession = BridgeService.watchSessionMembers().isNotEmpty()
+                    if (repeat == 0) {
+                        if (inSession) {
+                            Log.i(TAG, "youtube: remote Back in a watch session - this Portal leaves")
+                            a.runOnUiThread { a.exitToDashboard("remote Back - left the watch session") }
+                        } else a.runOnUiThread { a.lastTouchMs = System.currentTimeMillis(); a.sendKey(KeyEvent.KEYCODE_ESCAPE) }
+                    } else if (repeat == 1 && !inSession) a.runOnUiThread { a.exitToDashboard("remote Back held") }
+                }
+                else -> return false
+            }
+            return true
+        }
+
         /** Touch mode changed (DEBUG_CONFIG youtubeTouch): applies to the showing screen at once. */
         fun setTouchMode(mode: String) {
             instance?.let { a -> a.runOnUiThread { a.touchMode = mode; a.applyTouchMode() } }
