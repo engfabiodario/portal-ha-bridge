@@ -658,8 +658,32 @@ object HaDiscovery {
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
-    private fun device(deviceId: String, escapedName: String) =
-        """{"identifiers":["$deviceId"],"name":"$escapedName","model":"Meta Portal","manufacturer":"Meta"}"""
+    private fun device(deviceId: String, escapedName: String): String {
+        val mac = wifiMac()
+        val connections = if (mac != null) ""","connections":[["mac","$mac"]]""" else ""
+        return """{"identifiers":["$deviceId"],"name":"$escapedName","model":"Meta Portal","manufacturer":"Meta"$connections}"""
+    }
+
+    // ── Wi-Fi MAC (fleet 2026-10-21) ──────────────────────────────────────────
+    // The device's "connections" carry the Wi-Fi MAC so HA can join this device to the Deco's
+    // client tracker by MAC (Spatial Context draws the Portal -> Deco link + signal). Read from the
+    // wlan0 interface (Android 9/10 still allow it; WifiInfo gives 02:00:00:00:00:00 without a
+    // privileged permission). Cached once found; null = no "connections" (as before). HA only adds
+    // connections, so a later build without it leaves the MAC on the device (harmless).
+
+    @Volatile private var cachedWifiMac: String? = null
+
+    fun wifiMac(): String? {
+        cachedWifiMac?.let { return it }
+        val mac = try {
+            java.net.NetworkInterface.getByName("wlan0")?.hardwareAddress
+                ?.takeIf { it.size == 6 }
+                ?.joinToString(":") { "%02x".format(it) }
+        } catch (e: Exception) { null }
+        if (mac == null || mac == "00:00:00:00:00:00" || mac == "02:00:00:00:00:00") return null
+        cachedWifiMac = mac
+        return mac
+    }
 
     // ── Availability (fleet 2026-10-08) ───────────────────────────────────────
     // Every per-Portal entity follows portal/<id>/availability: the broker publishes the retained
