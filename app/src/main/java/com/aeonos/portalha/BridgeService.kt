@@ -235,6 +235,8 @@ class BridgeService : Service() {
         // Opt-in daily update check: evaluated on an hourly tick (cheap), fires
         // when the persisted due time passes and the screen is on.
         private const val UPDATE_TICK_MS = 3_600_000L
+        private const val WIFI_SIGNAL_TICK_MS = 60_000L
+        private const val WIFI_SIGNAL_REFRESH_MS = 600_000L
 
         // Live reference to the running service so the dashboard UI + the PTT
         // overlay can query peers and drive the intercom directly (low latency,
@@ -1163,6 +1165,7 @@ class BridgeService : Service() {
             // Daily auto update check (opt-in): first evaluation 2 min after boot,
             // then hourly — maybeAutoUpdateCheck gates on the persisted due time.
             wakeHandler.postDelayed(autoUpdateTick, 120_000L)
+            timeoutHandler.postDelayed(wifiSignalTick, WIFI_SIGNAL_TICK_MS)
         }, 1_500L)
 
         if (p.cameraServiceEnabled) {
@@ -1425,6 +1428,7 @@ class BridgeService : Service() {
             callWatchCallback = null
         }
         wakeHandler.removeCallbacks(autoUpdateTick)
+        timeoutHandler.removeCallbacks(wifiSignalTick)
         wakeHandler.removeCallbacks(alexaKeepWarm)
         unmuteAlexaOutput()   // never leave the Portal muted if we stop mid-warm-up
         intercom?.release()
@@ -2531,6 +2535,7 @@ class BridgeService : Service() {
         publishBrightnessState(p)
         publishDisplayStates(p)
         publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
+        publishWifiSignal(force = true)
         publishDashboardPathState(p)
         publishNavigateState(p)
         publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
@@ -2569,6 +2574,7 @@ class BridgeService : Service() {
 
         pub(HaDiscovery.discoveryTopic(p.deviceId), HaDiscovery.configPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.ipDiscoveryTopic(p.deviceId), HaDiscovery.ipConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.wifiSignalDiscoveryTopic(p.deviceId), HaDiscovery.wifiSignalConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.lightDiscoveryTopic(p.deviceId), HaDiscovery.lightConfigPayload(p.deviceId, p.deviceName))
         for (axis in listOf("x", "y", "z"))
             pub(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis), HaDiscovery.accelConfigPayload(p.deviceId, p.deviceName, axis))
@@ -3414,6 +3420,35 @@ class BridgeService : Service() {
                 twoWayOrb?.hide(); twoWayOrb = null
                 Log.i(TAG, "2way channel: closed — mic restored")
             }
+        }
+    }
+
+    // ── Wi-Fi signal sensor (fleet 2026-10-21) ────────────────────────────────
+    // RSSI read every minute (WifiInfo.rssi needs only ACCESS_WIFI_STATE); published when it moved >= 3 dB
+    // or 10 min passed, so HA's recorder isn't flooded by the normal 1-2 dB jitter. No link = nothing sent.
+
+    @Volatile private var lastWifiSignal: Int? = null
+    @Volatile private var lastWifiSignalAt = 0L
+
+    private val wifiSignalTick = object : Runnable {
+        override fun run() {
+            runCatching { commandExecutor.submit { publishWifiSignal(force = false) } }
+            timeoutHandler.postDelayed(this, WIFI_SIGNAL_TICK_MS)
+        }
+    }
+
+    private fun publishWifiSignal(force: Boolean) {
+        runCatching {
+            val p = prefs ?: return
+            if (mqtt?.isConnected != true) return
+            val wm = applicationContext.getSystemService(android.net.wifi.WifiManager::class.java) ?: return
+            @Suppress("DEPRECATION") val rssi = wm.connectionInfo?.rssi ?: return
+            if (rssi >= 0 || rssi <= -127) return   // -127 = no link
+            val now = android.os.SystemClock.elapsedRealtime()
+            val last = lastWifiSignal
+            if (!force && last != null && kotlin.math.abs(rssi - last) < 3 && now - lastWifiSignalAt < WIFI_SIGNAL_REFRESH_MS) return
+            publishRaw(HaDiscovery.wifiSignalStateTopic(p.deviceId), rssi.toString(), 1, retained = true)
+            lastWifiSignal = rssi; lastWifiSignalAt = now
         }
     }
 

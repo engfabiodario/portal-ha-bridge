@@ -614,6 +614,20 @@ object HaDiscovery {
         return """{"name":"IP Address","unique_id":"${deviceId}_ip","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${ipStateTopic(deviceId)}","icon":"mdi:ip-network","entity_category":"diagnostic"}"""
     }
 
+    // ── Wi-Fi signal sensor (diagnostic, fleet 2026-10-21) ──────────────────────
+    // RSSI of the current Wi-Fi link in dBm; device_class signal_strength on this device is what
+    // Spatial Context shows on the Portal -> Deco line. Published on change >= 3 dB or every 10 min.
+
+    fun wifiSignalDiscoveryTopic(deviceId: String) =
+        "homeassistant/sensor/${deviceId}_wifi_signal/config"
+
+    fun wifiSignalStateTopic(deviceId: String) = "portal/$deviceId/sensor/wifi_signal"
+
+    fun wifiSignalConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Wi-Fi Signal","unique_id":"${deviceId}_wifi_signal","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${wifiSignalStateTopic(deviceId)}","device_class":"signal_strength","unit_of_measurement":"dBm","state_class":"measurement","entity_category":"diagnostic"}"""
+    }
+
     // ── Stale entity cleanup ──────────────────────────────────────────────────
 
     fun staleTopics(deviceId: String) = listOf(
