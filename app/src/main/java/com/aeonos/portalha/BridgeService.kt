@@ -913,6 +913,20 @@ class BridgeService : Service() {
     }
 
     private fun cameraViewTopic(deviceId: String) = "portal/$deviceId/config/camera_view/set"
+    // Remote display density (DisplayDensity, fleet 2026-10-22): '<dpi>', '<dpi>!', 'reset', 'status'. MQTT/adb only.
+    private fun displayDensityTopic(deviceId: String) = "portal/$deviceId/config/display_density/set"
+    private fun displayDensityStatusTopic(deviceId: String) = "portal/$deviceId/config/display_density/status"
+
+    private fun handleDisplayDensityCommand(payload: String, p: Prefs) {
+        val line = DisplayDensity.handle(this, payload)
+        if (line.isEmpty()) return
+        publishRaw(displayDensityStatusTopic(p.deviceId), line, 0, retained = false)
+        // A new density re-lays out every window: let the keep-alive re-measure its sliver / cover / guard.
+        if (line.contains("applied live") || line.contains("cleared live")) {
+            wakeHandler.postDelayed({ runCatching { keepAlive?.selfHealRepark() } }, 6_000L)
+            wakeHandler.postDelayed({ Log.i(TAG, DisplayDensity.status(this)) }, 8_000L)
+        }
+    }
 
     private fun cameraViewStatus(p: Prefs): String =
         "cameraview: size=${p.streamSize.ifEmpty { "default" }} " +
@@ -2160,6 +2174,8 @@ class BridgeService : Service() {
                 if (intent.getBooleanExtra("rotationStatus", false)) Log.i(TAG, rotationStatus())
                 // Camera view (fleet, SmartCamera.kt): --es cameraView wide|auto|fixed:x,y,scale|size:WxH|status
                 intent.getStringExtra("cameraView")?.let { v -> handleCameraViewCommand(v, p) }
+                // --es displayDensity <dpi|dpi!|reset|status>  (DisplayDensity; 100..320, SDK 28 only with '!')
+                intent.getStringExtra("displayDensity")?.let { v -> handleDisplayDensityCommand(v, p) }
                 //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
@@ -2466,6 +2482,7 @@ class BridgeService : Service() {
             HaDiscovery.selfHealCommandTopic(p.deviceId),
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             cameraViewTopic(p.deviceId),
+            displayDensityTopic(p.deviceId),
             // Watch together: shared by every Portal (never purged or retained).
             WatchTogether.TOPIC,
             WatchTogether.MEMBERS_FILTER,
@@ -2765,6 +2782,7 @@ class BridgeService : Service() {
             HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
             cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
+            displayDensityTopic(p.deviceId)                       -> handleDisplayDensityCommand(payload, p)
             WatchTogether.TOPIC                                   -> watch.handle(payload)
         }
     }
