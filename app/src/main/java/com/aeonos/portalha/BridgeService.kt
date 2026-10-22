@@ -1219,6 +1219,7 @@ class BridgeService : Service() {
         if (kaPause != p.keepAlivePausedUntil) p.keepAlivePausedUntil = kaPause
         keepAlive = AvaKeepAlive(this, keepAliveHost).also { it.start(p.avaKeepAlive, p.keepAlivePackage, kaPause) }
         selfHeal = SelfHeal(this, selfHealHost).also { it.start(p.selfHeal) }
+        bridgeMemory = BridgeMemory(this) { state, attrs -> publishBridgeMemory(state, attrs) }.also { it.start() }
         smartCamera = SmartCamera(this).takeIf { it.available() }?.also { sc ->
             sc.mode = p.smartCamera; sc.cropX = p.smartCameraX; sc.cropY = p.smartCameraY; sc.cropScale = p.smartCameraScale
             sc.start()   // "auto" = no connection (the tick only acts in wide/fixed)
@@ -1380,6 +1381,7 @@ class BridgeService : Service() {
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
         runCatching { selfHeal?.stop() }; selfHeal = null
+        runCatching { bridgeMemory?.stop() }; bridgeMemory = null
         runCatching { smartCamera?.stop() }; smartCamera = null
         runCatching { screensaver.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
@@ -2575,6 +2577,8 @@ class BridgeService : Service() {
         pub(HaDiscovery.discoveryTopic(p.deviceId), HaDiscovery.configPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.ipDiscoveryTopic(p.deviceId), HaDiscovery.ipConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.wifiSignalDiscoveryTopic(p.deviceId), HaDiscovery.wifiSignalConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.bridgeMemoryDiscoveryTopic(p.deviceId), HaDiscovery.bridgeMemoryConfigPayload(p.deviceId, p.deviceName))
+        bridgeMemory?.republish()
         pub(HaDiscovery.lightDiscoveryTopic(p.deviceId), HaDiscovery.lightConfigPayload(p.deviceId, p.deviceName))
         for (axis in listOf("x", "y", "z"))
             pub(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis), HaDiscovery.accelConfigPayload(p.deviceId, p.deviceName, axis))
@@ -2867,11 +2871,15 @@ class BridgeService : Service() {
             return "asked the keep-alive to re-park Ava"
         }
 
-        override fun publish(state: String, attributesJson: String) {
-            val p = prefs ?: return
-            if (mqtt?.isConnected != true) return
-            publishRaw(HaDiscovery.selfHealStateTopic(p.deviceId), state, 1, retained = true)
-            publishRaw(HaDiscovery.selfHealAttributesTopic(p.deviceId), attributesJson, 1, retained = true)
+        override fun publish(state: String, attributesJson: String): Boolean {
+            val p = prefs ?: return false
+            val c = mqtt ?: return false
+            if (!c.isConnected) return false
+            return runCatching {
+                c.publish(HaDiscovery.selfHealStateTopic(p.deviceId), MqttMessage(state.toByteArray()).also { it.qos = 1; it.isRetained = true })
+                c.publish(HaDiscovery.selfHealAttributesTopic(p.deviceId), MqttMessage(attributesJson.toByteArray()).also { it.qos = 1; it.isRetained = true })
+                true
+            }.getOrDefault(false)
         }
 
         // lan check targets: the MQTT broker, then Prefs.lanProbe (default: the broker's /24 .1 on :80).
@@ -2896,6 +2904,20 @@ class BridgeService : Service() {
     }
 
     private fun handleSelfHealCommand(payload: String, p: Prefs) {
+        // Test hooks over MQTT (fleet 2026-10-22; the wall Portals have no adb) - never change the switch:
+        //   'test:<mqtt|stream|webview|lan|none...>' = DEBUG_CONFIG selfHealTest, 'tick' = selfHealTick,
+        //   'status' = selfHealStatus (also published once, not retained, on portal/<id>/selfheal/status_line).
+        val cmd = payload.trim()
+        when {
+            cmd.startsWith("test:", ignoreCase = true) -> { selfHeal?.setTest(cmd.substring(5)); return }
+            cmd.equals("tick", ignoreCase = true) -> { selfHeal?.tickNow(); return }
+            cmd.equals("status", ignoreCase = true) -> {
+                val line = selfHeal?.status() ?: "status n/a (service starting)"
+                Log.i("SelfHeal", line)
+                publishRaw("portal/${p.deviceId}/selfheal/status_line", line, 0, retained = false)
+                return
+            }
+        }
         val on = payload.equals("ON", ignoreCase = true)
         if (on != p.selfHeal) p.selfHeal = on
         selfHeal?.setEnabled(on)
@@ -3450,6 +3472,20 @@ class BridgeService : Service() {
             publishRaw(HaDiscovery.wifiSignalStateTopic(p.deviceId), rssi.toString(), 1, retained = true)
             lastWifiSignal = rssi; lastWifiSignalAt = now
         }
+    }
+
+    // ── Bridge memory sensor (fleet 2026-10-22, BridgeMemory) ─────────────────
+    private var bridgeMemory: BridgeMemory? = null
+
+    private fun publishBridgeMemory(state: String, attrs: String): Boolean {
+        val p = prefs ?: return false
+        val c = mqtt ?: return false
+        if (!c.isConnected) return false
+        return runCatching {
+            c.publish(HaDiscovery.bridgeMemoryAttributesTopic(p.deviceId), MqttMessage(attrs.toByteArray()).also { it.qos = 1; it.isRetained = true })
+            c.publish(HaDiscovery.bridgeMemoryStateTopic(p.deviceId), MqttMessage(state.toByteArray()).also { it.qos = 1; it.isRetained = true })
+            true
+        }.getOrDefault(false)
     }
 
     // ── Daily auto update check (opt-in) ─────────────────────────────────────

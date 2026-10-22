@@ -37,6 +37,11 @@ import java.util.Locale
  *              NETWORK_SELECTION_DISABLED_NO_INTERNET_TEMPORARY and doesn't rejoin it for ~13 min (Upstairs
  *              Hallway Guest 07:24 -> 07:37: a 2-min LAN glitch became a 13-min outage). While the self-heal state is not ok, or lan is bad,
  *              the lan check alone runs every [LAN_FAST_MS] (30 s).
+ *              QUIET PROBES (fleet 2026-10-22): the targets are tried one by one and the check stops at the first
+ *              one that answers. While the MQTT session is connected the broker is NOT probed first (the live
+ *              session already proves it; the old every-30-s connect was ~120 log lines/h per Portal in
+ *              Mosquitto) - the LAN probe goes first and the broker is only tried when that fails. With MQTT
+ *              down the order is the old one (broker, then the LAN probe), so healing is unchanged.
  *
  * It never reboots, never toggles the Wi-Fi radio, never changes a camera switch or preference,
  * never drives another app's UI. A tick is skipped while a call / ringing / alarm / cast / intercom
@@ -45,11 +50,17 @@ import java.util.Locale
  * (reset when its check is ok again). One log line (tag SelfHeal) per check result change and per action.
  *
  * HA: switch.<slug>_self_heal (on/off, persisted) and sensor.<slug>_self_heal
- * (ok / fixing / failing, plus off while switched off; attributes last_check, last_action,
+ * (ok / fixing / failing, plus off while switched off; attributes last_check, last_report, last_action,
  * last_reason, actions_today). 'failing' = a check still broken on 3+ consecutive ticks.
+ * Published only when the state or an attribute other than the two times changed, plus a heartbeat every
+ * [HEARTBEAT_MS] (10 min; the Homelab Watcher's bridge_alive treats a report < 12 min old as 'HA reaches
+ * the Bridge') and on every MQTT (re)connect / HA birth / switch change (fleet 2026-10-22: it was every tick
+ * = ~720 HA DB rows/h fleet-wide just for last_check).
  *
  * Test hooks (adb DEBUG_CONFIG): selfHealTest mqtt|stream|webview|none fakes that check failing
  * until its action has fired once; selfHealTick runs a check now; selfHealStatus logs a status line.
+ * The same over MQTT (wall Portals have no adb): portal/<id>/selfheal/set payload 'test:<check>', 'tick' or
+ * 'status' (the status line also goes to portal/<id>/selfheal/status_line, not retained).
  */
 class SelfHeal(private val ctx: Context, private val host: Host) {
 
@@ -71,8 +82,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** null = n/a (keep-alive off, paused, blocked, unsupported); true = parked; false = not parked. */
         fun keepAliveParked(): Boolean?
         fun keepAliveRepark(): String
-        fun publish(state: String, attributesJson: String)
-        /** lan check: TCP targets (host to port), the MQTT broker first. Empty = n/a. */
+        /** true = handed to the broker (false: no MQTT session - the next tick tries again). */
+        fun publish(state: String, attributesJson: String): Boolean
+        /** lan check: TCP targets (host to port), the MQTT broker first when one is configured. Empty = n/a. */
         fun lanTargets(): List<Pair<String, Int>> = emptyList()
     }
 
@@ -102,11 +114,16 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     @Volatile private var lastSkip = ""
     @Volatile private var ticks = 0
     @Volatile private var lanTargetsText = ""
+    @Volatile private var lanProbedText = ""      // what the last lan check actually connected to (status only)
     @Volatile private var lanBadSinceWall = 0L
     private var lastLanRunMs = 0L
     @Volatile private var lanFastScheduled = false
     private var actionsToday = 0
     private var actionsDay = -1
+    // Publish dedup (handler thread only): the last payload sent without its times, and when.
+    private var lastPublishedKey = ""
+    private var lastPublishMs = 0L
+    @Volatile private var publishes = 0
 
     private val tick = object : Runnable {
         override fun run() {
@@ -139,7 +156,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         started = true
         handler.postDelayed(tick, START_DELAY_MS)
         Log.i(TAG, "service up (enabled=$on, first check in ${START_DELAY_MS / 1000} s, then every ${TICK_MS / 1000} s)")
-        handler.post { publish() }
+        handler.post { publish(force = true) }
     }
 
     fun stop() {
@@ -149,12 +166,12 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     }
 
     fun setEnabled(on: Boolean) {
-        if (on == enabled) { handler.post { publish() }; return }
+        if (on == enabled) { handler.post { publish(force = true) }; return }
         enabled = on
         Log.i(TAG, "switch ${if (on) "ON" else "OFF"}")
         handler.post {
             if (!on) { checks.values.forEach { it.bad = 0; it.streak = 0; it.last = "unknown" }; lanBadSinceWall = 0L }
-            publish()
+            publish(force = true)
         }
     }
 
@@ -168,14 +185,15 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     /** adb selfHealTick: run one check now (counts as a tick). */
     fun tickNow() { handler.post { runCheck("adb") } }
 
-    /** Re-send the HA state (MQTT just connected). */
-    fun republish() { handler.post { publish() } }
+    /** Re-send the HA state (MQTT just connected, HA birth, the 20 s re-publish). */
+    fun republish() { handler.post { publish(force = true) } }
 
     fun status(): String {
         val parts = checks.entries.joinToString(" ") { (c, s) -> "${c.id}=${s.last.substringBefore(':')}/${s.bad}" }
         return "status enabled=$enabled state=${stateNow()} ticks=$ticks $parts fake=${fake?.id ?: "none"} " +
             "actionsToday=$actionsToday lastAction='$lastAction' lastReason='$lastReason' " +
-            "lan='${checks.getValue(Check.LAN).last}' lanTargets='$lanTargetsText' lanFast=$lanFastScheduled"
+            "lan='${checks.getValue(Check.LAN).last}' lanTargets='$lanTargetsText' lanProbed='$lanProbedText' " +
+            "lanFast=$lanFastScheduled publishes=$publishes"
     }
 
     private fun stateNow() = if (!enabled) "off" else state
@@ -188,6 +206,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val busy = runCatching { host.busyReason() }.getOrNull()
         if (busy != null) {
             if (busy != lastSkip) { lastSkip = busy; Log.i(TAG, "check skipped: $busy") }
+            publish()   // the heartbeat only (nothing changed)
             return
         }
         if (lastSkip.isNotEmpty()) { Log.i(TAG, "checks resumed (was: $lastSkip)"); lastSkip = "" }
@@ -276,8 +295,19 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val targets = runCatching { host.lanTargets() }.getOrDefault(emptyList())
         lanTargetsText = targets.joinToString(",") { "${it.first}:${it.second}" }
         if (targets.isEmpty()) return "n/a: no LAN target"
-        val results = targets.map { (h, port) -> "$h:$port" to probe(h, port) }
-        if (results.any { it.second == null }) return "ok"
+        // MQTT session up (and not faked down): the broker goes LAST - it is only connected to when every other
+        // target failed. No other target = the live session is the proof (no probe at all).
+        val mqttUp = !faked(Check.MQTT) && runCatching { host.mqttConnected() }.getOrNull() == true
+        if (mqttUp && targets.size == 1) { lanProbedText = "none (MQTT session up)"; return "ok" }
+        val order = if (mqttUp) targets.drop(1) + targets.first() else targets
+        val results = mutableListOf<Pair<String, String?>>()
+        for ((h, port) in order) {
+            val r = probe(h, port)
+            results += "$h:$port" to r
+            if (r == null) break                       // the first target that answers is enough
+        }
+        lanProbedText = results.joinToString(",") { it.first } + if (mqttUp) " (MQTT up)" else ""
+        if (results.last().second == null) return "ok"
         return "bad: lan unreachable (" + results.joinToString(", ") { "${it.first} ${it.second}" } + ")"
     }
 
@@ -431,17 +461,25 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     // ── HA ──────────────────────────────────────────────────────────────────────
 
-    private fun publish() {
+    // Only a real change (state / any attribute except the two times), the heartbeat every HEARTBEAT_MS, or
+    // [force] (MQTT connect, HA birth, switch) reaches HA. Runs on the handler thread.
+    private fun publish(force: Boolean = false) {
         val day = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         if (day != actionsDay) { actionsDay = day; actionsToday = 0 }
-        val iso = if (lastCheckWall == 0L) "" else isoOf(lastCheckWall)
         val checksJson = checks.entries.joinToString(",") { (c, s) -> "\"${c.id}\":\"${esc(s.last)}\"" }
-        val attrs = "{\"last_check\":${if (iso.isEmpty()) "null" else "\"$iso\""}," +
-            "\"last_action\":\"${esc(lastAction)}\",\"last_reason\":\"${esc(lastReason)}\"," +
+        val core = "\"last_action\":\"${esc(lastAction)}\",\"last_reason\":\"${esc(lastReason)}\"," +
             "\"actions_today\":$actionsToday,\"checks\":{$checksJson}," +
             "\"lan\":\"${esc(checks.getValue(Check.LAN).last)}\",\"lan_targets\":\"${esc(lanTargetsText)}\"," +
-            "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}}"
-        runCatching { host.publish(stateNow(), attrs) }
+            "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}"
+        val state = stateNow()
+        val key = "$state|$core"
+        val now = SystemClock.elapsedRealtime()
+        if (!force && key == lastPublishedKey && lastPublishMs != 0L && now - lastPublishMs < HEARTBEAT_MS - 15_000L) return
+        val iso = if (lastCheckWall == 0L) "" else isoOf(lastCheckWall)
+        val attrs = "{\"last_check\":${if (iso.isEmpty()) "null" else "\"$iso\""}," +
+            "\"last_report\":\"${isoOf(System.currentTimeMillis())}\",$core}"
+        val sent = runCatching { host.publish(state, attrs) }.getOrDefault(false)
+        if (sent) { lastPublishedKey = key; lastPublishMs = now; publishes++ }
     }
 
     private fun isoOf(ms: Long): String =
@@ -462,6 +500,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         private const val MAX_PER_HOUR = 6
         private const val HOUR_MS = 60 * 60_000L
         const val LAN_FAST_MS = 30_000L
+        /** Unchanged state is re-sent this often (HA last_reported; the watcher's freshness window is 12 min). */
+        const val HEARTBEAT_MS = 10 * 60_000L
         private const val LAN_BACKOFF_BASE_MS = 60_000L
         /** Repeats of the same (non-lan) action back off 1, 2, 4, 8 ... min (the tick is only 30 s). */
         private const val ACTION_BACKOFF_BASE_MS = 60_000L

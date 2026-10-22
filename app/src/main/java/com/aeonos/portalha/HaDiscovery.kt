@@ -628,6 +628,24 @@ object HaDiscovery {
         return """{"name":"Wi-Fi Signal","unique_id":"${deviceId}_wifi_signal","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${wifiSignalStateTopic(deviceId)}","device_class":"signal_strength","unit_of_measurement":"dBm","state_class":"measurement","entity_category":"diagnostic"}"""
     }
 
+    // ── Bridge memory sensor (diagnostic, fleet 2026-10-22, BridgeMemory) ────────
+    // State = the Bridge process PSS in MB; attributes = heap split, system free RAM, uptimes. Published hourly,
+    // on a >= 10 % PSS move and with every state burst. default_entity_id keeps the id <slug>_bridge_memory (HA
+    // would otherwise prefix the area, like the Wi-Fi Signal sensor got).
+
+    fun bridgeMemoryDiscoveryTopic(deviceId: String) = "homeassistant/sensor/${deviceId}_bridge_memory/config"
+
+    fun bridgeMemoryStateTopic(deviceId: String) = "portal/$deviceId/sensor/bridge_memory"
+
+    fun bridgeMemoryAttributesTopic(deviceId: String) = "portal/$deviceId/sensor/bridge_memory/attributes"
+
+    fun bridgeMemoryConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        val slug = deviceName.lowercase(java.util.Locale.ROOT).replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        val defId = if (slug.isNotEmpty()) ",\"default_entity_id\":\"sensor.${slug}_bridge_memory\"" else ""
+        return """{"name":"Bridge Memory","unique_id":"${deviceId}_bridge_memory","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${bridgeMemoryStateTopic(deviceId)}","json_attributes_topic":"${bridgeMemoryAttributesTopic(deviceId)}","device_class":"data_size","unit_of_measurement":"MB","state_class":"measurement","suggested_display_precision":0,"icon":"mdi:memory","entity_category":"diagnostic"$defId}"""
+    }
+
     // ── Stale entity cleanup ──────────────────────────────────────────────────
 
     fun staleTopics(deviceId: String) = listOf(
