@@ -26,8 +26,8 @@ import java.util.Locale
  *  - webview   the dashboard doesn't answer a trivial evaluateJavascript in 10 s on 2 ticks
  *              -> reload the current start page
  *  - keepalive the Ava keep-alive is on but not parked             -> the keep-alive's own re-park
- *  - wifi      the Wi-Fi link is down for 2 ticks -> Android 9: WifiManager.reconnect() once per
- *              outage; Android 10: reported only
+ *  - wifi      the Wi-Fi link is down for 2 ticks -> Android 9: WifiManager.reconnect(), repeated with the
+ *              backoff while the link stays down (2026-10-23; was once per outage); Android 10: reported only
  *  - lan       (fleet 2026-10-08) Wi-Fi says connected but neither the MQTT broker (host:port) nor the
  *              LAN probe (default the broker's /24 .1 = main Deco, :80) accepts a TCP connect in 3 s
  *              (a refused connect counts as reachable), on 2 consecutive checks -> Android 9:
@@ -424,16 +424,29 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     }
 
     private fun wifiAction(s: CheckState): String {
-        if (Build.VERSION.SDK_INT != Build.VERSION_CODES.P) {
-            if (s.bad == BAD_TICKS_FOR_ACTION) Log.w(TAG, "wifi: link down for ${s.bad} ticks - report only on Android ${Build.VERSION.RELEASE}")
-            return ""
-        }
-        if (s.wifiReconnected) return ""
-        s.wifiReconnected = true
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
+        if (Build.VERSION.SDK_INT != Build.VERSION_CODES.P) {
+            // fleet (2026-10-23): Android 10 - try reconnect() too. In the framework it is only a forced connectivity
+            // scan (CMD_RECONNECT -> forceConnectivityScan); for an app targeting Q+ it is refused (returns false, no-op),
+            // then this stays report-only. Upstairs Hallway / Guest took 26-32 min and Downstairs Hallway 30 min to
+            // rejoin after a Deco reboot with the screen off.
+            @Suppress("DEPRECATION")
+            val ok = runCatching { wm.reconnect() }.getOrDefault(false)
+            if (!ok) {
+                if (s.bad == BAD_TICKS_FOR_ACTION) Log.w(TAG, "wifi: link down for ${s.bad} ticks - reconnect() refused on Android ${Build.VERSION.RELEASE}, report only")
+                return ""
+            }
+            return "WifiManager.reconnect() = true on Android ${Build.VERSION.RELEASE} (attempt ${s.streak + 1} of this outage)"
+        }
+        // fleet (2026-10-23): repeated with the normal backoff (1, 2, 4, 8 ... min, max MAX_PER_HOUR), no longer once per
+        // outage. Coffee Area at the 03:00 Deco reboot: the one reconnect() (03:03) scanned while the Decos were still
+        // booting (only neighbours' APs seen), then Android 9 sat in DisconnectedState with no scan for 25 min (rejoined
+        // 03:27:51 on a PNO result). reconnect() on Android 9 starts a fresh scan + network selection; it is only sent
+        // while the link is down, so a live connection is never touched.
         @Suppress("DEPRECATION")
         val ok = wm.reconnect()
-        return "WifiManager.reconnect() = $ok"
+        s.wifiReconnected = true
+        return "WifiManager.reconnect() = $ok (attempt ${s.streak + 1} of this outage)"
     }
 
     // Android 9: reconnect() first; from the 2nd action of the same outage disconnect() + reconnect().
