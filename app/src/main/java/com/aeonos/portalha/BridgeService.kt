@@ -1087,6 +1087,7 @@ class BridgeService : Service() {
         // RTSP guard so the guard still swallows its library exception without it being recorded.
         CrashRecorder.install(this)
         CrashRecorder.onServiceStart(this)
+        WifiTrace.start(this)   // fleet 2026-10-23: Wi-Fi stack log lines -> files/wifi/wifi-trace.txt (Fleet Agent readable)
         installRtspCrashGuard()
         createChannel()
         startForeground(NOTIF_ID, notification("Starting…"))
@@ -1399,6 +1400,7 @@ class BridgeService : Service() {
         runCatching { keepAlive?.stop() }; keepAlive = null
         runCatching { selfHeal?.stop() }; selfHeal = null
         runCatching { bridgeMemory?.stop() }; bridgeMemory = null
+        runCatching { WifiTrace.stop() }
         runCatching { smartCamera?.stop() }; smartCamera = null
         runCatching { screensaver.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
