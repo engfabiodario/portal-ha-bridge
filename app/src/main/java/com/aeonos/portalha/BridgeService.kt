@@ -3531,12 +3531,14 @@ class BridgeService : Service() {
     // With the launcher in front nothing keeps the screen on, so Android's own idle timeout (~60 s on the Portals)
     // slept it and ended desktop mode under the user (pilot 2026-10-22). Held until desktop mode ends (bounded by
     // the auto-return); the HA screen switch / power button still sleep the screen (goToSleep overrides it).
+    // ON_AFTER_RELEASE: the release pokes the idle timer, else the long-expired idle timeout blanks the screen the
+    // moment the dashboard comes back (seen on the pilot); a screen that is already off stays off.
     private var desktopWakeLock: PowerManager.WakeLock? = null
 
     private fun holdDesktopScreen(untilMs: Long) {
         runCatching {
             val wl = desktopWakeLock ?: @Suppress("DEPRECATION") getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "PortalHA:Desktop").also { it.setReferenceCounted(false); desktopWakeLock = it }
+                .newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE, "PortalHA:Desktop").also { it.setReferenceCounted(false); desktopWakeLock = it }
             wl.acquire((untilMs - System.currentTimeMillis()).coerceIn(60_000L, 5 * 3_600_000L) + 60_000L)
         }.onFailure { Log.w(TAG, "desktop: screen wake lock failed: ${it.message}") }
     }
