@@ -72,6 +72,13 @@ class PresenceMonitor(private val onPresenceChange: (present: Boolean) -> Unit) 
                 while (running) {
                     val line = reader.readLine() ?: break
                     if (!line.contains("presence", ignoreCase = true)) continue
+                    // fleet (2026-10-23): Meta's own package name contains the word. Its state-transition line
+                    // "Global state notification changed to [STANDBY] by [com.facebook.alohaservices.presence]" is
+                    // logged on EVERY screen-off (and [AMBIENT] on every wake) and counted as a face beat: 'presence
+                    // ON' for 50 s right after each screen timeout with nobody there (Coffee Area 01:47:08 -> 01:47:16,
+                    // Bar 03:56:36 -> 03:56:44 / 04:16:07 -> 04:16:15) - the wall wake loop's 'meta_presence'.
+                    // Real detections ("Notify people presence", "onNotifyPresence ...") still count.
+                    if (!line.replace("alohaservices.presence", "", ignoreCase = true).contains("presence", ignoreCase = true)) continue
                     val epoch = line.trimStart().substringBefore(' ').toDoubleOrNull() ?: continue
                     val beatMs = (epoch * 1000).toLong()
                     // Only count beats that are genuinely recent (ignore backlog).
