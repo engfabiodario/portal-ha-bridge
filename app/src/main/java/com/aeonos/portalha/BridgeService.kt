@@ -1403,6 +1403,7 @@ class BridgeService : Service() {
         runCatching { WifiTrace.stop() }
         runCatching { smartCamera?.stop() }; smartCamera = null
         runCatching { screensaver.hide() }
+        runCatching { desktopButton.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
         dreamObserver = null
@@ -2185,6 +2186,9 @@ class BridgeService : Service() {
                 // --ez desktopMode true|false (DesktopMode: launcher in front on purpose), --ei desktopMinutes N (5..240)
                 if (intent.hasExtra("desktopMinutes")) handleDesktopMinutesCommand(intent.getIntExtra("desktopMinutes", 60).toString(), p)
                 if (intent.hasExtra("desktopMode")) handleDesktopCommand(if (intent.getBooleanExtra("desktopMode", false)) "ON" else "OFF")
+                // --es desktopButtonTap dashboard|back (injected touch on the floating button), --ez desktopStatus true
+                intent.getStringExtra("desktopButtonTap")?.let { v -> handleDesktopCommand("BUTTON_TAP:" + v) }
+                if (intent.getBooleanExtra("desktopStatus", false)) handleDesktopCommand("STATUS")
                 //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
@@ -3538,6 +3542,15 @@ class BridgeService : Service() {
     @Volatile private var desktopEndWhy = ""
     @Volatile private var desktopLastEnd = ""
     private val desktopEndRunnable = Runnable { checkDesktopEnd() }
+    // Fleet 2026-10-23: the floating "Back | Dashboard" pill, shown ONLY while desktop mode is on (the walls have no
+    // on-screen Back/Home: bar overscanned away, Immortal quick buttons off - a full-screen app trapped the user).
+    private val desktopButton by lazy {
+        DesktopButtonOverlay(this).also { b ->
+            b.onDashboard = { wakeHandler.post { endDesktopNow("desktop button") } }
+            b.onBack = { ScreenAccessibility.instance?.performBack() ?: Log.w(TAG, "desktop: Back - accessibility service not bound") }
+            b.backAvailable = { ScreenAccessibility.instance != null }
+        }
+    }
     // With the launcher in front nothing keeps the screen on, so Android's own idle timeout (~60 s on the Portals)
     // slept it and ended desktop mode under the user (pilot 2026-10-22). Held until desktop mode ends (bounded by
     // the auto-return); the HA screen switch / power button still sleep the screen (goToSleep overrides it).
@@ -3561,7 +3574,10 @@ class BridgeService : Service() {
         when (payload.trim().uppercase()) {
             "ON", "SHOW", "TRUE", "1" -> wakeHandler.post { startDesktopNow() }
             "OFF", "BACK", "FALSE", "0" -> wakeHandler.post { endDesktopNow("Back to Dashboard") }
-            "STATUS" -> Log.i(TAG, desktopStatus())
+            "STATUS" -> wakeHandler.post { publishDesktopStatusLine() }
+            // Remote tests of the floating button (no adb on the walls): a real injected touch at its centre.
+            "BUTTON_TAP", "BUTTON_TAP:DASHBOARD" -> wakeHandler.post { tapDesktopButton(back = false) }
+            "BUTTON_TAP:BACK" -> wakeHandler.post { tapDesktopButton(back = true) }
             "" -> {}
             else -> Log.w(TAG, "desktop: unknown command '$payload'")
         }
@@ -3578,7 +3594,25 @@ class BridgeService : Service() {
     private fun desktopStatus(): String =
         "desktop: status on=$desktopMode since=${if (desktopSinceMs == 0L) "-" else isoTime(desktopSinceMs)} " +
             "endsAt=${if (desktopEndsAtMs == 0L) "-" else isoTime(desktopEndsAtMs)} ($desktopEndWhy) last='$desktopLastEnd' " +
-            "dashboardFg=$dashboardForeground userLeft=$userLeftDashboard fg=$foregroundPkg"
+            "dashboardFg=$dashboardForeground userLeft=$userLeftDashboard fg=$foregroundPkg ${desktopButton.status()}"
+
+    /** Main thread. Logs the status and publishes it once (not retained) on portal/<id>/desktop/status_line. */
+    private fun publishDesktopStatusLine() {
+        val line = desktopStatus()
+        Log.i(TAG, line)
+        prefs?.let { p -> commandExecutor.submit { publishRaw("portal/${p.deviceId}/desktop/status_line", line, 0, retained = false) } }
+    }
+
+    /** Main thread. Test hook: inject a touch at the floating button's Dashboard (or Back) item. */
+    private fun tapDesktopButton(back: Boolean) {
+        val c = desktopButton.centerOnScreen(back)
+        val a = ScreenAccessibility.instance
+        when {
+            c == null -> Log.i(TAG, "desktop: button tap test - no ${if (back) "Back" else "Dashboard"} item showing (on=$desktopMode)")
+            a == null -> Log.w(TAG, "desktop: button tap test - accessibility service not bound")
+            else -> { Log.i(TAG, "desktop: button tap test at ${c[0]},${c[1]} fg=$foregroundPkg"); a.tapAt(c[0].toFloat(), c[1].toFloat()) }
+        }
+    }
 
     // The auto-return moment: Desktop Minutes from now, or 23:00 local if that comes first.
     private fun scheduleDesktopEnd(p: Prefs) {
@@ -3613,7 +3647,7 @@ class BridgeService : Service() {
         }
         if (why != null) { Log.i(TAG, "desktop: refused - $why"); return }
         if (desktopMode) {           // pressed again: restart the auto-return countdown, bring the launcher up again
-            scheduleDesktopEnd(p); holdDesktopScreen(desktopEndsAtMs); launchHome(); publishDesktopState(p)
+            scheduleDesktopEnd(p); holdDesktopScreen(desktopEndsAtMs); launchHome(); desktopButton.show(); publishDesktopState(p)
             Log.i(TAG, "desktop: already on - auto-return re-armed (${desktopEndWhy}, ends ${isoTime(desktopEndsAtMs)})")
             return
         }
@@ -3629,6 +3663,7 @@ class BridgeService : Service() {
         scheduleDesktopEnd(p)
         holdDesktopScreen(desktopEndsAtMs)
         launchHome()
+        desktopButton.show()                              // the way back over any full-screen app
         Log.i(TAG, "desktop: ON - launcher in front, camera paused, auto-return $desktopEndWhy (${isoTime(desktopEndsAtMs)})")
         publishDesktopState(p)
     }
@@ -3644,6 +3679,7 @@ class BridgeService : Service() {
     private fun endDesktopNow(why: String, bringBack: Boolean = true) {
         if (!desktopMode) return
         desktopMode = false
+        desktopButton.hide()                              // every exit path comes through here
         desktopLastEnd = "$why at ${isoTime(System.currentTimeMillis())}"
         wakeHandler.removeCallbacks(desktopEndRunnable)
         desktopEndsAtMs = 0L

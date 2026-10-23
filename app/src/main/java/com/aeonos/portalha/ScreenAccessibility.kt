@@ -101,6 +101,24 @@ class ScreenAccessibility : AccessibilityService() {
         performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
     }
 
+    /** Fleet 2026-10-23: the desktop-mode floating button's Back (the walls have no on-screen nav bar). */
+    fun performBack(): Boolean {
+        val ok = performGlobalAction(GLOBAL_ACTION_BACK)
+        Log.i(TAG, "back: GLOBAL_ACTION_BACK ok=$ok")
+        return ok
+    }
+
+    /** Inject a single tap at screen pixels (desktop-button remote test: proves the button is on top and takes touches). */
+    fun tapAt(x: Float, y: Float): Boolean {
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+            .build()
+        val ok = dispatchGesture(gesture, null, null)
+        Log.i(TAG, "tap: injected at ($x,$y) dispatched=$ok")
+        return ok
+    }
+
     /**
      * Inject a single tap at a fraction of the screen (0..1 in each axis), used to dismiss
      * Meta's launcher photo-home when we open it for a call — one tap anywhere clears it.
