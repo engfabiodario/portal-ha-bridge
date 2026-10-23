@@ -66,6 +66,7 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
             val am = ctx.getSystemService(ActivityManager::class.java)
             val sys = ActivityManager.MemoryInfo().also { am?.getMemoryInfo(it) }
             val upH = (now - Process.getStartElapsedRealtime()) / 3_600_000.0
+            val load = loadAvg()
             val attrs = "{\"pss_mb\":${mb(pss)},\"java_heap_mb\":${stat("summary.java-heap")}," +
                 "\"native_heap_mb\":${stat("summary.native-heap")},\"graphics_mb\":${stat("summary.graphics")}," +
                 "\"code_mb\":${stat("summary.code")},\"stack_mb\":${stat("summary.stack")}," +
@@ -74,6 +75,7 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
                 "\"system_free_mb\":${mb(sys.availMem / 1048576.0)},\"system_total_mb\":${mb(sys.totalMem / 1048576.0)}," +
                 "\"system_low_memory\":${sys.lowMemory},\"low_memory_threshold_mb\":${mb(sys.threshold / 1048576.0)}," +
                 "\"process_uptime_h\":${"%.2f".format(Locale.US, upH)},\"device_uptime_h\":${"%.2f".format(Locale.US, now / 3_600_000.0)}," +
+                "\"load_1m\":${load[0]},\"load_5m\":${load[1]},\"load_15m\":${load[2]},\"swap_used_mb\":${swapUsedMb()}," +
                 "\"sampled_at\":\"${isoNow()}\"}"
             if (sink(mb(pss), attrs)) {
                 if (lastPublishMs == 0L || moved) Log.i(TAG, "memory: pss ${mb(pss)} MB, system free ${mb(sys.availMem / 1048576.0)} MB" +
@@ -92,6 +94,28 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
         if (r.isEmpty()) return "null"
         val total = am.getProcessMemoryInfo(r.map { it.pid }.toIntArray()).sumOf { it.totalPss }
         if (total <= 0) "null" else mb(total / 1024.0)
+    }.getOrDefault("null")
+
+    // fleet (2026-10-23): system load + swap, to spot a Portal whose Meta services are stuck busy (Upstairs Hallway:
+    // load 23-29 for hours vs 2-12 on the other Portal 10", 1.4 GB swapped vs ~0.75 GB, dashboard probes timing out).
+    // /proc/loadavg when SELinux lets an app read it, else toybox `uptime` (sysinfo(), allowed for apps); null if neither.
+    private fun loadAvg(): Array<String> = runCatching {
+        val txt = runCatching { java.io.File("/proc/loadavg").readText() }.getOrNull()
+            ?: run {
+                val pr = ProcessBuilder("uptime").redirectErrorStream(true).start()
+                val out = pr.inputStream.bufferedReader().use { it.readText() }
+                pr.waitFor(); out.substringAfter("load average:", "")
+            }
+        val v = Regex("[0-9]+[.][0-9]+").findAll(txt).map { it.value }.take(3).toList()
+        if (v.size == 3) v.toTypedArray() else arrayOf("null", "null", "null")
+    }.getOrDefault(arrayOf("null", "null", "null"))
+
+    private fun swapUsedMb(): String = runCatching {
+        val m = java.io.File("/proc/meminfo").readLines().associate { l ->
+            l.substringBefore(':') to (l.substringAfter(':').trim().substringBefore(' ').toLongOrNull() ?: 0L)
+        }
+        val total = m["SwapTotal"] ?: return@runCatching "null"
+        mb((total - (m["SwapFree"] ?: 0L)) / 1024.0)
     }.getOrDefault("null")
 
     private fun mb(v: Double) = "%.1f".format(Locale.US, v)
