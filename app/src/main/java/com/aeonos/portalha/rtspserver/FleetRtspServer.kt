@@ -223,20 +223,55 @@ class FleetRtspServer(
         serverCommandManager.audioDisabled = onlyVideo
     }
 
+    // ── Continuous RTP clock (2026-10-23) ──────────────────────────────────────
+    // RootEncoder's pts start at 0 on every startStream() (StreamBase.startSources: startTs =
+    // System.nanoTime()/1000; video pts = encoder output nanoTime/1000 - startTs) and BasePacket makes
+    // the RTP ts = pts * clock, so every Bridge stream restart sent the RTP clock back to 0 (and the
+    // library's pts_ns * 90000 overflows a Long after 28.5 h of one stream). go2rtc's '<cam>_av' keeps
+    // its consumers across a producer reconnect and passes RTP timestamps through, so Frigate's record
+    // ffmpeg saw a +-hours video DTS jump. Now the RTP ts = CLOCK_MONOTONIC (System.nanoTime, the same
+    // clock the encoders use, shared by every process of this boot) of the frame: startTs + pts. A
+    // restart (new stream / new server / Bridge reinstall) continues the clock; a gap advances it by
+    // exactly the real gap, so the other (Ava mic) audio stays in step.
+    /** startTs of the running encoders in us (CLOCK_MONOTONIC), learnt from the video frames. */
+    @Volatile private var tsBaseUs = Long.MIN_VALUE
+
+    private fun videoBaseUs(info: MediaCodec.BufferInfo): Long {
+        // Surface encoder: pts was set to nanoTime/1000 - startTs microseconds ago on this thread.
+        val cand = System.nanoTime() / 1000 - info.presentationTimeUs
+        val b = tsBaseUs
+        if (b == Long.MIN_VALUE || kotlin.math.abs(cand - b) > 500_000L) {
+            tsBaseUs = cand
+            Log.i(TAG, "rtsp: RTP clock base ${cand} us (monotonic; ${if (b == Long.MIN_VALUE) "stream start" else "encoder restarted, was $b"})")
+            return cand
+        }
+        return b
+    }
+
     fun sendVideo(h264Buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
         if (serverCommandManager.videoDisabled) return
+        val absUs = videoBaseUs(info) + info.presentationTimeUs
         synchronized(clients) {
             clients.forEach {
-                if (it.canSend && !it.closed) runCatching { it.sendVideoFrame(h264Buffer.duplicate(), info) }
+                if (it.canSend && !it.closed) runCatching { it.sendVideoFrame(h264Buffer.duplicate(), info, absUs) }
             }
         }
     }
 
     fun sendAudio(aacBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {
         if (serverCommandManager.audioDisabled) return
+        var b = tsBaseUs
+        if (b == Long.MIN_VALUE) {
+            // No video frame yet: its base is the exact one, so audio waits for it (no client can
+            // be playing yet - the server only listens after the video info).
+            if (!serverCommandManager.videoDisabled) return
+            b = System.nanoTime() / 1000 - info.presentationTimeUs
+            tsBaseUs = b
+        }
+        val absUs = b + info.presentationTimeUs
         synchronized(clients) {
             clients.forEach {
-                if (it.canSend && !it.closed) runCatching { it.sendAudioFrame(aacBuffer.duplicate(), info) }
+                if (it.canSend && !it.closed) runCatching { it.sendAudioFrame(aacBuffer.duplicate(), info, absUs) }
             }
         }
     }

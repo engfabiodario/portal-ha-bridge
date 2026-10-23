@@ -347,28 +347,41 @@ class FleetServerClient(
 
     // ── Media side ─────────────────────────────────────────────────────────────
 
-    /** Encoder thread. Never blocks: a full queue drops for this client only. */
-    fun sendVideoFrame(h264Buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+    /** Encoder thread. Never blocks: a full queue drops for this client only.
+     *  [absUs] = the frame's CLOCK_MONOTONIC time (see FleetRtspServer: continuous RTP clock). */
+    fun sendVideoFrame(h264Buffer: ByteBuffer, info: MediaCodec.BufferInfo, absUs: Long) {
         if (!canSend || closed) return
         val vp = videoPacket ?: return
         if (waitKeyFrame) {
             if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) { droppedVideo++; return }
             waitKeyFrame = false
         }
+        val ts = rtpTs(absUs, RtpConstants.clockVideoFrequency)
         vp.createAndSendPacket(h264Buffer, info) { f ->
             if (waitKeyFrame) { droppedVideo++; return@createAndSendPacket }
             lastOfferAt = SystemClock.elapsedRealtime()
-            if (!queue.offer(f)) overflow()
+            if (!queue.offer(restamp(f, ts))) overflow()
         }
     }
 
-    fun sendAudioFrame(aacBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+    fun sendAudioFrame(aacBuffer: ByteBuffer, info: MediaCodec.BufferInfo, absUs: Long) {
         if (!canSend || closed) return
         val ap = audioPacket ?: return
+        val ts = rtpTs(absUs, scm.sampleRate.toLong())
         ap.createAndSendPacket(aacBuffer, info) { f ->
             lastOfferAt = SystemClock.elapsedRealtime()
-            if (!queue.offer(f)) droppedAudio++
+            if (!queue.offer(restamp(f, ts))) droppedAudio++
         }
+    }
+
+    /** 32-bit RTP ts of a CLOCK_MONOTONIC time (no Long overflow below ~3 years of uptime). */
+    private fun rtpTs(absUs: Long, clock: Long): Long = (absUs * clock / 1_000_000L) and 0xFFFFFFFFL
+
+    /** The library's packet with its RTP header timestamp (bytes 4..7) replaced by [ts]. */
+    private fun restamp(f: RtpFrame, ts: Long): RtpFrame {
+        val b = f.buffer
+        b[4] = (ts shr 24).toByte(); b[5] = (ts shr 16).toByte(); b[6] = (ts shr 8).toByte(); b[7] = ts.toByte()
+        return f.copy(timeStamp = ts)
     }
 
     private fun overflow() {
