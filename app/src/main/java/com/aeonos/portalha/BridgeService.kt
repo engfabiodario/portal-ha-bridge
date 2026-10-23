@@ -1063,6 +1063,7 @@ class BridgeService : Service() {
     @Volatile private var facePresent = false
     @Volatile private var lastSoundActivityMs = 0L
     @Volatile private var lastPublishedPresence: Boolean? = null
+    @Volatile private var presenceUnsent = false   // fleet: the last presence value never reached the broker
     @Volatile private var lastSoundLevel = -1   // for the live readout in settings
     @Volatile private var screenOn = true
     @Volatile private var lastActivityMs = System.currentTimeMillis()
@@ -2561,6 +2562,13 @@ class BridgeService : Service() {
         publishVolumeMuteState(p)
         publishBrightnessState(p)
         publishDisplayStates(p)
+        // Presence is on-change only; a value that never reached the broker goes now (see recomputePresence).
+        if (p.presenceEnabled && (presenceUnsent || lastPublishedPresence == null)) {
+            lastPublishedPresence?.let { cur ->
+                presenceUnsent = !publishRawSent(HaDiscovery.presenceStateTopic(p.deviceId), if (cur) "ON" else "OFF", 1, retained = true)
+                Log.i(TAG, "presence: re-sent ${if (cur) "ON" else "OFF"} on connect" + if (presenceUnsent) " - failed again" else "")
+            } ?: recomputePresence(p)
+        }
         publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
         publishWifiSignal(force = true)
         publishDesktopState(p)
@@ -4856,9 +4864,16 @@ class BridgeService : Service() {
         val present = facePresent || soundActive
         if (present) lastActivityMs = System.currentTimeMillis()   // keeps the screen awake
         if (lastPublishedPresence != present) {
+            // fleet (2026-10-23): only a value that REACHED the broker counts as published. The first value of a run
+            // is computed in onCreate before the broker connects, and publishRaw dropped it silently: the RETAINED
+            // value of the previous run then stayed in HA until the next change (Upstairs Hallway: Meta presence ON
+            // for 50 h straight, 10-21 00:53 -> 10-23, across 3 Bridge restarts, while Meta said absent and the
+            // screen slept). An unsent value is flagged (presenceUnsent); the next connect / HA-birth burst sends it.
             lastPublishedPresence = present
-            publishRaw(HaDiscovery.presenceStateTopic(p.deviceId), if (present) "ON" else "OFF", 1, retained = true)
-            Log.i(TAG, "presence -> ${if (present) "DETECTED" else "CLEAR"} (face=$facePresent sound=$soundActive)")
+            presenceUnsent = !publishRawSent(HaDiscovery.presenceStateTopic(p.deviceId), if (present) "ON" else "OFF", 1, retained = true)
+            val sent = !presenceUnsent
+            Log.i(TAG, "presence -> ${if (present) "DETECTED" else "CLEAR"} (face=$facePresent sound=$soundActive)" +
+                if (sent) "" else " - not sent (MQTT down), resent on connect")
         }
     }
 
@@ -5452,6 +5467,15 @@ class BridgeService : Service() {
             mqtt?.publish(topic, MqttMessage(payload.toByteArray()).also { it.qos = qos; it.isRetained = retained })
         }
     }
+
+    // publishRaw that tells whether the message was handed to a CONNECTED client (false = dropped).
+    private fun publishRawSent(topic: String, payload: String, qos: Int = 0, retained: Boolean = false): Boolean =
+        runCatching {
+            val c = mqtt
+            if (c == null || !c.isConnected) return@runCatching false
+            c.publish(topic, MqttMessage(payload.toByteArray()).also { it.qos = qos; it.isRetained = retained })
+            true
+        }.getOrDefault(false)
 
     // Binary publish for the intercom (raw PCM frames, presence, lock). Never
     // called from the Paho callback thread — only the capture + MQTT threads.
