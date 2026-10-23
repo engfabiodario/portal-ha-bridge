@@ -628,6 +628,48 @@ object HaDiscovery {
         return """{"name":"Wi-Fi Signal","unique_id":"${deviceId}_wifi_signal","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${wifiSignalStateTopic(deviceId)}","device_class":"signal_strength","unit_of_measurement":"dBm","state_class":"measurement","entity_category":"diagnostic"}"""
     }
 
+    // ── Desktop mode (fleet 2026-10-22) ─────────────────────────────────────────
+    // "Show Desktop" / "Back to Dashboard" buttons (one command topic ON/OFF), binary sensor "Desktop Mode"
+    // (ON = the launcher is in front on purpose, camera paused; attributes since / ends_at / last_end_reason)
+    // and the config number "Desktop Minutes" (auto-return). default_entity_id keeps <slug>_... ids.
+    // Never voice-exposed ('desktop' is on the voice-unsafe word lists).
+
+    fun desktopCommandTopic(deviceId: String) = "portal/$deviceId/desktop/set"
+    fun desktopStateTopic(deviceId: String) = "portal/$deviceId/desktop/state"
+    fun desktopAttributesTopic(deviceId: String) = "portal/$deviceId/desktop/attributes"
+    fun desktopMinutesStateTopic(deviceId: String) = "portal/$deviceId/desktop/minutes/state"
+    fun desktopMinutesCommandTopic(deviceId: String) = "portal/$deviceId/desktop/minutes/set"
+
+    fun desktopShowDiscoveryTopic(deviceId: String) = "homeassistant/button/${deviceId}_show_desktop/config"
+    fun desktopBackDiscoveryTopic(deviceId: String) = "homeassistant/button/${deviceId}_back_to_dashboard/config"
+    fun desktopSensorDiscoveryTopic(deviceId: String) = "homeassistant/binary_sensor/${deviceId}_desktop_mode/config"
+    fun desktopMinutesDiscoveryTopic(deviceId: String) = "homeassistant/number/${deviceId}_desktop_minutes/config"
+
+    private fun defaultId(domain: String, deviceName: String, objectSuffix: String): String {
+        val slug = deviceName.lowercase(java.util.Locale.ROOT).replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        return if (slug.isEmpty()) "" else ",\"default_entity_id\":\"$domain.${slug}_$objectSuffix\""
+    }
+
+    fun desktopShowConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Show Desktop","unique_id":"${deviceId}_show_desktop","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${desktopCommandTopic(deviceId)}","payload_press":"ON","icon":"mdi:tablet"${defaultId("button", deviceName, "show_desktop")}}"""
+    }
+
+    fun desktopBackConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Back to Dashboard","unique_id":"${deviceId}_back_to_dashboard","device":${device(deviceId, name)},${availability(deviceId)},"command_topic":"${desktopCommandTopic(deviceId)}","payload_press":"OFF","icon":"mdi:view-dashboard"${defaultId("button", deviceName, "back_to_dashboard")}}"""
+    }
+
+    fun desktopSensorConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Desktop Mode","unique_id":"${deviceId}_desktop_mode","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${desktopStateTopic(deviceId)}","json_attributes_topic":"${desktopAttributesTopic(deviceId)}","payload_on":"ON","payload_off":"OFF","icon":"mdi:tablet-dashboard"${defaultId("binary_sensor", deviceName, "desktop_mode")}}"""
+    }
+
+    fun desktopMinutesConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        return """{"name":"Desktop Minutes","unique_id":"${deviceId}_desktop_minutes","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${desktopMinutesStateTopic(deviceId)}","command_topic":"${desktopMinutesCommandTopic(deviceId)}","min":5,"max":240,"step":5,"mode":"box","unit_of_measurement":"min","icon":"mdi:timer-sand","entity_category":"config"${defaultId("number", deviceName, "desktop_minutes")}}"""
+    }
+
     // ── Bridge memory sensor (diagnostic, fleet 2026-10-22, BridgeMemory) ────────
     // State = the Bridge process PSS in MB; attributes = heap split, system free RAM, uptimes. Published hourly,
     // on a >= 10 % PSS move and with every state burst. default_entity_id keeps the id <slug>_bridge_memory (HA

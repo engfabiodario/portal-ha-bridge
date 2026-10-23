@@ -369,6 +369,11 @@ class Prefs(private val context: Context) {
         get() = sp.getInt("call_return_minutes", 1)
         set(v) = sp.edit().putInt("call_return_minutes", v.coerceIn(0, 60)).apply()
 
+    // Desktop mode (fleet 2026-10-22): minutes before the dashboard (and the camera) come back by themselves.
+    var desktopMinutes: Int
+        get() = sp.getInt("desktop_minutes", 60)
+        set(v) = sp.edit().putInt("desktop_minutes", v.coerceIn(5, 240)).apply()
+
     // When we open Meta's launcher for a call it lands on its photo home, which needs one tap
     // to reveal the Calls tiles. With this on, the accessibility service injects that tap for
     // you so you go straight to the tiles. On = auto-dismiss; off = leave the tap to the user.

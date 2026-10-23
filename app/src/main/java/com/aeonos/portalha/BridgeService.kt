@@ -236,6 +236,8 @@ class BridgeService : Service() {
         // when the persisted due time passes and the screen is on.
         private const val UPDATE_TICK_MS = 3_600_000L
         private const val WIFI_SIGNAL_TICK_MS = 60_000L
+        private const val DESKTOP_NIGHT_HOUR = 23
+        private const val DESKTOP_FRONT_GRACE_MS = 5_000L
         private const val WIFI_SIGNAL_REFRESH_MS = 600_000L
 
         // Live reference to the running service so the dashboard UI + the PTT
@@ -338,7 +340,7 @@ class BridgeService : Service() {
             // Assistant keep-alive (Android 9+): a resume may have covered the parked assistant, and
             // the corner cover follows the dashboard (see AvaKeepAlive).
             if (fg) instance?.keepAlive?.onDashboardResumed() else instance?.keepAlive?.onDashboardPaused()
-            if (fg) { userLeftDashboard = false; instance?.clearForegroundSteal() }
+            if (fg) { instance?.onDashboardFrontInDesktop(); userLeftDashboard = false; instance?.clearForegroundSteal() }
             // We just lost the front and nothing marked it a deliberate departure. That covers
             // both shapes of steal: an app that sends a leave hint (an Alexa announcement — see
             // noteUserLeftDashboard) and one that sends none at all (a launcher asserting HOME
@@ -1535,6 +1537,7 @@ class BridgeService : Service() {
                     }
                     Intent.ACTION_SCREEN_OFF -> {
                         screenOn = false; publishState("OFF")
+                        if (desktopMode) endDesktopNow("screen off")   // the camera must never stay off overnight
                         keepAlive?.onScreen(false)
                         // Put the cover up NOW, while the panel is dark, so it is already
                         // composited before the screen lights again. Skipped when the user is
@@ -1894,7 +1897,7 @@ class BridgeService : Service() {
         if (inCall || ringing) return
         // Nor over an app the user deliberately opened: waking the screen is not a request to
         // abandon whatever they were watching.
-        if (userLeftDashboard) return
+        if (userLeftDashboard || desktopMode) return
         // Nor over our own YouTube screen (it closes itself when the screen goes off).
         if (TvAppActivity.isShowing()) return
         runCatching {
@@ -2176,6 +2179,9 @@ class BridgeService : Service() {
                 intent.getStringExtra("cameraView")?.let { v -> handleCameraViewCommand(v, p) }
                 // --es displayDensity <dpi|dpi!|reset|status>  (DisplayDensity; 100..320, SDK 28 only with '!')
                 intent.getStringExtra("displayDensity")?.let { v -> handleDisplayDensityCommand(v, p) }
+                // --ez desktopMode true|false (DesktopMode: launcher in front on purpose), --ei desktopMinutes N (5..240)
+                if (intent.hasExtra("desktopMinutes")) handleDesktopMinutesCommand(intent.getIntExtra("desktopMinutes", 60).toString(), p)
+                if (intent.hasExtra("desktopMode")) handleDesktopCommand(if (intent.getBooleanExtra("desktopMode", false)) "ON" else "OFF")
                 //   --ez rtspStatus true                       logs one "rtsp: status ..." line (clients, progress, evictions)
                 if (intent.getBooleanExtra("rtspStatus", false)) {
                     Log.i(TAG, rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
@@ -2483,6 +2489,8 @@ class BridgeService : Service() {
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             cameraViewTopic(p.deviceId),
             displayDensityTopic(p.deviceId),
+            HaDiscovery.desktopCommandTopic(p.deviceId),
+            HaDiscovery.desktopMinutesCommandTopic(p.deviceId),
             // Watch together: shared by every Portal (never purged or retained).
             WatchTogether.TOPIC,
             WatchTogether.MEMBERS_FILTER,
@@ -2555,6 +2563,7 @@ class BridgeService : Service() {
         publishDisplayStates(p)
         publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
         publishWifiSignal(force = true)
+        publishDesktopState(p)
         publishDashboardPathState(p)
         publishNavigateState(p)
         publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
@@ -2595,6 +2604,10 @@ class BridgeService : Service() {
         pub(HaDiscovery.ipDiscoveryTopic(p.deviceId), HaDiscovery.ipConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.wifiSignalDiscoveryTopic(p.deviceId), HaDiscovery.wifiSignalConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.bridgeMemoryDiscoveryTopic(p.deviceId), HaDiscovery.bridgeMemoryConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.desktopShowDiscoveryTopic(p.deviceId), HaDiscovery.desktopShowConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.desktopBackDiscoveryTopic(p.deviceId), HaDiscovery.desktopBackConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.desktopSensorDiscoveryTopic(p.deviceId), HaDiscovery.desktopSensorConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.desktopMinutesDiscoveryTopic(p.deviceId), HaDiscovery.desktopMinutesConfigPayload(p.deviceId, p.deviceName))
         bridgeMemory?.republish()
         pub(HaDiscovery.lightDiscoveryTopic(p.deviceId), HaDiscovery.lightConfigPayload(p.deviceId, p.deviceName))
         for (axis in listOf("x", "y", "z"))
@@ -2783,6 +2796,8 @@ class BridgeService : Service() {
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
             cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
             displayDensityTopic(p.deviceId)                       -> handleDisplayDensityCommand(payload, p)
+            HaDiscovery.desktopCommandTopic(p.deviceId)           -> handleDesktopCommand(payload)
+            HaDiscovery.desktopMinutesCommandTopic(p.deviceId)    -> handleDesktopMinutesCommand(payload, p)
             WatchTogether.TOPIC                                   -> watch.handle(payload)
         }
     }
@@ -2801,6 +2816,7 @@ class BridgeService : Service() {
             micYieldedForWake -> "a wake hand-off is running"
             navPath.isNotEmpty() -> "a navigate page is showing"
             otherScreensResumed > 0 -> "a Bridge screen is open"
+            desktopMode -> "desktop mode (the launcher is in front on purpose)"
             else -> null
         }
 
@@ -2960,6 +2976,7 @@ class BridgeService : Service() {
             // to the dashboard, so Ava keeps hearing while a video plays (fleet 2026-10-02).
             TvAppActivity.isVisible() -> null
             TvAppActivity.isShowing() -> "the YouTube screen is hidden"
+            desktopMode -> "desktop mode"
             userLeftDashboard -> "another app in front (the user's choice)"
             screenIsOn && !dashboardForeground -> "another app in front"
             else -> null
@@ -3491,6 +3508,148 @@ class BridgeService : Service() {
             lastWifiSignal = rssi; lastWifiSignalAt = now
         }
     }
+
+    // ── Desktop mode (fleet 2026-10-22) ──────────────────────────────────────
+    // HA "Show Desktop" sends the Portal to its Android home screen (the Immortal launcher) so it can be used as a
+    // tablet; the camera PAUSES meanwhile (Android gives the camera to the front app - accepted by Fabio).
+    // While on: userLeftDashboard (no auto-return, no wake reclaim, no wake-to-photos, no sleep cover), the
+    // central guard in bringDashboardToFront, self-heal checks skipped (busyReason), the keep-alive held off (its
+    // parked window removed), our screen-off timer held, Show Dashboard = wake only, non-alert navigates ignored.
+    // Ends (dashboard + camera + keep-alive back): "Back to Dashboard", Desktop Minutes (default 60), 23:00 local,
+    // the screen turning off, an ALERT navigate (it then shows its page), or the dashboard coming to the front
+    // by itself (its launcher icon). Not persisted: a Bridge restart = desktop mode off (the normal recovery).
+    @Volatile private var desktopMode = false
+    @Volatile private var desktopSinceMs = 0L
+    @Volatile private var desktopEndsAtMs = 0L
+    @Volatile private var desktopEndWhy = ""
+    @Volatile private var desktopLastEnd = ""
+    private val desktopEndRunnable = Runnable { checkDesktopEnd() }
+
+    private fun handleDesktopCommand(payload: String) {
+        when (payload.trim().uppercase()) {
+            "ON", "SHOW", "TRUE", "1" -> wakeHandler.post { startDesktopNow() }
+            "OFF", "BACK", "FALSE", "0" -> wakeHandler.post { endDesktopNow("Back to Dashboard") }
+            "STATUS" -> Log.i(TAG, desktopStatus())
+            "" -> {}
+            else -> Log.w(TAG, "desktop: unknown command '$payload'")
+        }
+    }
+
+    private fun handleDesktopMinutesCommand(payload: String, p: Prefs) {
+        val n = payload.trim().toFloatOrNull()?.toInt() ?: return
+        p.desktopMinutes = n
+        Log.i(TAG, "desktop: minutes = ${p.desktopMinutes}")
+        if (desktopMode) wakeHandler.post { scheduleDesktopEnd(p) }
+        publishDesktopState(p)
+    }
+
+    private fun desktopStatus(): String =
+        "desktop: status on=$desktopMode since=${if (desktopSinceMs == 0L) "-" else isoTime(desktopSinceMs)} " +
+            "endsAt=${if (desktopEndsAtMs == 0L) "-" else isoTime(desktopEndsAtMs)} ($desktopEndWhy) last='$desktopLastEnd' " +
+            "dashboardFg=$dashboardForeground userLeft=$userLeftDashboard fg=$foregroundPkg"
+
+    // The auto-return moment: Desktop Minutes from now, or 23:00 local if that comes first.
+    private fun scheduleDesktopEnd(p: Prefs) {
+        val now = System.currentTimeMillis()
+        val timer = now + p.desktopMinutes * 60_000L
+        val night = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, DESKTOP_NIGHT_HOUR); set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0); set(java.util.Calendar.MILLISECOND, 0)
+            if (timeInMillis <= now) add(java.util.Calendar.DAY_OF_YEAR, 1)
+        }.timeInMillis
+        if (night < timer) { desktopEndsAtMs = night; desktopEndWhy = "night ${DESKTOP_NIGHT_HOUR}:00" }
+        else { desktopEndsAtMs = timer; desktopEndWhy = "${p.desktopMinutes} min" }
+        wakeHandler.removeCallbacks(desktopEndRunnable)
+        wakeHandler.postDelayed(desktopEndRunnable, (desktopEndsAtMs - now).coerceAtLeast(1_000L))
+    }
+
+    private fun checkDesktopEnd() {
+        if (!desktopMode) return
+        if (System.currentTimeMillis() >= desktopEndsAtMs) {
+            if (Looper.myLooper() == Looper.getMainLooper()) endDesktopNow("auto-return ($desktopEndWhy)")
+            else wakeHandler.post { endDesktopNow("auto-return ($desktopEndWhy)") }
+        }
+    }
+
+    /** Main thread. */
+    private fun startDesktopNow() {
+        val p = prefs ?: return
+        val why = when {
+            inCall || ringing -> "a call has the screen"
+            navPath.startsWith("/portal-alerts") -> "an alert page is showing ($navPath)"
+            else -> null
+        }
+        if (why != null) { Log.i(TAG, "desktop: refused - $why"); return }
+        if (desktopMode) {           // pressed again: restart the auto-return countdown, bring the launcher up again
+            scheduleDesktopEnd(p); launchHome(); publishDesktopState(p)
+            Log.i(TAG, "desktop: already on - auto-return re-armed (${desktopEndWhy}, ends ${isoTime(desktopEndsAtMs)})")
+            return
+        }
+        if (TvAppActivity.isShowing()) { dialServer?.appRunning = false; TvAppActivity.close("desktop mode") }
+        desktopMode = true
+        desktopSinceMs = System.currentTimeMillis()
+        userLeftDashboard = true                          // before the launcher pauses us: a choice, not a steal
+        clearForegroundSteal()
+        screensaver.hide()
+        keepAlive?.setDesktopHold(true)                   // parked Ava window removed while the desktop is in use
+        ScreenControl.wake(this)
+        lastActivityMs = System.currentTimeMillis()
+        scheduleDesktopEnd(p)
+        launchHome()
+        Log.i(TAG, "desktop: ON - launcher in front, camera paused, auto-return $desktopEndWhy (${isoTime(desktopEndsAtMs)})")
+        publishDesktopState(p)
+    }
+
+    private fun launchHome() {
+        runCatching {
+            startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED))
+        }.onFailure { Log.w(TAG, "desktop: HOME launch failed: ${it.message}") }
+    }
+
+    /** Main thread. [bringBack] false = the caller (an alert navigate) brings the dashboard itself. */
+    private fun endDesktopNow(why: String, bringBack: Boolean = true) {
+        if (!desktopMode) return
+        desktopMode = false
+        desktopLastEnd = "$why at ${isoTime(System.currentTimeMillis())}"
+        wakeHandler.removeCallbacks(desktopEndRunnable)
+        desktopEndsAtMs = 0L
+        userLeftDashboard = false
+        keepAlive?.setDesktopHold(false)                  // re-parks once the dashboard is back
+        lastActivityMs = System.currentTimeMillis()
+        lastInteractionMs = System.currentTimeMillis()    // no photos straight over the returning dashboard
+        if (bringBack) bringDashboardToFront()            // screen off too: the camera needs us on top overnight
+        Log.i(TAG, "desktop: OFF ($why) - dashboard${if (bringBack) " brought back" else ""}, keep-alive back, camera resumes")
+        prefs?.let { publishDesktopState(it) }
+    }
+
+    /** setDashboardForeground(true) while the desktop is on: someone opened the dashboard from the launcher. */
+    fun onDashboardFrontInDesktop() {
+        if (!desktopMode) return
+        if (System.currentTimeMillis() - desktopSinceMs < DESKTOP_FRONT_GRACE_MS) return   // our own HOME hand-off
+        wakeHandler.post { endDesktopNow("dashboard came back to the front", bringBack = false) }
+    }
+
+    private fun publishDesktopState(p: Prefs) {
+        val on = desktopMode
+        val attrs = org.json.JSONObject()
+            .put("since", if (on) isoTime(desktopSinceMs) else org.json.JSONObject.NULL)
+            .put("ends_at", if (on && desktopEndsAtMs > 0L) isoTime(desktopEndsAtMs) else org.json.JSONObject.NULL)
+            .put("ends_why", if (on) desktopEndWhy else "")
+            .put("last_end", desktopLastEnd)
+            .put("minutes", p.desktopMinutes)
+        runCatching {
+            commandExecutor.submit {
+                publishRaw(HaDiscovery.desktopAttributesTopic(p.deviceId), attrs.toString(), 1, retained = true)
+                publishRaw(HaDiscovery.desktopStateTopic(p.deviceId), if (on) "ON" else "OFF", 1, retained = true)
+                publishRaw(HaDiscovery.desktopMinutesStateTopic(p.deviceId), p.desktopMinutes.toString(), 1, retained = true)
+            }
+        }
+    }
+
+    private fun isoTime(ms: Long): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US).format(java.util.Date(ms))
+            .let { it.substring(0, it.length - 2) + ":" + it.substring(it.length - 2) }
 
     // ── Bridge memory sensor (fleet 2026-10-22, BridgeMemory) ─────────────────
     private var bridgeMemory: BridgeMemory? = null
@@ -4207,6 +4366,11 @@ class BridgeService : Service() {
             wakeHandler.post { ScreenControl.wake(this); lastActivityMs = System.currentTimeMillis() }
             return
         }
+        if (desktopMode) {
+            Log.i(TAG, "show dashboard ignored - desktop mode is on (use Back to Dashboard)")
+            wakeHandler.post { ScreenControl.wake(this); lastActivityMs = System.currentTimeMillis() }
+            return
+        }
         Log.i(TAG, "show dashboard requested (inCall=$inCall)")
         wakeHandler.post {
             ScreenControl.wake(this)
@@ -4250,6 +4414,9 @@ class BridgeService : Service() {
         // full-screen answer/reject. Guarded here rather than at the call sites because there
         // are eight of them and any one firing mid-ring causes it.
         if (inCall || ringing) return
+        // Desktop mode: the launcher is in front on purpose. Only endDesktop (button, timer, night, screen off,
+        // an alert navigate, the dashboard coming back by itself) clears the flag and then brings us back.
+        if (desktopMode) { Log.i(TAG, "dashboard: not brought to the front - desktop mode is on"); return }
         // Works on A9 too: falcon self-foregrounds a story/music card there, and without an
         // explicit return the end of the turn strands the user on the Meta launcher (plus a
         // long black transition) instead of the dashboard. A no-op when we're already front.
@@ -4680,6 +4847,9 @@ class BridgeService : Service() {
         // OS timeout; this timer is ours and used to blank the video mid-programme. Holds the
         // countdown at zero while it plays, so a paused video still sleeps on the usual schedule.
         if (TvAppActivity.isPlayingVideo()) { lastActivityMs = System.currentTimeMillis(); return }
+        // Desktop mode: touches on the launcher / other apps never reach us, so this timer would blank the screen
+        // under someone's finger. Held; the desktop's own auto-return (Desktop Minutes, 23:00) ends the mode.
+        if (desktopMode) { lastActivityMs = System.currentTimeMillis(); checkDesktopEnd(); return }
         // Presence (face or enhanced-sound) holds the screen awake and resets the countdown —
         // unless the user has asked for the screen to sleep on schedule regardless of whether
         // anyone is there. Presence is still computed and published either way.
@@ -4843,6 +5013,13 @@ class BridgeService : Service() {
         youtubeNavigate(payload)?.let { video -> openYouTube("navigate", video.ifEmpty { null }); return }
         val req = parseNavigate(payload)
         if (req == null) { Log.w(TAG, "navigate: refused '$payload' (not a path)"); return }
+        if (desktopMode) {
+            if (req.path.isEmpty() || !isAlertNavigate(req)) {
+                Log.i(TAG, "navigate: ignored '${req.path.ifEmpty { "home" }}' - desktop mode is on (not an alert)"); return
+            }
+            Log.i(TAG, "navigate: alert '${req.path}' - ending desktop mode first")
+            wakeHandler.post { endDesktopNow("alert ${req.path}", bringBack = false) }   // the navigate below brings us back
+        }
         if (req.path.isEmpty()) {
             if (TvAppActivity.isShowing()) { Log.i(TAG, "navigate: 'home' ignored - YouTube is showing"); return }
             wakeHandler.post { returnFromNavigate(timed = false) }; return

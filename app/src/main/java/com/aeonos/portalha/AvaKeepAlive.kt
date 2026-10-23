@@ -338,9 +338,19 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         }
     }
 
-    /** Recompute [enabled] from the switch and the pause, and act on a change. */
+    // Desktop mode (fleet 2026-10-22): off while the Portal is used as a tablet - the parked window is taken
+    // away (no corner sliver / forced status bar over the launcher); back on when desktop mode ends.
+    @Volatile private var desktopHold = false
+
+    fun setDesktopHold(on: Boolean) {
+        if (on == desktopHold) return
+        desktopHold = on
+        applyEnabled(if (on) "desktop mode" else "desktop mode ended")
+    }
+
+    /** Recompute [enabled] from the switch, the pause and the desktop hold, and act on a change. */
     @Synchronized private fun applyEnabled(why: String) {
-        val on = userEnabled && pausedUntil == 0L
+        val on = userEnabled && pausedUntil == 0L && !desktopHold
         if (on == enabled) return
         enabled = on
         Log.i(TAG, "keepalive: ${if (on) "enabled" else "disabled"} ($why)")
