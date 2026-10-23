@@ -3038,7 +3038,11 @@ class BridgeService : Service() {
     private fun handleScreenCommand(cmd: String) {
         when (cmd.uppercase()) {
             "ON" -> ScreenControl.wake(this)
-            "OFF" -> ScreenControl.sleep()
+            "OFF" -> {
+                // Desktop mode: end it first (wake lock released, dashboard back on top for the night camera).
+                if (desktopMode) wakeHandler.post { endDesktopNow("screen switched off"); ScreenControl.sleep() }
+                else ScreenControl.sleep()
+            }
         }
     }
 
@@ -3524,6 +3528,22 @@ class BridgeService : Service() {
     @Volatile private var desktopEndWhy = ""
     @Volatile private var desktopLastEnd = ""
     private val desktopEndRunnable = Runnable { checkDesktopEnd() }
+    // With the launcher in front nothing keeps the screen on, so Android's own idle timeout (~60 s on the Portals)
+    // slept it and ended desktop mode under the user (pilot 2026-10-22). Held until desktop mode ends (bounded by
+    // the auto-return); the HA screen switch / power button still sleep the screen (goToSleep overrides it).
+    private var desktopWakeLock: PowerManager.WakeLock? = null
+
+    private fun holdDesktopScreen(untilMs: Long) {
+        runCatching {
+            val wl = desktopWakeLock ?: @Suppress("DEPRECATION") getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "PortalHA:Desktop").also { it.setReferenceCounted(false); desktopWakeLock = it }
+            wl.acquire((untilMs - System.currentTimeMillis()).coerceIn(60_000L, 5 * 3_600_000L) + 60_000L)
+        }.onFailure { Log.w(TAG, "desktop: screen wake lock failed: ${it.message}") }
+    }
+
+    private fun releaseDesktopScreen() {
+        runCatching { desktopWakeLock?.let { if (it.isHeld) it.release() } }
+    }
 
     private fun handleDesktopCommand(payload: String) {
         when (payload.trim().uppercase()) {
@@ -3539,7 +3559,7 @@ class BridgeService : Service() {
         val n = payload.trim().toFloatOrNull()?.toInt() ?: return
         p.desktopMinutes = n
         Log.i(TAG, "desktop: minutes = ${p.desktopMinutes}")
-        if (desktopMode) wakeHandler.post { scheduleDesktopEnd(p) }
+        if (desktopMode) wakeHandler.post { scheduleDesktopEnd(p); holdDesktopScreen(desktopEndsAtMs) }
         publishDesktopState(p)
     }
 
@@ -3581,7 +3601,7 @@ class BridgeService : Service() {
         }
         if (why != null) { Log.i(TAG, "desktop: refused - $why"); return }
         if (desktopMode) {           // pressed again: restart the auto-return countdown, bring the launcher up again
-            scheduleDesktopEnd(p); launchHome(); publishDesktopState(p)
+            scheduleDesktopEnd(p); holdDesktopScreen(desktopEndsAtMs); launchHome(); publishDesktopState(p)
             Log.i(TAG, "desktop: already on - auto-return re-armed (${desktopEndWhy}, ends ${isoTime(desktopEndsAtMs)})")
             return
         }
@@ -3595,6 +3615,7 @@ class BridgeService : Service() {
         ScreenControl.wake(this)
         lastActivityMs = System.currentTimeMillis()
         scheduleDesktopEnd(p)
+        holdDesktopScreen(desktopEndsAtMs)
         launchHome()
         Log.i(TAG, "desktop: ON - launcher in front, camera paused, auto-return $desktopEndWhy (${isoTime(desktopEndsAtMs)})")
         publishDesktopState(p)
@@ -3614,6 +3635,7 @@ class BridgeService : Service() {
         desktopLastEnd = "$why at ${isoTime(System.currentTimeMillis())}"
         wakeHandler.removeCallbacks(desktopEndRunnable)
         desktopEndsAtMs = 0L
+        releaseDesktopScreen()
         userLeftDashboard = false
         keepAlive?.setDesktopHold(false)                  // re-parks once the dashboard is back
         lastActivityMs = System.currentTimeMillis()
