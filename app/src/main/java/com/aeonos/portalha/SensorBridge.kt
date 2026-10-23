@@ -31,9 +31,16 @@ class SensorBridge(
         private const val LIGHT_MIN_LX = 5f            // ambient light: >= max(5 lx, 10 %)
         private const val LIGHT_REL = 0.10f
         private const val LIGHT_MIN_INTERVAL_MS = 5_000L
-        private const val RGB_MIN_ABS = 5f             // RGB channels (raw counts ~1e4): >= max(5, 10 %)
-        private const val RGB_REL = 0.10f
-        private const val RGB_MIN_INTERVAL_MS = 5_000L
+        // RGB channels (raw counts ~1e4) are display-only in HA. The gate compares a 60 s
+        // time-weighted MEAN, not the last sample: in the dark the R (IR-heavy) channel aliases
+        // the 120 Hz flicker of a phase-dimmed lamp (Front Door: porch light through the door glass,
+        // R jumping 1900 <-> 5200 every 5 s, ~560 HA states/h per channel; replayed: 10-25/h).
+        // Publish when the mean moves >= max(20, 20 %), at most once per 30 s.
+        private const val RGB_MIN_ABS = 20f
+        private const val RGB_REL = 0.20f
+        private const val RGB_MIN_INTERVAL_MS = 30_000L
+        private const val RGB_WINDOW_MS = 60_000L
+        private const val RGB_MAX_SAMPLES = 512
         private const val ACCEL_MIN_DELTA = 0.5f       // m/s2 on any axis (gravity-filtered)
         private const val ACCEL_MIN_INTERVAL_MS = 5_000L
         private const val TEMP_MIN_DELTA = 0.3f        // degC, raw reading
@@ -119,7 +126,9 @@ class SensorBridge(
     // Latest readings, and what was last published (the deadband centre).
     private var lux = 0f
     private var pubLux = 0f
-    private val rgb = FloatArray(3)
+    private class RgbSample(val t: Long, val v: FloatArray)
+    private val rgbSamples = ArrayDeque<RgbSample>()   // raw readings of the last RGB_WINDOW_MS
+    private val rgb = FloatArray(3)                    // time-weighted mean of rgbSamples (see rgbMean)
     private val pubRgb = FloatArray(3)
     private val pubAccel = FloatArray(3)
     private var lastTemp = Float.MIN_VALUE   // latest RAW temperature (no offset)
@@ -132,9 +141,31 @@ class SensorBridge(
         { outside(lux, pubLux, LIGHT_MIN_LX, LIGHT_REL) },
         { pubLux = lux; "%.1f".format(lux) })
 
+    // Fills [rgb] with the time-weighted mean of the raw signal over the last RGB_WINDOW_MS (each
+    // reading holds until the next one, the newest until now). After RGB_WINDOW_MS without a new
+    // reading the mean IS the last reading, so a step always ends on its exact value.
+    private fun rgbMean(now: Long = SystemClock.elapsedRealtime()) {
+        val start = now - RGB_WINDOW_MS
+        while (rgbSamples.size >= 2 && rgbSamples[1].t <= start) rgbSamples.removeFirst()
+        if (rgbSamples.isEmpty()) return
+        val sum = DoubleArray(3)
+        var total = 0L
+        for (i in rgbSamples.indices) {
+            val s = rgbSamples[i]
+            val to = if (i + 1 < rgbSamples.size) rgbSamples[i + 1].t else now
+            val dur = to - maxOf(s.t, start)
+            if (dur <= 0) continue
+            for (c in 0..2) sum[c] += s.v[c].toDouble() * dur
+            total += dur
+        }
+        val last = rgbSamples.last().v
+        for (c in 0..2) rgb[c] = if (total > 0) (sum[c] / total).toFloat() else last[c]
+    }
+
     private val rgbGate = Gate(RGB_MIN_INTERVAL_MS, { HaDiscovery.rgbStateTopic(it.deviceId) },
-        { (0..2).any { outside(rgb[it], pubRgb[it], RGB_MIN_ABS, RGB_REL) } },
+        { rgbMean(); (0..2).any { outside(rgb[it], pubRgb[it], RGB_MIN_ABS, RGB_REL) } },
         {
+            rgbMean()
             rgb.copyInto(pubRgb)
             """{"r":${"%.1f".format(rgb[0])},"g":${"%.1f".format(rgb[1])},"b":${"%.1f".format(rgb[2])}}"""
         })
@@ -219,9 +250,16 @@ class SensorBridge(
         // NaN/Infinity, which isn't JSON (HA logged a template error per channel every ~30 s
         // all night). Skip such readings - the last published values stay in HA.
         for (i in 0..2) if (!event.values.getOrElse(i) { 0f }.isFinite()) return
-        for (i in 0..2) rgb[i] = event.values.getOrElse(i) { 0f }
+        rgbSamples.addLast(RgbSample(SystemClock.elapsedRealtime(), FloatArray(3) { event.values.getOrElse(it) { 0f } }))
+        while (rgbSamples.size > RGB_MAX_SAMPLES) rgbSamples.removeFirst()
         rgbGate.offer()
+        // On-change sensor: when the readings stop, re-check once the window holds only the last
+        // one, so the end value of a step is published even though no new event arrives.
+        handler.removeCallbacks(rgbFlush)
+        handler.postDelayed(rgbFlush, RGB_WINDOW_MS + 200L)
     }
+
+    private val rgbFlush = Runnable { rgbGate.offer(settled = true) }
 
     private fun handleAccel(event: SensorEvent, p: Prefs) {
         val x = event.values[0]
