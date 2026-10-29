@@ -1,6 +1,9 @@
 package com.aeonos.portalha
 
+import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
@@ -8,6 +11,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -27,11 +31,19 @@ import java.util.Locale
  *              -> reload the current start page
  *  - keepalive the Ava keep-alive is on but not parked             -> the keep-alive's own re-park
  *  - wifi      the Wi-Fi link is down for 2 ticks -> Android 9: WifiManager.reconnect(), repeated with the
- *              backoff while the link stays down (2026-10-23; was once per outage); Android 10: reported only
+ *              backoff while the link stays down (2026-10-23; was once per outage). Android 10 (wifi recovery
+ *              2026-10-29): a ladder by outage age - reconnect(), >= 5 min enableNetwork(last nid, true),
+ *              >= 10 min disconnect() + reconnect(), >= 15 min the target-28 helper's radio toggle (every 30 min,
+ *              max 4/day). Wi-Fi itself OFF (the framework's SelfRecovery can shut it down while the toggle stays
+ *              on) is now 'bad' too -> setWifiEnabled(true): Android 9 itself, Android 10 via the helper.
+ *              The Bridge's reconnect()/disconnect()/enableNetwork() are ACCEPTED on Android 10 (its
+ *              SYSTEM_ALERT_WINDOW app-op passes AOSP 10 isTargetSdkLessThanQOrPrivileged); only
+ *              setWifiEnabled() needs targetSdk < 29 = the helper (com.aeonos.portalha.wifihelper).
  *  - lan       (fleet 2026-10-08) Wi-Fi says connected but neither the MQTT broker (host:port) nor the
  *              LAN probe (default the broker's /24 .1 = main Deco, :80) accepts a TCP connect in 3 s
  *              (a refused connect counts as reachable), on 2 consecutive checks -> Android 9:
- *              WifiManager.reconnect(), from the 2nd action of an outage disconnect() + reconnect();
+ *              WifiManager.reconnect() (wifi recovery 2026-10-29: the 2nd-action disconnect() + reconnect() is
+ *              GONE - on 10-26 it turned a LAN glitch into 7 min (Bar) and 15 min (Coffee Area) offline);
  *              Android 10: report only - state 'failing' (reason 'lan unreachable'). NEVER disconnect()
  *              there (2026-10-13): it does work on the Portal 10", but Android 10 then holds the network
  *              NETWORK_SELECTION_DISABLED_NO_INTERNET_TEMPORARY and doesn't rejoin it for ~13 min (Upstairs
@@ -97,6 +109,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         var streak = 0           // actions since the check was last ok (backoff exponent)
         var lastActionMs = 0L
         var wifiReconnected = false        // wifi: reconnect() already used for this outage
+        var downSinceMs = 0L               // wifi: elapsedRealtime the outage started (0 = not down)
     }
 
     private val thread = HandlerThread("portal-ha-selfheal").also { it.start() }
@@ -280,7 +293,12 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     private fun evalWifi(): String = runCatching {
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return "n/a: no Wi-Fi"
-        if (!wm.isWifiEnabled) return "n/a: Wi-Fi is off"
+        // A wall Portal has no other network: Wi-Fi off is never 'n/a'. It was, so a Wi-Fi the framework shut down
+        // (SelfRecovery) was never acted on. 'wifi_on' = the persisted user toggle (0 off, 1 on, 2/3 airplane).
+        if (!wm.isWifiEnabled) {
+            val on = runCatching { Settings.Global.getInt(ctx.contentResolver, "wifi_on") }.getOrDefault(-1)
+            return "bad: Wi-Fi is off (state ${wm.wifiState}, wifi_on=$on)"
+        }
         val cm = ctx.getSystemService(ConnectivityManager::class.java)
         val up = cm?.allNetworks?.any { n ->
             val caps = cm.getNetworkCapabilities(n)
@@ -377,7 +395,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         }
         s.last = result
         if (!bad) {
-            s.bad = 0; s.streak = 0; s.wifiReconnected = false
+            s.bad = 0; s.streak = 0; s.wifiReconnected = false; s.downSinceMs = 0L
             return
         }
         s.bad++
@@ -425,32 +443,99 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     private fun wifiAction(s: CheckState): String {
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
-        if (Build.VERSION.SDK_INT != Build.VERSION_CODES.P) {
-            // fleet (2026-10-23): Android 10 - try reconnect() too. In the framework it is only a forced connectivity
-            // scan (CMD_RECONNECT -> forceConnectivityScan); for an app targeting Q+ it is refused (returns false, no-op),
-            // then this stays report-only. Upstairs Hallway / Guest took 26-32 min and Downstairs Hallway 30 min to
-            // rejoin after a Deco reboot with the screen off.
-            @Suppress("DEPRECATION")
-            val ok = runCatching { wm.reconnect() }.getOrDefault(false)
-            if (!ok) {
-                if (s.bad == BAD_TICKS_FOR_ACTION) Log.w(TAG, "wifi: link down for ${s.bad} ticks - reconnect() refused on Android ${Build.VERSION.RELEASE}, report only")
-                return ""
-            }
-            return "WifiManager.reconnect() = true on Android ${Build.VERSION.RELEASE} (attempt ${s.streak + 1} of this outage)"
-        }
-        // fleet (2026-10-23): repeated with the normal backoff (1, 2, 4, 8 ... min, max MAX_PER_HOUR), no longer once per
-        // outage. Coffee Area at the 03:00 Deco reboot: the one reconnect() (03:03) scanned while the Decos were still
-        // booting (only neighbours' APs seen), then Android 9 sat in DisconnectedState with no scan for 25 min (rejoined
-        // 03:27:51 on a PNO result). reconnect() on Android 9 starts a fresh scan + network selection; it is only sent
-        // while the link is down, so a live connection is never touched.
+        val now = SystemClock.elapsedRealtime()
+        if (s.downSinceMs == 0L) s.downSinceMs = now - BAD_TICKS_FOR_ACTION * TICK_MS
+        val downMin = (now - s.downSinceMs) / 60_000L
         @Suppress("DEPRECATION")
-        val ok = wm.reconnect()
-        s.wifiReconnected = true
-        return "WifiManager.reconnect() = $ok (attempt ${s.streak + 1} of this outage)"
+        if (!wm.isWifiEnabled) {
+            // Android 9 may switch it on itself; Android 10 refuses setWifiEnabled() to a target-35 app -> the helper
+            // (a no-op there when Wi-Fi is already on; it never turns Wi-Fi off for this command).
+            return if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P)
+                "WifiManager.setWifiEnabled(true) = ${wm.setWifiEnabled(true)} (Wi-Fi was off $downMin min)"
+            else helper("assert_on")
+        }
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P) {
+            // fleet (2026-10-23): repeated with the normal backoff (1, 2, 4, 8 ... min, max MAX_PER_HOUR), no longer once per
+            // outage. Coffee Area at the 03:00 Deco reboot: the one reconnect() (03:03) scanned while the Decos were still
+            // booting (only neighbours' APs seen), then Android 9 sat in DisconnectedState with no scan for 25 min (rejoined
+            // 03:27:51 on a PNO result). reconnect() on Android 9 starts a fresh scan + network selection; it is only sent
+            // while the link is down, so a live connection is never touched.
+            @Suppress("DEPRECATION")
+            val ok = wm.reconnect()
+            s.wifiReconnected = true
+            return "WifiManager.reconnect() = $ok (attempt ${s.streak + 1} of this outage)"
+        }
+        // Android 10 ladder (wifi recovery 2026-10-29). The link is DOWN when we get here (2 bad ticks), so none of
+        // these can cut a working connection. Nightly Deco reboots rejoin in ~100 s on step 1 alone (10-26..10-29).
+        val nid = WifiTrace.lastNetId
+        @Suppress("DEPRECATION")
+        return when {
+            downMin >= 15 && canToggle(now) -> {
+                lastToggleMs = now; togglesToday++
+                helper("toggle")
+            }
+            downMin >= 10 && now - lastKickMs >= 15 * 60_000L -> {
+                lastKickMs = now
+                "WifiManager.disconnect() = ${wm.disconnect()} + reconnect() = ${wm.reconnect()} (down $downMin min)"
+            }
+            downMin >= 5 && nid >= 0 && now - lastEnableNetMs >= 10 * 60_000L -> {
+                // connectToUserSelectNetwork(): without modify rights it logs 'Allowing uid ... with insufficient
+                // permissions to connect' and still starts the connect - also when the network's selection status is
+                // disabled (DISABLED_NO_INTERNET_*, ...BY_WRONG_PASSWORD, auth/assoc/DHCP temp disables).
+                lastEnableNetMs = now
+                "WifiManager.enableNetwork($nid, true) = ${wm.enableNetwork(nid, true)} (down $downMin min)"
+            }
+            else -> {
+                val ok = runCatching { wm.reconnect() }.getOrDefault(false)
+                if (!ok) {
+                    if (s.bad == BAD_TICKS_FOR_ACTION) Log.w(TAG, "wifi: reconnect() refused on Android ${Build.VERSION.RELEASE}")
+                    ""
+                } else "WifiManager.reconnect() = true on Android ${Build.VERSION.RELEASE} (attempt ${s.streak + 1}, down $downMin min)"
+            }
+        }
     }
 
-    // Android 9: reconnect() first; from the 2nd action of the same outage disconnect() + reconnect().
-    // Android 10+: report only (see the class doc) - like wifiAction.
+    // -- Wi-Fi helper (target 28; the only way to call setWifiEnabled() on Android 10 without root) --
+    private var lastToggleMs = 0L
+    private var lastKickMs = 0L
+    private var lastEnableNetMs = 0L
+    private var togglesToday = 0
+    private var togglesDay = -1
+
+    private fun helperInstalled(): Boolean =
+        runCatching { ctx.packageManager.getPackageInfo(HELPER_PKG, 0); true }.getOrDefault(false)
+
+    private fun canToggle(now: Long): Boolean {
+        val day = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        if (day != togglesDay) { togglesDay = day; togglesToday = 0 }
+        return togglesToday < MAX_TOGGLES_PER_DAY &&
+            (lastToggleMs == 0L || now - lastToggleMs >= 30 * 60_000L) &&
+            lastKickMs != 0L && now - lastKickMs >= 5 * 60_000L &&     // the gentler steps first
+            helperInstalled()
+    }
+
+    /** Explicit ordered broadcast to the helper; its answer (code 1 done / 0 refused + one line) is logged when it
+     *  arrives. "" = helper not installed (report only). [onResult] gets that line (the MQTT 'helper:' hook). */
+    fun helper(cmd: String, onResult: ((String) -> Unit)? = null): String {
+        if (!helperInstalled()) {
+            Log.w(TAG, "wifi helper not installed - '$cmd' not possible on Android ${Build.VERSION.RELEASE}")
+            onResult?.invoke("helper not installed"); return ""
+        }
+        val i = Intent("$HELPER_PKG.CMD").setComponent(ComponentName(HELPER_PKG, "$HELPER_PKG.WifiRecoveryReceiver"))
+            .putExtra("cmd", cmd).addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+        return runCatching {
+            ctx.sendOrderedBroadcast(i, null, object : BroadcastReceiver() {
+                override fun onReceive(c: Context, r: Intent) {
+                    val line = "helper $cmd -> code=$resultCode ${resultData ?: "(no answer: helper missing or crashed)"}"
+                    Log.w(TAG, line); onResult?.invoke(line)
+                }
+            }, handler, -1, null, null)
+            "helper($cmd) sent"
+        }.getOrElse { "helper($cmd) failed: ${it.message}" }
+    }
+
+    // Android 9: reconnect() only (wifi recovery 2026-10-29: disconnect() + reconnect() removed, see the class doc).
+    // Android 10+: report only (see the class doc).
     @Suppress("DEPRECATION")
     private fun lanAction(s: CheckState): String {
         if (Build.VERSION.SDK_INT != Build.VERSION_CODES.P) {
@@ -458,12 +543,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             return ""
         }
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
-        return if (s.streak == 0) {
-            "WifiManager.reconnect() = ${wm.reconnect()}"
-        } else {
-            val d = wm.disconnect()
-            "WifiManager.disconnect() = $d + reconnect() = ${wm.reconnect()}"
-        }
+        return "WifiManager.reconnect() = ${wm.reconnect()}"
     }
 
     private fun countToday() {
@@ -519,5 +599,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** Repeats of the same (non-lan) action back off 1, 2, 4, 8 ... min (the tick is only 30 s). */
         private const val ACTION_BACKOFF_BASE_MS = 60_000L
         private const val LAN_PROBE_TIMEOUT_MS = 3_000
+        const val HELPER_PKG = "com.aeonos.portalha.wifihelper"
+        private const val MAX_TOGGLES_PER_DAY = 4
     }
 }

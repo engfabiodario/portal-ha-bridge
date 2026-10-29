@@ -24,8 +24,24 @@ object WifiTrace {
         "wpa_supplicant:I", "WifiClientModeImpl:D", "WifiStateMachine:D", "WifiNetworkSelector:D",
         "WifiConnectivityManager:D", "WifiConfigManager:D", "WificondScannerImpl:D", "WificondControl:D",
         "WifiScanningService:D", "WifiDiagnosticStateMachine:D", "FbaWifiEvent:D", "IpClient.wlan0:D",
-        "SupplicantStaIfaceHal:D", "WifiService:I", "SelfHeal:I"
+        "SupplicantStaIfaceHal:D", "WifiService:I", "SelfHeal:I",
+        // fleet (wifi recovery 2026-10-29): the framework's own Wi-Fi shutdown/restart paths (AOSP 10 SelfRecovery
+        // 'STA interface down, disable wifi' / 'Already restarted wifi (2) times ... Disabling wifi', WifiController
+        // 'Recovery has been throttled, disable wifi', last-resort watchdog, HAL/driver), and the helper's lines.
+        "SelfRecovery:V", "WifiController:V", "WifiLastResortWatchdog:V", "WifiNative:I", "WifiVendorHal:I",
+        "HalDevMgr:I", "ClientModeManager:V", "ActiveModeWarden:V", "WifiHAL:I", "PortalWifiHelper:V"
     )
+    /** Framework network id of the last connect attempt ('CMD_START_CONNECT ... nid=N' / 'Evaluator selects "x":N').
+     *  Apps without location get networkId -1 from getConnectionInfo(), so SelfHeal takes it from here for
+     *  enableNetwork(nid, true). -1 = not seen yet. */
+    @Volatile var lastNetId = -1
+        private set
+    private val NID = Regex("""CMD_START_CONNECT .* nid=(\d+)|Evaluator selects ".*":(\d+)""")
+    /** Outage snapshots (wifi/outage-<start>.txt, newest 7 kept, never rotated): every line from the first
+     *  'Entering DisconnectedState' for 30 min, so a multi-day outage keeps its start
+     *  even after wifi-trace.txt + .1 (2 MB) rotated past it. */
+    private const val SNAP_MS = 30 * 60_000L
+    private const val SNAP_KEEP = 7
 
     @Volatile private var running = false
     @Volatile private var process: Process? = null
@@ -72,10 +88,29 @@ object WifiTrace {
                     }
                 }
                 runCatching { out.close() }
+                runCatching { snapOut?.close() }; snapOut = null
             } catch (e: Exception) {
                 Log.w(TAG, "wifi trace: reader stopped: ${e.message} (READ_LOGS granted?)")
             }
             if (running) runCatching { Thread.sleep(60_000L) }
+        }
+    }
+
+    private var snapOut: FileWriter? = null
+    private var snapUntil = 0L
+    private fun snapshot(dir: File, line: String) {
+        val now = System.currentTimeMillis()
+        if (snapOut == null && line.contains("WifiDiagnosticStateMachine: Entering DisconnectedState")) {
+            runCatching {
+                val f = File(dir, "outage-" + java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(java.util.Date(now)) + ".txt")
+                snapOut = FileWriter(f, true); snapUntil = now + SNAP_MS
+                dir.listFiles { x -> x.name.startsWith("outage-") }?.sortedBy { it.name }?.dropLast(SNAP_KEEP)?.forEach { it.delete() }
+            }
+        }
+        val o = snapOut ?: return
+        runCatching { o.write(line); o.write("\n"); o.flush() }
+        if (now > snapUntil) {   // a fixed 30-min window: the nightly flaps (5-8 drops) stay in ONE file
+            runCatching { o.close() }; snapOut = null
         }
     }
 }

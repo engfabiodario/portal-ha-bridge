@@ -2959,6 +2959,17 @@ class BridgeService : Service() {
         when {
             cmd.startsWith("test:", ignoreCase = true) -> { selfHeal?.setTest(cmd.substring(5)); return }
             cmd.equals("tick", ignoreCase = true) -> { selfHeal?.tickNow(); return }
+            // fleet (wifi recovery): 'helper:status|probe|assert_on' -> the Wi-Fi helper; its answer goes to
+            // .../selfheal/status_line. Only commands that cannot take a working link down are reachable remotely
+            // (when MQTT reaches us, Wi-Fi is up by definition): kick/toggle stay SelfHeal-internal.
+            cmd.startsWith("helper:", ignoreCase = true) -> {
+                val h = cmd.substring(7).trim().lowercase()
+                val topic = "portal/${p.deviceId}/selfheal/status_line"
+                if (h !in setOf("status", "probe", "assert_on")) { publishRaw(topic, "helper: '$h' not allowed remotely", 0, retained = false); return }
+                val sent = selfHeal?.helper(h) { line -> publishRaw(topic, line, 0, retained = false) }
+                if (sent == null) publishRaw(topic, "helper: self-heal not running", 0, retained = false)
+                return
+            }
             cmd.equals("status", ignoreCase = true) -> {
                 val line = selfHeal?.status() ?: "status n/a (service starting)"
                 Log.i("SelfHeal", line)
