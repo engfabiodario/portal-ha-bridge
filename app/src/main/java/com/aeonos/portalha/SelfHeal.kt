@@ -198,6 +198,22 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     /** adb selfHealTick: run one check now (counts as a tick). */
     fun tickNow() { handler.post { runCheck("adb") } }
 
+    /** MQTT 'test:enablenet' (fleet 2026-10-29): proves the Android 10 ladder's step 2 on a CONNECTED Portal without
+     *  touching the link - enableNetwork(lastNid, true) on the network it is already on is a no-op in AOSP 10
+     *  (connectToUserSelectNetwork 'already connecting/connected'); WifiService logs 'enableNetwork uid=...'.
+     *  Refused while the link is down (there it would be the real step) or before a nid was seen. */
+    fun enableNetTest(): String {
+        val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return "enablenet: no WifiManager"
+        val nid = WifiTrace.lastNetId
+        if (nid < 0) return "enablenet: refused - no network id seen in the Wi-Fi trace yet (nid=-1)"
+        if (!evalWifi().startsWith("ok")) return "enablenet: refused - the Wi-Fi link is down (that is the real step, not a test)"
+        @Suppress("DEPRECATION")
+        val ok = runCatching { wm.enableNetwork(nid, true) }.getOrElse { Log.w(TAG, "enablenet: ${it.message}"); false }
+        val line = "enablenet: WifiManager.enableNetwork($nid, true) = $ok while connected (no-op)"
+        Log.w(TAG, line)
+        return line
+    }
+
     /** Re-send the HA state (MQTT just connected, HA birth, the 20 s re-publish). */
     fun republish() { handler.post { publish(force = true) } }
 
@@ -206,7 +222,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         return "status enabled=$enabled state=${stateNow()} ticks=$ticks $parts fake=${fake?.id ?: "none"} " +
             "actionsToday=$actionsToday lastAction='$lastAction' lastReason='$lastReason' " +
             "lan='${checks.getValue(Check.LAN).last}' lanTargets='$lanTargetsText' lanProbed='$lanProbedText' " +
-            "lanFast=$lanFastScheduled publishes=$publishes"
+            "lanFast=$lanFastScheduled publishes=$publishes nid=${WifiTrace.lastNetId}"
     }
 
     private fun stateNow() = if (!enabled) "off" else state
@@ -412,8 +428,12 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         }
         if (s.streak > 0) {
             // Near-real-time (Fabio 2026-10-12): checks every 30 s; repeats back off from 1 min (1, 2, 4 ... min).
+            // fleet (2026-10-29): the doubling is capped BEFORE the shift. 'base shl (streak - 1)' overflowed a Long once
+            // streak reached ~48 (two days of hourly retries): Upstairs Hallway Guest 10-28 logged 'wifi: backing off
+            // (9223372036743293s left)' and self-heal never acted again. Wi-Fi repeats are capped at 8 min.
             val base = if (c == Check.LAN) LAN_BACKOFF_BASE_MS else ACTION_BACKOFF_BASE_MS
-            val wait = (base shl (s.streak - 1)).coerceAtMost(HOUR_MS) - 5_000L
+            val cap = if (c == Check.WIFI) WIFI_BACKOFF_MAX_MS else HOUR_MS
+            val wait = (base shl (s.streak - 1).coerceIn(0, BACKOFF_MAX_SHIFT)).coerceAtMost(cap) - 5_000L
             if (now - s.lastActionMs < wait) {
                 Log.i(TAG, "${c.id}: backing off (${(wait - (now - s.lastActionMs)) / 1000}s left)"); return
             }
@@ -598,6 +618,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         private const val LAN_BACKOFF_BASE_MS = 60_000L
         /** Repeats of the same (non-lan) action back off 1, 2, 4, 8 ... min (the tick is only 30 s). */
         private const val ACTION_BACKOFF_BASE_MS = 60_000L
+        /** Wi-Fi link down: repeats back off 1, 2, 4, 8, 8, 8 ... min (still at most [MAX_PER_HOUR] an hour). */
+        private const val WIFI_BACKOFF_MAX_MS = 8 * 60_000L
+        /** 60 s shl 6 = 64 min > HOUR_MS: no cap needs a bigger shift, and no Long can overflow. */
+        private const val BACKOFF_MAX_SHIFT = 6
         private const val LAN_PROBE_TIMEOUT_MS = 3_000
         const val HELPER_PKG = "com.aeonos.portalha.wifihelper"
         private const val MAX_TOGGLES_PER_DAY = 4

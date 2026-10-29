@@ -2957,6 +2957,11 @@ class BridgeService : Service() {
         //   'status' = selfHealStatus (also published once, not retained, on portal/<id>/selfheal/status_line).
         val cmd = payload.trim()
         when {
+            cmd.equals("test:enablenet", ignoreCase = true) -> {
+                val line = selfHeal?.enableNetTest() ?: "enablenet: self-heal not running"
+                publishRaw("portal/${p.deviceId}/selfheal/status_line", line, 0, retained = false)
+                return
+            }
             cmd.startsWith("test:", ignoreCase = true) -> { selfHeal?.setTest(cmd.substring(5)); return }
             cmd.equals("tick", ignoreCase = true) -> { selfHeal?.tickNow(); return }
             // fleet (wifi recovery): 'helper:status|probe|assert_on' -> the Wi-Fi helper; its answer goes to
