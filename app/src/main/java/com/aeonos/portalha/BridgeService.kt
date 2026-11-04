@@ -340,6 +340,7 @@ class BridgeService : Service() {
             // Assistant keep-alive (Android 9+): a resume may have covered the parked assistant, and
             // the corner cover follows the dashboard (see AvaKeepAlive).
             if (fg) instance?.keepAlive?.onDashboardResumed() else instance?.keepAlive?.onDashboardPaused()
+            if (fg) instance?.avaMic?.onDashboardResumed()
             if (fg) { instance?.onDashboardFrontInDesktop(); userLeftDashboard = false; instance?.clearForegroundSteal() }
             // We just lost the front and nothing marked it a deliberate departure. That covers
             // both shapes of steal: an app that sends a leave hint (an Alexa announcement — see
@@ -1236,6 +1237,8 @@ class BridgeService : Service() {
         val kaPause = AvaKeepAlive.clampPauseUntil(p.keepAlivePausedUntil)
         if (kaPause != p.keepAlivePausedUntil) p.keepAlivePausedUntil = kaPause
         keepAlive = AvaKeepAlive(this, keepAliveHost).also { it.start(p.avaKeepAlive, p.keepAlivePackage, kaPause) }
+        // Android 11+ (Echo Show): the assistant's background-started service gets no microphone - see AvaMicStarter.
+        avaMic = AvaMicStarter(this) { dashboardForeground }.also { it.start() }
         selfHeal = SelfHeal(this, selfHealHost).also { it.start(p.selfHeal) }
         bridgeMemory = BridgeMemory(this) { state, attrs -> publishBridgeMemory(state, attrs) }.also { it.start() }
         smartCamera = SmartCamera(this).takeIf { it.available() }?.also { sc ->
@@ -1398,6 +1401,7 @@ class BridgeService : Service() {
         serviceAlive = false
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
+        runCatching { avaMic?.stop() }; avaMic = null
         runCatching { selfHeal?.stop() }; selfHeal = null
         runCatching { bridgeMemory?.stop() }; bridgeMemory = null
         runCatching { WifiTrace.stop() }
@@ -2995,6 +2999,7 @@ class BridgeService : Service() {
 
     // -- Assistant keep-alive (AvaKeepAlive, Android 9+) -----------------------------
     private var keepAlive: AvaKeepAlive? = null
+    private var avaMic: AvaMicStarter? = null
 
     private val keepAliveHost = object : AvaKeepAlive.Host {
         override fun parkBlocker(): String? = when {
