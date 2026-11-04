@@ -63,6 +63,9 @@
     <uses-permission android:name="com.facebook.portal.permission.SMART_CAMERA_CONTROL" />
     <queries>
         <package android:name="com.facebook.portal.aiservice" />
+        <!-- Android 11+ package visibility (Echo Show): AvaMicStarter starts Ava's voice service and sends its
+             mic / overlay broadcasts - without this the Bridge can't see Ava at all ('not installed', 2026-11-04) -->
+        <package android:name="com.example.ava" />
     </queries>
 
     <!--
