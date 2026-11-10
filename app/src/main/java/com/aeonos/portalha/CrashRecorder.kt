@@ -24,6 +24,13 @@ import java.util.Locale
  *    heartbeat without clean=true = "previous run ended unexpectedly at <last heartbeat>" (logged +
  *    crash/previous-exit.txt; an app install/update after that heartbeat is named as the likely cause).
  *
+ * fleet (2026-11-09, audit bridge-code.2): the heartbeat also carries elapsedRealtime (er=) and the kernel boot id
+ * (boot=), so the verdict tells a process death inside the same boot ('same boot, process gone N s after its last
+ * heartbeat') from a reboot / power loss - wall-clock stamps alone mislead (Kitchen 10-31: the clock was 16 days behind
+ * after a boot without network). After an unexpected end the service saves what Android logged about the old pid:
+ * crash/exit-MMdd-HHmmss.txt = the events / system / main / crash buffer lines naming the package or the old pid
+ * (am_kill, am_proc_died, lowmemorykiller, ANR, WIN DEATH ...), capped at [EXIT_DUMP_LINES] lines, newest 7 kept.
+ *
  * Path on the Portal: /sdcard/Android/data/com.aeonos.portalha/files/crash/ (Fleet Agent /fs/read).
  * Writes nothing outside that folder; never throws.
  */
@@ -31,6 +38,11 @@ object CrashRecorder {
     private const val TAG = "CrashRecorder"
     private const val KEEP = 5
     private const val HEARTBEAT_MS = 60_000L
+    private const val EXIT_DUMP_LINES = 500
+    private const val EXIT_KEEP = 7
+
+    private fun bootId(): String =
+        runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim().take(36) }.getOrDefault("?")
 
     @Volatile private var installed = false
     @Volatile private var dir: File? = null
@@ -38,6 +50,7 @@ object CrashRecorder {
     private var hbHandler: Handler? = null
     @Volatile private var hbRunning = false
     @Volatile private var lastPreviousExit = ""
+    private val bootIdCached: String by lazy { bootId() }
 
     private fun crashDir(ctx: Context): File? = dir ?: runCatching {
         val base = ctx.applicationContext.getExternalFilesDir(null) ?: ctx.applicationContext.filesDir
@@ -91,7 +104,14 @@ object CrashRecorder {
                 val i = p.indexOf('='); if (i <= 0) null else p.substring(0, i) to p.substring(i + 1)
             }.toMap()
             val ts = kv["ts"]?.toLongOrNull() ?: 0L
-            if (kv["clean"] == "true") return@runCatching "previous run ended cleanly at ${stamp(ts)}"
+            val er = kv["er"]?.toLongOrNull()
+            val sameBoot = kv["boot"] != null && kv["boot"] == bootId()
+            val boot = when {
+                kv["boot"] == null -> ""
+                sameBoot && er != null -> "; same boot, ${(android.os.SystemClock.elapsedRealtime() - er) / 1000} s after its last heartbeat (uptime then ${er / 1000} s)"
+                else -> "; the Portal REBOOTED since (or lost power)"
+            }
+            if (kv["clean"] == "true") return@runCatching "previous run ended cleanly at ${stamp(ts)}$boot"
             val updated = runCatching {
                 ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime
             }.getOrDefault(0L)
@@ -100,16 +120,45 @@ object CrashRecorder {
                 File(d, "last-crash.txt").lastModified() >= ts -> " (see last-crash.txt)"
                 else -> " (no Java crash recorded: killed - low memory, force-stop, native crash or power loss)"
             }
-            val line = "previous run ended unexpectedly at ${stamp(ts)} (last heartbeat, pid ${kv["pid"] ?: "?"})$cause"
+            val line = "previous run ended unexpectedly at ${stamp(ts)} (last heartbeat, pid ${kv["pid"] ?: "?"})$cause$boot"
             runCatching {
                 File(d, "previous-exit.txt").writeText("recorded=${stamp(System.currentTimeMillis())}\n$line\n")
             }
+            // What Android logged about the old process, while its ring buffers still hold it (own thread: logcat -d is slow).
+            if (sameBoot) kv["pid"]?.let { oldPid -> Thread({ saveExitDump(ctx, d, oldPid, line) }, "portal-ha-exitdump").also { it.isDaemon = true }.start() }
             line
         }.getOrElse { "heartbeat unreadable: ${it.message}" }
         lastPreviousExit = verdict
         Log.i(TAG, "$verdict - files in ${d.absolutePath}")
         startHeartbeat(d)
         return verdict
+    }
+
+    /** crash/exit-<stamp>.txt: every buffer line that names our package or the old pid (capped, newest [EXIT_KEEP] kept). */
+    private fun saveExitDump(ctx: Context, d: File, oldPid: String, verdict: String) {
+        runCatching {
+            val pkg = ctx.packageName
+            val keep = ArrayList<String>()
+            for (buf in listOf("events", "system", "crash", "main")) {
+                val p = ProcessBuilder("logcat", "-d", "-v", "threadtime", "-b", buf, "-t", "20000").redirectErrorStream(true).start()
+                val pidTok = Regex("(^|[^0-9])$oldPid([^0-9]|$)")
+                p.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { l ->
+                        if (l.contains(pkg) || l.contains("lowmemorykiller") || l.contains("lmkd") ||
+                            (l.contains("am_") && pidTok.containsMatchIn(l)) || (l.contains("ActivityManager") && pidTok.containsMatchIn(l))) {
+                            keep += "[$buf] $l"
+                        }
+                    }
+                }
+                runCatching { p.waitFor() }
+            }
+            val lines = if (keep.size > EXIT_DUMP_LINES) keep.takeLast(EXIT_DUMP_LINES) else keep
+            val f = File(d, "exit-" + SimpleDateFormat("MMdd-HHmmss", Locale.US).format(Date()) + ".txt")
+            f.writeText("recorded=${stamp(System.currentTimeMillis())} boot=${bootId()} er=${android.os.SystemClock.elapsedRealtime()}\n" +
+                "$verdict\nold pid $oldPid; ${keep.size} matching line(s), last ${lines.size} kept\n\n" + lines.joinToString("\n") + "\n")
+            d.listFiles { x -> x.name.startsWith("exit-") }?.sortedBy { it.name }?.dropLast(EXIT_KEEP)?.forEach { it.delete() }
+            Log.i(TAG, "exit dump: ${f.name} (${lines.size} lines about pid $oldPid)")
+        }.onFailure { Log.w(TAG, "exit dump failed: ${it.message}") }
     }
 
     /** Service destroyed normally: mark the run as ended cleanly. */
@@ -143,7 +192,7 @@ object CrashRecorder {
         val d = dir ?: return
         runCatching {
             val tmp = File(d, "heartbeat.tmp")
-            tmp.writeText("ts=${System.currentTimeMillis()} pid=${Process.myPid()} clean=$clean\n")
+            tmp.writeText("ts=${System.currentTimeMillis()} pid=${Process.myPid()} clean=$clean er=${android.os.SystemClock.elapsedRealtime()} boot=$bootIdCached\n")
             if (!tmp.renameTo(File(d, "heartbeat.txt"))) {
                 File(d, "heartbeat.txt").writeText(tmp.readText()); tmp.delete()
             }

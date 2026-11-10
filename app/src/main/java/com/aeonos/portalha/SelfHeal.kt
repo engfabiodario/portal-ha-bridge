@@ -69,6 +69,18 @@ import java.util.Locale
  * the Bridge') and on every MQTT (re)connect / HA birth / switch change (fleet 2026-10-22: it was every tick
  * = ~720 HA DB rows/h fleet-wide just for last_check).
  *
+ * fleet (2026-11-09, audit bridge-code.1/.6/.10/.11):
+ *  - stream: a (re)start is 'wait: stream just started' for 60 s - it neither counts as bad nor resets the streak (it
+ *    read 'n/a' and reset it, so a camera refused 'from background' flapped ok/fixing while it never recovered and the
+ *    backoff never grew). Right after a start the 4 s rtsp health check's verdict 'camera not open' (or the camera's
+ *    own open refusal) IS the bad reason. Stream repeats back off 1, 2, 4, 8, 8 ... min, at most [STREAM_MAX_PER_HOUR].
+ *  - an action that did nothing (MQTT 'no session to drop') is not counted; the per-tick 'backing off' / 'no action'
+ *    lines are logged once per outage step instead of every 30 s (they ate the Wi-Fi trace on the Portal 10").
+ *  - busy (call, cast, desktop, navigate page ...): the wifi / lan / mqtt checks still run and report (attributes
+ *    busy + busy_since); the only action allowed while busy is the plain WifiManager.reconnect() (Android 9 also
+ *    setWifiEnabled(true)) on a link that is actually down. Stream / webview / keep-alive actions stay skipped.
+ *  - every 'lan: ok -> bad' logs the link (rssi, link speed, frequency, supplicant state, AP suffix from the trace).
+ *
  * Test hooks (adb DEBUG_CONFIG): selfHealTest mqtt|stream|webview|none fakes that check failing
  * until its action has fired once; selfHealTick runs a check now; selfHealStatus logs a status line.
  * The same over MQTT (wall Portals have no adb): portal/<id>/selfheal/set payload 'test:<check>', 'tick' or
@@ -84,6 +96,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         fun mqttReconnect(): String
         /** null = stream not wanted (camera/stream off by the user) or not judgeable yet; else ms since the last encoded frame. */
         fun streamFrameAgeMs(): Long?
+        /** Why the camera is known NOT open right now (the 4 s rtsp health check / the camera's own refusal), or null. */
+        fun streamCameraIssue(): String? = null
+        /** One line about the Wi-Fi link (rssi, link speed, frequency, AP) for the 'lan: ok -> bad' log line. */
+        fun wifiLinkInfo(): String = ""
         fun streamRestart(): String
         /** null = no PLAYing RTSP client (n/a); true = at least one received data recently; false = none did. */
         fun rtspClientsReceiving(): Boolean? = null
@@ -110,6 +126,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         var lastActionMs = 0L
         var wifiReconnected = false        // wifi: reconnect() already used for this outage
         var downSinceMs = 0L               // wifi: elapsedRealtime the outage started (0 = not down)
+        var quietKey = ""                  // the last 'backing off' / 'no action' line logged (once per step)
     }
 
     private val thread = HandlerThread("portal-ha-selfheal").also { it.start() }
@@ -131,6 +148,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     @Volatile private var lanBadSinceWall = 0L
     private var lastLanRunMs = 0L
     @Volatile private var lanFastScheduled = false
+    @Volatile private var busyNow = ""
+    @Volatile private var busySinceWall = 0L
     private var actionsToday = 0
     private var actionsDay = -1
     // Publish dedup (handler thread only): the last payload sent without its times, and when.
@@ -219,7 +238,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     fun status(): String {
         val parts = checks.entries.joinToString(" ") { (c, s) -> "${c.id}=${s.last.substringBefore(':')}/${s.bad}" }
-        return "status enabled=$enabled state=${stateNow()} ticks=$ticks $parts fake=${fake?.id ?: "none"} " +
+        return "status enabled=$enabled state=${stateNow()} ticks=$ticks busy='$busyNow' $parts fake=${fake?.id ?: "none"} " +
             "actionsToday=$actionsToday lastAction='$lastAction' lastReason='$lastReason' " +
             "lan='${checks.getValue(Check.LAN).last}' lanTargets='$lanTargetsText' lanProbed='$lanProbedText' " +
             "lanFast=$lanFastScheduled publishes=$publishes nid=${WifiTrace.lastNetId}"
@@ -233,12 +252,21 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         if (!started) return
         if (!enabled) { publish(); return }
         val busy = runCatching { host.busyReason() }.getOrNull()
+        noteBusy(busy)
         if (busy != null) {
-            if (busy != lastSkip) { lastSkip = busy; Log.i(TAG, "check skipped: $busy") }
-            publish()   // the heartbeat only (nothing changed)
+            if (busy != lastSkip) { lastSkip = busy; Log.i(TAG, "busy ($busy): only the wifi / lan / mqtt checks run (plain Wi-Fi reconnect only)") }
+            ticks++
+            lastCheckWall = System.currentTimeMillis()
+            val w = evalWifi()
+            judge(Check.WIFI, w, busy = busy)
+            if (SystemClock.elapsedRealtime() - lastLanRunMs >= LAN_FAST_MS - 10_000L) judgeLan(w, busy)
+            judge(Check.MQTT, evalMqtt(), skipActionWhy = "busy: $busy")
+            updateState(why)
+            publish()
+            scheduleLanFast()
             return
         }
-        if (lastSkip.isNotEmpty()) { Log.i(TAG, "checks resumed (was: $lastSkip)"); lastSkip = "" }
+        if (lastSkip.isNotEmpty()) { Log.i(TAG, "all checks resumed (was busy: $lastSkip)"); lastSkip = "" }
         ticks++
         lastCheckWall = System.currentTimeMillis()
 
@@ -268,22 +296,29 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     private fun runLanOnly(why: String) {
         if (!started || !enabled) return
         val busy = runCatching { host.busyReason() }.getOrNull()
-        if (busy != null) {
-            if (busy != lastSkip) { lastSkip = busy; Log.i(TAG, "check skipped: $busy") }
-            return
-        }
+        noteBusy(busy)
         lastCheckWall = System.currentTimeMillis()
-        judgeLan(evalWifi())
+        judgeLan(evalWifi(), busy)
         updateState(why)
         publish()
     }
 
-    private fun judgeLan(wifi: String) {
+    private fun noteBusy(busy: String?) {
+        if (busy == null) { busyNow = ""; busySinceWall = 0L; return }
+        if (busy != busyNow) { busyNow = busy; busySinceWall = System.currentTimeMillis() }
+    }
+
+    private fun judgeLan(wifi: String, busy: String? = null) {
         lastLanRunMs = SystemClock.elapsedRealtime()
-        judge(Check.LAN, evalLan(wifi))
+        judge(Check.LAN, evalLan(wifi), skipActionWhy = busy?.let { "busy: $it" })
         val s = checks.getValue(Check.LAN)
         if (s.bad > 0) {
-            if (lanBadSinceWall == 0L) lanBadSinceWall = System.currentTimeMillis()
+            if (lanBadSinceWall == 0L) {
+                lanBadSinceWall = System.currentTimeMillis()
+                // audit bridge-code.11: the link as Android sees it at the moment the LAN stopped answering.
+                val info = runCatching { host.wifiLinkInfo() }.getOrDefault("")
+                if (info.isNotEmpty()) Log.w(TAG, "lan: ok -> bad - link: $info")
+            }
             if (s.bad >= BAD_TICKS_FOR_ACTION) lastReason = "lan unreachable"
         } else if (lanBadSinceWall != 0L) {
             Log.i(TAG, "lan: reachable again after ${(System.currentTimeMillis() - lanBadSinceWall) / 1000}s")
@@ -375,7 +410,11 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     private fun evalStream(): String {
         if (faked(Check.STREAM)) return "bad: test (selfHealTest stream)"
-        val age = runCatching { host.streamFrameAgeMs() }.getOrNull() ?: return "n/a: stream off or just started"
+        val age = runCatching { host.streamFrameAgeMs() }.getOrNull() ?: return "n/a: stream off"
+        if (age == STREAM_JUST_STARTED) {
+            val issue = runCatching { host.streamCameraIssue() }.getOrNull()
+            return if (issue != null) "bad: $issue" else "wait: stream just started"
+        }
         return if (age <= STREAM_STALE_MS) "ok" else "bad: no camera frames for ${if (age == Long.MAX_VALUE) "ever" else "${age / 1000}s"}"
     }
 
@@ -403,28 +442,45 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         false -> "bad: keep-alive on but Ava not parked"
     }
 
-    private fun judge(c: Check, result: String, skipActionWhy: String? = null) {
+    private fun judge(c: Check, result: String, skipActionWhy: String? = null, busy: String? = null) {
         val s = checks.getValue(c)
         val bad = result.startsWith("bad")
         if (result.substringBefore(':') != s.last.substringBefore(':') || (bad && result != s.last)) {
             Log.i(TAG, "${c.id}: ${s.last} -> $result")
         }
+        // 'wait' (a stream (re)start still coming up): neither bad nor ok - the bad count and the streak are KEPT, so a
+        // stream that never recovers reaches 'failing' and its restarts back off (audit bridge-code.1).
+        if (result.startsWith("wait")) {
+            if (s.bad == 0) s.last = result
+            return
+        }
         s.last = result
         if (!bad) {
-            s.bad = 0; s.streak = 0; s.wifiReconnected = false; s.downSinceMs = 0L
+            s.bad = 0; s.streak = 0; s.wifiReconnected = false; s.downSinceMs = 0L; s.quietKey = ""
             return
         }
         s.bad++
         if (s.bad < BAD_TICKS_FOR_ACTION) return
-        if (skipActionWhy != null) { Log.i(TAG, "${c.id}: no action ($skipActionWhy)"); return }
-        act(c, s, result.removePrefix("bad: "))
+        if (skipActionWhy != null) { quiet(c, s, "no action ($skipActionWhy)"); return }
+        act(c, s, result.removePrefix("bad: "), busy)
     }
 
-    private fun act(c: Check, s: CheckState, reason: String) {
+    /** A 'no action' / 'backing off' line: logged once per outage step, not on every 30 s tick (audit bridge-code.6). */
+    private fun quiet(c: Check, s: CheckState, line: String, key: String = line) {
+        val k = "${s.streak}|$key"
+        if (k == s.quietKey) return
+        s.quietKey = k
+        Log.i(TAG, "${c.id}: $line")
+    }
+
+    private fun maxPerHour(c: Check) = if (c == Check.STREAM) STREAM_MAX_PER_HOUR else MAX_PER_HOUR
+
+    private fun act(c: Check, s: CheckState, reason: String, busy: String? = null) {
         val now = SystemClock.elapsedRealtime()
         while (s.actions.isNotEmpty() && now - s.actions.first() > HOUR_MS) s.actions.removeFirst()
-        if (s.actions.size >= MAX_PER_HOUR) {
-            Log.w(TAG, "${c.id}: no action - ${s.actions.size} in the last hour (limit $MAX_PER_HOUR)"); return
+        val limit = maxPerHour(c)
+        if (s.actions.size >= limit) {
+            quiet(c, s, "no action - ${s.actions.size} in the last hour (limit $limit)", "limit"); return
         }
         if (s.streak > 0) {
             // Near-real-time (Fabio 2026-10-12): checks every 30 s; repeats back off from 1 min (1, 2, 4 ... min).
@@ -432,10 +488,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             // streak reached ~48 (two days of hourly retries): Upstairs Hallway Guest 10-28 logged 'wifi: backing off
             // (9223372036743293s left)' and self-heal never acted again. Wi-Fi repeats are capped at 8 min.
             val base = if (c == Check.LAN) LAN_BACKOFF_BASE_MS else ACTION_BACKOFF_BASE_MS
-            val cap = if (c == Check.WIFI) WIFI_BACKOFF_MAX_MS else HOUR_MS
+            val cap = if (c == Check.WIFI || c == Check.STREAM) WIFI_BACKOFF_MAX_MS else HOUR_MS
             val wait = (base shl (s.streak - 1).coerceIn(0, BACKOFF_MAX_SHIFT)).coerceAtMost(cap) - 5_000L
             if (now - s.lastActionMs < wait) {
-                Log.i(TAG, "${c.id}: backing off (${(wait - (now - s.lastActionMs)) / 1000}s left)"); return
+                quiet(c, s, "backing off (${(wait - (now - s.lastActionMs)) / 1000}s left; next is attempt ${s.streak + 1})", "backoff"); return
             }
         }
         val what: String = runCatching {
@@ -445,7 +501,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
                 Check.RTSPCLIENTS -> host.rtspEvictStalled()
                 Check.WEBVIEW -> host.webviewReload()
                 Check.KEEPALIVE -> host.keepAliveRepark()
-                Check.WIFI -> wifiAction(s)
+                Check.WIFI -> if (busy != null) wifiPlainAction(s, busy) else wifiAction(s)
                 Check.LAN -> lanAction(s)
             }
         }.getOrElse { "failed: ${it.message}" }
@@ -513,6 +569,18 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
                 } else "WifiManager.reconnect() = true on Android ${Build.VERSION.RELEASE} (attempt ${s.streak + 1}, down $downMin min)"
             }
         }
+    }
+
+    /** While busy (a call, cast, desktop ...): only what cannot cut a live session - the link is DOWN already. */
+    @Suppress("DEPRECATION")
+    private fun wifiPlainAction(s: CheckState, busy: String): String {
+        val wm = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: return ""
+        if (!wm.isWifiEnabled) {
+            return if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P)
+                "WifiManager.setWifiEnabled(true) = ${wm.setWifiEnabled(true)} (busy: $busy)" else ""
+        }
+        val ok = runCatching { wm.reconnect() }.getOrDefault(false)
+        return if (ok) "WifiManager.reconnect() = true (busy: $busy - plain reconnect only, attempt ${s.streak + 1})" else ""
     }
 
     // -- Wi-Fi helper (target 28; the only way to call setWifiEnabled() on Android 10 without root) --
@@ -583,7 +651,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val core = "\"last_action\":\"${esc(lastAction)}\",\"last_reason\":\"${esc(lastReason)}\"," +
             "\"actions_today\":$actionsToday,\"checks\":{$checksJson}," +
             "\"lan\":\"${esc(checks.getValue(Check.LAN).last)}\",\"lan_targets\":\"${esc(lanTargetsText)}\"," +
-            "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}"
+            "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}," +
+            "\"busy\":${if (busyNow.isEmpty()) "null" else "\"${esc(busyNow)}\""}," +
+            "\"busy_since\":${if (busySinceWall == 0L) "null" else "\"${isoOf(busySinceWall)}\""}"
         val state = stateNow()
         val key = "$state|$core"
         val now = SystemClock.elapsedRealtime()
@@ -611,6 +681,11 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         private const val BAD_TICKS_FOR_ACTION = 2
         private const val FAILING_TICKS = 3
         private const val MAX_PER_HOUR = 6
+        /** Stream restarts: 1, 2, 4, 8, 8 ... min apart (audit bridge-code.1: the hourly cap of 6 left a cause that cleared
+         *  mid-hour unretried for up to 51 min). */
+        private const val STREAM_MAX_PER_HOUR = 10
+        /** Host.streamFrameAgeMs(): a (re)start is still coming up (not judged; see 'wait'). */
+        const val STREAM_JUST_STARTED = -1L
         private const val HOUR_MS = 60 * 60_000L
         const val LAN_FAST_MS = 30_000L
         /** Unchanged state is re-sent this often (HA last_reported; the watcher's freshness window is 12 min). */

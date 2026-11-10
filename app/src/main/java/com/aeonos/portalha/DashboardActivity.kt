@@ -103,6 +103,23 @@ class DashboardActivity : AppCompatActivity() {
         /** True while a dashboard activity exists. */
         fun alive(): Boolean = instance != null
 
+        /** fleet (2026-11-09, audit bridge-code.8): ms the page has been on the 'Failed to load' placeholder (0 = loaded). */
+        fun loadFailedForMs(): Long {
+            val t = instance?.loadFailedAtMs ?: 0L
+            return if (t == 0L) 0L else System.currentTimeMillis() - t
+        }
+
+        /** MQTT (re)connected / HA birth: a dashboard stuck on the placeholder loads again now (no-op otherwise). */
+        fun retryIfFailed(why: String) {
+            val act = instance ?: return
+            act.runOnUiThread {
+                if (act.loadFailedAtMs == 0L || !act::webView.isInitialized) return@runOnUiThread
+                android.util.Log.i("PortalHA", "webview: retrying the failed page now ($why)")
+                act.retryHandler.removeCallbacks(act.loadRetry)
+                act.loadDashboard()
+            }
+        }
+
         /** SelfHeal: full reload of the page the kiosk should be on (the navigate target, else home). */
         fun selfHealReload(): Boolean {
             val act = instance ?: return false
@@ -222,9 +239,15 @@ class DashboardActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                if (url.startsWith("http")) mainFrameErrored = false
                 view.evaluateJavascript(alwaysVisibleJs(), null)
             }
             override fun onPageFinished(view: WebView, url: String) {
+                if (url.startsWith("http") && !mainFrameErrored && loadFailedAtMs != 0L) {
+                    android.util.Log.i("PortalHA", "webview: page loaded again after ${(System.currentTimeMillis() - loadFailedAtMs) / 1000} s on the placeholder ($loadRetryN retries)")
+                    loadFailedAtMs = 0L; loadRetryN = 0
+                    retryHandler.removeCallbacks(loadRetry)
+                }
                 view.evaluateJavascript(alwaysVisibleJs(), null)
                 AvaKeepAlive.onDashboardContentChanged()   // re-copy the corner cover as the page settles
             }
@@ -235,7 +258,16 @@ class DashboardActivity : AppCompatActivity() {
                 handler.proceed() // Accept self-signed certs for local HA
             }
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                if (request.isForMainFrame) showPlaceholder(
+                if (!request.isForMainFrame) return
+                mainFrameErrored = true
+                // fleet (2026-11-09, audit bridge-code.8): the placeholder used to stay until a tap / the nightly reload
+                // (the self-heal probe '1+1' answers on it too). Retry with a backoff 30 s, 1, 2, 4 min, then every 5 min.
+                if (loadFailedAtMs == 0L) loadFailedAtMs = System.currentTimeMillis()
+                val delay = (30_000L shl loadRetryN.coerceAtMost(4)).coerceAtMost(5 * 60_000L)
+                android.util.Log.w("PortalHA", "webview: main frame failed (${error.errorCode} ${error.description}) - placeholder, retry in ${delay / 1000} s")
+                retryHandler.removeCallbacks(loadRetry)
+                retryHandler.postDelayed(loadRetry, delay)
+                showPlaceholder(
                     "Failed to load.<br><br>Swipe in from the <b>left edge</b> to open the menu, " +
                     "then tap <b>Settings</b> to check your Home Assistant URL.")
             }
@@ -631,6 +663,18 @@ class DashboardActivity : AppCompatActivity() {
         })();
     """.trimIndent()
 
+    // fleet (2026-11-09, audit bridge-code.8): the 'Failed to load' retry.
+    @Volatile private var loadFailedAtMs = 0L
+    private var loadRetryN = 0
+    private var mainFrameErrored = false
+    private val retryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val loadRetry = Runnable {
+        if (loadFailedAtMs == 0L || !::webView.isInitialized) return@Runnable
+        loadRetryN++
+        android.util.Log.i("PortalHA", "webview: retry #$loadRetryN of the failed page (${(System.currentTimeMillis() - loadFailedAtMs) / 1000} s on the placeholder)")
+        loadDashboard()
+    }
+
     private fun showPlaceholder(message: String) {
         // Must use loadDataWithBaseURL, not loadData: loadData treats the payload
         // like a URL and chokes on the '#' in hex colors, rendering a blank page.
@@ -662,6 +706,7 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        retryHandler.removeCallbacks(loadRetry)
         runCatching { unregisterReceiver(clearCacheReceiver) }
         if (instance === this) instance = null
         super.onDestroy()

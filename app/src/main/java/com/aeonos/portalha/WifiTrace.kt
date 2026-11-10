@@ -17,6 +17,17 @@ import java.io.FileWriter
  * Readable with the Fleet Agent: /fs/read?path=/sdcard/Android/data/com.aeonos.portalha/files/wifi/wifi-trace.txt
  * Needs READ_LOGS (already granted for the presence monitor); without it, it logs once and does nothing.
  * Never throws; restarts the reader with a 60 s pause if logcat ends.
+ *
+ * fleet (2026-11-09, audit bridge-code.6/.11):
+ *  - NetworkMonitor's HEALTHY re-validation cycle (Forcing reevaluation / GK enabled / Multiple Parallel Probing /
+ *    PROBE_DNS ... OK / PROBE_HTTP(S) ... ret=204 / isCaptivePortal isSuccessful()=true) was 71-76 % of the trace bytes
+ *    on the Portal 10" (1 MB = only ~5 h): those lines are counted, not written - one summary line every 10 min and
+ *    before any other NetworkMonitor line. Every failing / unusual NetworkMonitor line is still written in full.
+ *  - The first 30 min after each Bridge process start also go to wifi/start-MMdd-HHmmss.txt (newest 7 kept), like the
+ *    outage-*.txt snapshots: a process restart in the night keeps its context after the trace rotated past it.
+ *  - Meta's own gateway checker (tags DGW, CollectPingData: 'ConnectivityManager ping failure', gateway ping results)
+ *    is recorded; [lastApSuffix] = the last 3 octets of the AP the supplicant associated with (for SelfHeal's
+ *    'lan: ok -> bad' link line; apps without location get a masked BSSID from WifiInfo).
  */
 object WifiTrace {
     private const val TAG = "PortalHA"
@@ -37,8 +48,24 @@ object WifiTrace {
         // ClientModeImpl 'NETWORK_STATUS_UNWANTED_DISABLE_AUTOJOIN'). Validation itself is NetworkMonitor/<netId>
         // (per-network tag: see [nmTags]); the no-internet notification is NetworkNotificationManager.
         "ConnectivityService:D", "NetworkNotificationManager:D", "NetworkMonitor:D", "WifiNetworkFactory:D",
-        "MultinetworkPolicyTracker:D", "WifiNoInternetDialog:D"
+        "MultinetworkPolicyTracker:D", "WifiNoInternetDialog:D",
+        // fleet (2026-11-09, audit bridge-code.11): Meta's gateway ping checker (seen on the Portal+ in the Kitchen 10-31 logcat).
+        "DGW:V", "CollectPingData:V"
     )
+    /** NetworkMonitor lines of a healthy re-validation (counted, not written). */
+    private val NM_HEALTHY = Regex(
+        "NetworkMonitor/\\d+: (Forcing reevaluation for UID|GK enabled:|Multiple Parallel Probing:|PROBE_DNS \\S+ \\d+ms OK|" +
+        "PROBE_HTTPS? \\S+ time=\\d+ms ret=204 |isCaptivePortal: isSuccessful\\(\\)=true isPortal\\(\\)=false)")
+    private const val NM_SUMMARY_MS = 10 * 60_000L
+    private var nmSuppressed = 0
+    private var nmSuppressedSinceMs = 0L
+    /** Last 3 octets of the AP the supplicant last associated with ('' = not seen yet). */
+    @Volatile var lastApSuffix = ""
+        private set
+    private val AP = Regex("(?:Associated with|CTRL-EVENT-CONNECTED - Connection to) ([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})")
+    private const val START_SNAP_MS = 30 * 60_000L
+    private var startOut: FileWriter? = null
+    private var startUntil = 0L
     /** NetworkMonitor logs as 'NetworkMonitor/<netId>' (Android 10 NetworkStack): logcat -s can't wildcard, so the
      *  reader filters a window of ids from the newest network on (ids only grow, one per (re)connect) and is
      *  restarted with a new window when the Wi-Fi network id gets near its end. */
@@ -79,6 +106,14 @@ object WifiTrace {
         val base = ctx.getExternalFilesDir(null) ?: return
         val dir = File(base, "wifi").apply { mkdirs() }
         running = true
+        // The first 30 min of this process (audit bridge-code.6).
+        runCatching {
+            val now = System.currentTimeMillis()
+            val f = File(dir, "start-" + java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(java.util.Date(now)) + ".txt")
+            startOut = FileWriter(f, true).also { it.write("---- Bridge process start ${java.util.Date(now)} pid=${android.os.Process.myPid()}\n"); it.flush() }
+            startUntil = now + START_SNAP_MS
+            dir.listFiles { x -> x.name.startsWith("start-") }?.sortedBy { it.name }?.dropLast(SNAP_KEEP)?.forEach { it.delete() }
+        }
         thread = Thread({ loop(dir) }, "portal-ha-wifitrace").also { it.isDaemon = true; it.start() }
     }
 
@@ -113,6 +148,22 @@ object WifiTrace {
                     while (running) {
                         val line = r.readLine() ?: break
                         if (line.startsWith("--------- beginning of")) continue
+                        AP.find(line)?.let { m -> lastApSuffix = m.groupValues[1].lowercase().takeLast(8) }
+                        startSnapshot(line)
+                        val tNow = System.currentTimeMillis()
+                        if (line.contains("NetworkMonitor/")) {
+                            if (NM_HEALTHY.containsMatchIn(line)) {
+                                if (nmSuppressed == 0) nmSuppressedSinceMs = tNow
+                                nmSuppressed++
+                                if (tNow - nmSuppressedSinceMs < NM_SUMMARY_MS) continue
+                            }
+                            if (nmSuppressed > 0) {
+                                val sum = "---- NetworkMonitor: $nmSuppressed healthy validation line(s) not written since ${java.util.Date(nmSuppressedSinceMs)}\n"
+                                out.write(sum); size += sum.length
+                                nmSuppressed = 0
+                                if (NM_HEALTHY.containsMatchIn(line)) { out.flush(); continue }
+                            }
+                        }
                         out.write(line); out.write("\n"); out.flush()
                         // fleet (2026-10-29): this per-line hook was MISSING in 73dcfb3/87006cc2 (lastNetId stayed -1,
                         // so SelfHeal's enableNetwork step never ran, and no outage-*.txt was ever written).
@@ -140,6 +191,12 @@ object WifiTrace {
             }
             if (running) runCatching { Thread.sleep(60_000L) }
         }
+    }
+
+    private fun startSnapshot(line: String) {
+        val o = startOut ?: return
+        runCatching { o.write(line); o.write("\n"); o.flush() }
+        if (System.currentTimeMillis() > startUntil) { runCatching { o.close() }; startOut = null }
     }
 
     private var snapOut: FileWriter? = null

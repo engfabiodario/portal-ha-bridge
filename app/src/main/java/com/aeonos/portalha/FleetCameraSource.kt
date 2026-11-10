@@ -3,7 +3,10 @@ package com.aeonos.portalha
 import android.content.Context
 import android.graphics.SurfaceTexture
 import android.view.Surface
+import android.os.SystemClock
+import android.util.Log
 import com.pedro.encoder.input.video.Camera2ApiManager
+import com.pedro.encoder.input.video.CameraCallbacks
 import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.util.sources.video.VideoSource
 
@@ -19,7 +22,7 @@ import com.pedro.library.util.sources.video.VideoSource
 // Same Camera2ApiManager underneath (same session/request/fps handling).
 class FleetCameraSource(context: Context) : VideoSource() {
 
-    private val camera = Camera2ApiManager(context)
+    private val camera = Camera2ApiManager(context).also { it.setCameraCallbacks(openLog) }
     private var surface: Surface? = null
     @Volatile var bufferSize = "?"
         private set
@@ -54,6 +57,41 @@ class FleetCameraSource(context: Context) : VideoSource() {
     }
 
     override fun isRunning(): Boolean = camera.isRunning
+
+    companion object {
+        /**
+         * fleet (2026-11-09, audit bridge-code.m0): ONE log line per camera open result (tag PortalHA, 'camera: ...').
+         * RootEncoder's Camera2ApiManager swallows an open refusal (onError 3 = CAMERA_DISABLED: Android refused
+         * the camera to a process without a visible activity) and the stream still reports 'streaming', so the
+         * result was never recorded. [last] / [lastElapsed] feed self-heal's stream check and the camera revive.
+         */
+        @Volatile var last = "unknown"
+            private set
+        @Volatile var lastElapsed = 0L
+            private set
+        @Volatile var opened = false
+            private set
+        @Volatile var openCount = 0
+            private set
+        @Volatile var refusedCount = 0
+            private set
+        fun status(): String = "camera: last='$last' ${if (lastElapsed == 0L) "never" else "${(SystemClock.elapsedRealtime() - lastElapsed) / 1000}s ago"} opened=$openCount refused=$refusedCount"
+        private val openLog = object : CameraCallbacks {
+            override fun onCameraChanged(facing: CameraHelper.Facing) = Unit
+            override fun onCameraOpened() {
+                opened = true; openCount++; last = "opened"; lastElapsed = SystemClock.elapsedRealtime()
+                Log.i("PortalHA", "camera: opened (front, open #$openCount)")
+            }
+            override fun onCameraDisconnected() {
+                opened = false; last = "disconnected"; lastElapsed = SystemClock.elapsedRealtime()
+                Log.i("PortalHA", "camera: disconnected")
+            }
+            override fun onCameraError(error: String) {
+                opened = false; refusedCount++; last = "refused: $error"; lastElapsed = SystemClock.elapsedRealtime()
+                Log.w("PortalHA", "camera: open refused / error: $error (refusal #$refusedCount)")
+            }
+        }
+    }
 
     /** Experimental camera hop (see RtspStreamer.cameraId). */
     fun openCameraId(id: String) {

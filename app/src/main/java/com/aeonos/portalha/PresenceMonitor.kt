@@ -41,7 +41,8 @@ class PresenceMonitor(private val onPresenceChange: (present: Boolean) -> Unit) 
         running = true
         lastBeatMs = 0L
         present = false
-        readerThread = Thread(::readLoop, "portal-ha-presence-log").also { it.isDaemon = true; it.start() }
+        val g = ++gen
+        readerThread = Thread({ readLoop(g) }, "portal-ha-presence-log").also { it.isDaemon = true; it.start() }
         checkHandler.post(checkRunnable)
         Log.i(TAG, "PresenceMonitor started")
     }
@@ -60,7 +61,35 @@ class PresenceMonitor(private val onPresenceChange: (present: Boolean) -> Unit) 
         checkThread.quitSafely()
     }
 
-    private fun readLoop() {
+    // fleet (2026-11-09, audit bridge-code.9): the reader ran logcat ONCE - if logcat ended (EOF / exception) the thread
+    // was gone while 'running' stayed true, so presence went silently dead until the next Bridge restart. Now it starts
+    // logcat again with a backoff (2 s doubling to 60 s, reset after a reader that lived 5 min); a replayed backlog line
+    // is still ignored by its own epoch stamp (FRESH_MS). Liveness for the self-heal status line: [status].
+    @Volatile private var readerStarts = 0
+    @Volatile private var readerAlive = false
+    @Volatile private var lastReaderEnd = ""
+    fun status(): String = "presence: reader=${if (!running) "stopped" else if (readerAlive) "alive" else "restarting"} starts=$readerStarts lastEnd='$lastReaderEnd'"
+
+    @Volatile private var gen = 0
+    private fun readLoop(myGen: Int) {
+        var backoff = 2_000L
+        while (running && myGen == gen) {
+            val began = android.os.SystemClock.elapsedRealtime()
+            readerStarts++
+            readerAlive = true
+            val why = readOnce()
+            readerAlive = false
+            if (!running || myGen != gen) break
+            lastReaderEnd = why
+            if (android.os.SystemClock.elapsedRealtime() - began > 5 * 60_000L) backoff = 2_000L
+            Log.w(TAG, "PresenceMonitor reader ended ($why) - restarting in ${backoff / 1000} s (start #${readerStarts + 1})")
+            runCatching { Thread.sleep(backoff) }
+            backoff = (backoff * 2).coerceAtMost(60_000L)
+        }
+    }
+
+    /** One logcat session; returns why it ended. */
+    private fun readOnce(): String {
         try {
             // -v epoch → each line is prefixed with a Unix timestamp we can age-check.
             val p = ProcessBuilder(
@@ -89,8 +118,12 @@ class PresenceMonitor(private val onPresenceChange: (present: Boolean) -> Unit) 
                     }
                 }
             }
+            runCatching { process?.destroy() }
+            return "logcat ended"
         } catch (e: Exception) {
             Log.w(TAG, "PresenceMonitor reader stopped: ${e.message} (READ_LOGS granted?)")
+            runCatching { process?.destroy() }
+            return "error: ${e.message}"
         }
     }
 
