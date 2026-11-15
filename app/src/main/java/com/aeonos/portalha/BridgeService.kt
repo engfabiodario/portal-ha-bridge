@@ -1147,6 +1147,7 @@ class BridgeService : Service() {
     private val timeoutRunnable = object : Runnable {
         override fun run() {
             checkScreenTimeout()
+            runCatching { reconcileWebPause("tick") }
             runCatching { checkScreensaver() }.onFailure { Log.w(TAG, "screensaver check: ${it.message}") }
             runCatching { checkCallReturn() }.onFailure { Log.w(TAG, "call-return check: ${it.message}") }
             timeoutHandler.postDelayed(this, 15_000L)
@@ -1566,6 +1567,7 @@ class BridgeService : Service() {
                 when (intent.action) {
                     Intent.ACTION_SCREEN_ON -> {
                         screenOn = true
+                        reconcileWebPause("screen on")
                         lastActivityMs = System.currentTimeMillis()  // restart the off-timer
                         publishState("ON"); reclaimForeground()
                         keepAlive?.onScreen(true)
@@ -1604,6 +1606,7 @@ class BridgeService : Service() {
                     }
                     Intent.ACTION_SCREEN_OFF -> {
                         screenOn = false; publishState("OFF")
+                        reconcileWebPause("screen off")
                         if (desktopMode) endDesktopNow("screen off")   // the camera must never stay off overnight
                         keepAlive?.onScreen(false)
                         // Put the cover up NOW, while the panel is dark, so it is already
@@ -1756,6 +1759,12 @@ class BridgeService : Service() {
         Handler(Looper.getMainLooper()).post {
             intercomOverlays.forEach { runCatching { it.bringToFront() } }
         }
+    }
+
+    /** Dashboard WebView pause (DashboardActivity.setCovered): screen off or the photos on top. */
+    private fun reconcileWebPause(why: String) {
+        val covered = !screenOn || screensaver.isShowing
+        DashboardActivity.setCovered(covered, if (covered) (if (!screenOn) "screen off" else "photos") else why)
     }
 
     // YouTube cast receiver: DIAL discovery makes this Portal show up in the cast menu of any YouTube app on the LAN; a
@@ -2203,6 +2212,12 @@ class BridgeService : Service() {
                 //                                  (--el / --es are accepted too.)
                 //   --es keepAlivePackage com.example.ava
                 //   --ez keepAliveStatus true      (logs one "keepalive: status ..." line)
+                //   --ez webviewPause true|false  pause the dashboard WebView while not seen (default true)
+                if (intent.hasExtra("webviewPause")) {
+                    p.webviewPauseHidden = intent.getBooleanExtra("webviewPause", true)
+                    reconcileWebPause("pref")
+                    Log.i(TAG, "config: webview pause while hidden ${p.webviewPauseHidden} - ${DashboardActivity.webPauseStatus()}")
+                }
                 //   --ez dialEnabled true|false   YouTube phone-cast (DIAL) receiver (fleet default off)
                 if (intent.hasExtra("dialEnabled")) {
                     val on = intent.getBooleanExtra("dialEnabled", false)
@@ -3214,7 +3229,8 @@ class BridgeService : Service() {
 
     private fun bridgeStatusExtras(): String =
         "${FleetCameraSource.status()} | revive attempts=$reviveAttempts last='$reviveLast' | ${presenceMonitor?.status() ?: "presence: off"} | " +
-            "${pubStatus()} | wifiPerfLock pref=${prefs?.wifiPerfLock} held=${wifiPerfLock?.isHeld == true} | webview failedFor=${DashboardActivity.loadFailedForMs() / 1000}s"
+            "${pubStatus()} | wifiPerfLock pref=${prefs?.wifiPerfLock} held=${wifiPerfLock?.isHeld == true} | webview failedFor=${DashboardActivity.loadFailedForMs() / 1000}s | " +
+            "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
@@ -4297,6 +4313,7 @@ class BridgeService : Service() {
         ScreensaverOverlay(this).also { s ->
             s.brightnessPct = prefs?.screensaverBrightness ?: 0
             s.onShowingChanged = { on ->
+                reconcileWebPause(if (on) "photos" else "photos gone")
                 prefs?.let { pp ->
                     publishRaw(HaDiscovery.screensaverShowingStateTopic(pp.deviceId), if (on) "ON" else "OFF", 1, retained = true)
                 }

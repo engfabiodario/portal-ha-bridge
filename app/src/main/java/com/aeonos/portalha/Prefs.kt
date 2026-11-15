@@ -63,6 +63,11 @@ class Prefs(private val context: Context) {
     // Join Music Assistant as a Sendspin player — synchronised multi-room audio, which DLNA
     // can't do (it gives each Portal standalone playback). Experimental, so off by default.
     // YouTube phone-cast receiver (DialServer). fleet (2026-11-15): off by default on every model (DEBUG_CONFIG dialEnabled).
+    // fleet (2026-11-15): WebView.onPause() while the dashboard is not seen (screen off / photos / stopped). Default on.
+    var webviewPauseHidden: Boolean
+        get() = sp.getBoolean("webview_pause_hidden", true)
+        set(v) = sp.edit().putBoolean("webview_pause_hidden", v).apply()
+
     var dialEnabled: Boolean
         get() = sp.getBoolean("dial_enabled", false)
         set(v) = sp.edit().putBoolean("dial_enabled", v).apply()

@@ -103,6 +103,22 @@ class DashboardActivity : AppCompatActivity() {
         /** True while a dashboard activity exists. */
         fun alive(): Boolean = instance != null
 
+        // fleet (2026-11-15, net diet): the service says the dashboard is not seen (screen off, photo screensaver on
+        // top). Then - or while the activity is stopped (YouTube / another app in front) - the WebView is paused with
+        // WebView.onPause(): no drawing, animations or compositing. JavaScript and the HA websocket keep running
+        // (onPause does not pause JS; pauseTimers() is never used - it would also freeze the photo WebView), so alerts,
+        // navigate and the self-heal probe ('1+1' via evaluateJavascript) still work. Chromium may slow a hidden page's
+        // timers (1 Hz); the page catches up at once on resume. Pref webviewPauseHidden (DEBUG_CONFIG --ez webviewPause).
+        @Volatile private var coveredByService = false
+        @Volatile private var coveredWhy = ""
+        fun setCovered(covered: Boolean, why: String) {
+            if (covered != coveredByService) { coveredByService = covered; coveredWhy = why }
+            val act = instance ?: return
+            act.runOnUiThread { act.applyWebPause() }
+        }
+        fun webPauseStatus(): String = "webview: paused=${instance?.webPaused ?: false} covered=$coveredByService ('$coveredWhy') " +
+            "stopped=${instance?.stoppedNow ?: false}"
+
         /** fleet (2026-11-09, audit bridge-code.8): ms the page has been on the 'Failed to load' placeholder (0 = loaded). */
         fun loadFailedForMs(): Long {
             val t = instance?.loadFailedAtMs ?: 0L
@@ -358,8 +374,31 @@ class DashboardActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && instance === this) BridgeService.setDashboardForeground(false)
     }
 
+    // Visible-state for the WebView pause (onStart/onStop) and whether webView.onPause() is in effect. Main thread.
+    private var stoppedNow = false
+    private var webPaused = false
+
+    override fun onStart() {
+        super.onStart()
+        stoppedNow = false
+        applyWebPause()
+    }
+
+    private fun applyWebPause() {
+        if (!::webView.isInitialized) return
+        val enabled = runCatching { Prefs(this).webviewPauseHidden }.getOrDefault(true)
+        val want = enabled && (coveredByService || stoppedNow)
+        if (want == webPaused) return
+        webPaused = want
+        runCatching { if (want) webView.onPause() else webView.onResume() }
+            .onFailure { android.util.Log.w("PortalHA", "webview: ${if (want) "pause" else "resume"} failed: ${it.message}") }
+        android.util.Log.i("PortalHA", "webview: ${if (want) "paused (" + (if (coveredByService) coveredWhy else "activity stopped") + ")" else "resumed"}")
+    }
+
     override fun onStop() {
         super.onStop()
+        stoppedNow = true
+        applyWebPause()
         stoppedSinceResume = true
         if (instance === this) BridgeService.setDashboardForeground(false)
     }
