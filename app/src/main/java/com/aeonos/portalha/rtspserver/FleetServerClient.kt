@@ -91,6 +91,8 @@ class FleetServerClient(
         private const val SR_INTERVAL_MS = 3000L
         private const val SR_LENGTH = 28
         private const val MAX_REQUEST = 16 * 1024
+        /** Flush at the latest after this many buffered bytes (~5 full TCP segments; below the 16 KB buffer). */
+        private const val FLUSH_CAP = 7_400
     }
 
     val remotePort: Int = socket.port
@@ -404,6 +406,10 @@ class FleetServerClient(
                     writeInterleaved(2 * f.channelIdentifier, f.buffer, f.length)
                     if (f.isVideoFrame()) sentVideo++ else sentAudio++
                     maybeSenderReport(f)
+                    // fleet (2026-11-15, net diet): flush only when the queue is drained (end of a frame's burst) or
+                    // FLUSH_CAP bytes are pending. A flush per packet with TCP_NODELAY sent every 1476-byte RTP packet
+                    // as a full 1448-byte segment + a 28-byte runt: ~2x the Wi-Fi frames (and ACKs) for the same video.
+                    if (unflushed >= FLUSH_CAP || queue.isEmpty()) flushOut()
                 } else {
                     val rtp = udpRtp ?: continue
                     runBlocking { rtp.sendFrame(f, false) }
@@ -420,6 +426,11 @@ class FleetServerClient(
         }
     }
 
+    // Bytes written into [out] (BufferedOutputStream, 16 KB) since the last flush. Sender thread only.
+    private var unflushed = 0
+
+    /** Buffers one interleaved packet; the socket write happens in [flushOut] (or when the 16 KB buffer fills -
+     *  that write-through also runs inside writeStartedAt, so the stall watchdog still sees a blocked socket). */
     private fun writeInterleaved(channel: Int, buf: ByteArray, len: Int) {
         synchronized(writeLock) {
             if (closed) throw IOException("closed")
@@ -431,12 +442,27 @@ class FleetServerClient(
             try {
                 out.write(tcpHeader)
                 out.write(buf, 0, len)
+            } finally {
+                writeStartedAt = 0L
+            }
+            unflushed += len + 4
+            bytesSent += len + 4
+        }
+    }
+
+    /** Pushes the buffered packets to the socket. lastWriteAt = the last COMPLETED socket write, as before. */
+    private fun flushOut() {
+        synchronized(writeLock) {
+            if (closed) throw IOException("closed")
+            if (unflushed == 0) return
+            writeStartedAt = SystemClock.elapsedRealtime()
+            try {
                 out.flush()
             } finally {
                 writeStartedAt = 0L
             }
+            unflushed = 0
             lastWriteAt = SystemClock.elapsedRealtime()
-            bytesSent += len + 4
         }
     }
 
