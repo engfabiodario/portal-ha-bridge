@@ -2620,7 +2620,7 @@ class BridgeService : Service() {
     }
 
     /**
-     * Discovery + every retained state again, [delayMs] from now, if [client] is still the live session (a newer
+     * Every retained state again (discovery only if the config set changed), [delayMs] from now, if [client] is still the live session (a newer
      * session publishes for itself). Runs on the command executor like every other publish burst.
      */
     private fun scheduleRepublish(client: MqttClient, delayMs: Long, why: String) {
@@ -2632,16 +2632,52 @@ class BridgeService : Service() {
                 runCatching {
                     val p = prefs ?: return@runCatching
                     if (mqtt !== client || !client.isConnected) return@runCatching
-                    publishDiscovery(client, p)
+                    publishDiscovery(client, p, force = false)   // configs only if they changed this session
                     publishAllStates(p)
-                    Log.i(TAG, "mqtt: re-published discovery + states ($why)")
+                    Log.i(TAG, "mqtt: re-published states ($why)")
                 }.onFailure { Log.w(TAG, "mqtt: re-publish failed: ${it.message}") }
             }, "portal-ha-mqtt-republish").also { it.isDaemon = true }.start()
         }, delayMs)
     }
 
-    private fun publishDiscovery(client: MqttClient, p: Prefs) {
-        fun pub(topic: String, payload: String) = client.publish(topic, retained(payload))
+    // fleet (2026-11-15, net diet): the retained discovery configs go out ONCE per broker session (the connect burst).
+    // The +20 s re-publish and HA's birth message re-send states only - the broker re-delivers retained configs to HA by
+    // itself. Those paths still rebuild the config set and publish it again when it differs from what this session sent
+    // (a setting that adds/removes an entity mid-session), so no new entity can miss its config.
+    @Volatile private var discoverySigSent = 0
+    @Volatile private var discoverySigClient: MqttClient? = null
+
+    /** [force] = the connect burst (always publishes); otherwise only a changed config set is re-sent. */
+    private fun publishDiscovery(client: MqttClient, p: Prefs, force: Boolean = true) {
+        val configs = buildDiscovery(p)
+        val sig = configs.hashCode()
+        if (force || discoverySigClient !== client || sig != discoverySigSent) {
+            configs.forEach { (topic, payload) ->
+                client.publish(topic, if (payload.isEmpty()) emptyRetained() else retained(payload))
+            }
+            discoverySigSent = sig; discoverySigClient = client
+            Log.i(TAG, "mqtt: discovery published (${configs.size} configs${if (force) "" else ", changed since the connect"})")
+        }
+        publishDiscoveryStates(p)
+    }
+
+    /** The states that used to ride along with the discovery burst. */
+    private fun publishDiscoveryStates(p: Prefs) {
+        bridgeMemory?.republish()
+        publishDlnaState(p)
+        if (keepAlive?.supported == true) publishAvaKeepAliveState(p)
+        publishSelfHealSwitchState(p)
+        selfHeal?.republish()
+        publishYoutubeState(p)
+        watch.republish()
+        watch.announce()
+    }
+
+    /** Every retained discovery config of this Portal as (topic, payload); "" = clear (entity removed). */
+    private fun buildDiscovery(p: Prefs): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>(80)
+        fun pub(topic: String, payload: String) { out += topic to payload }
+        fun clear(topic: String) { out += topic to "" }
 
         pub(HaDiscovery.discoveryTopic(p.deviceId), HaDiscovery.configPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.ipDiscoveryTopic(p.deviceId), HaDiscovery.ipConfigPayload(p.deviceId, p.deviceName))
@@ -2651,7 +2687,6 @@ class BridgeService : Service() {
         pub(HaDiscovery.desktopBackDiscoveryTopic(p.deviceId), HaDiscovery.desktopBackConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopSensorDiscoveryTopic(p.deviceId), HaDiscovery.desktopSensorConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopMinutesDiscoveryTopic(p.deviceId), HaDiscovery.desktopMinutesConfigPayload(p.deviceId, p.deviceName))
-        bridgeMemory?.republish()
         pub(HaDiscovery.lightDiscoveryTopic(p.deviceId), HaDiscovery.lightConfigPayload(p.deviceId, p.deviceName))
         for (axis in listOf("x", "y", "z"))
             pub(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis), HaDiscovery.accelConfigPayload(p.deviceId, p.deviceName, axis))
@@ -2664,14 +2699,14 @@ class BridgeService : Service() {
                 pub(HaDiscovery.rgbDiscoveryTopic(p.deviceId, ch), HaDiscovery.rgbConfigPayload(p.deviceId, p.deviceName, ch))
         } else {
             for (ch in listOf("r", "g", "b"))
-                client.publish(HaDiscovery.rgbDiscoveryTopic(p.deviceId, ch), emptyRetained())
+                clear(HaDiscovery.rgbDiscoveryTopic(p.deviceId, ch))
         }
         if (sensorBridge?.hasTemperature == true) {
             pub(HaDiscovery.tempDiscoveryTopic(p.deviceId), HaDiscovery.tempConfigPayload(p.deviceId, p.deviceName))
             pub(HaDiscovery.tempOffsetDiscoveryTopic(p.deviceId), HaDiscovery.tempOffsetConfigPayload(p.deviceId, p.deviceName))
         } else {
-            client.publish(HaDiscovery.tempDiscoveryTopic(p.deviceId), emptyRetained())
-            client.publish(HaDiscovery.tempOffsetDiscoveryTopic(p.deviceId), emptyRetained())
+            clear(HaDiscovery.tempDiscoveryTopic(p.deviceId))
+            clear(HaDiscovery.tempOffsetDiscoveryTopic(p.deviceId))
         }
 
         pub(HaDiscovery.tapDiscoveryTopic(p.deviceId), HaDiscovery.tapConfigPayload(p.deviceId, p.deviceName))
@@ -2680,7 +2715,7 @@ class BridgeService : Service() {
         // The Sound Level sensor only exists when we hold the mic; in coexist mode the
         // mic is released, so remove the entity instead of publishing a stale value.
         if (p.coexistVoiceAssistant)
-            client.publish(HaDiscovery.soundDiscoveryTopic(p.deviceId), emptyRetained())
+            clear(HaDiscovery.soundDiscoveryTopic(p.deviceId))
         else
             pub(HaDiscovery.soundDiscoveryTopic(p.deviceId), HaDiscovery.soundConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.micMuteDiscoveryTopic(p.deviceId), HaDiscovery.micMuteConfigPayload(p.deviceId, p.deviceName))
@@ -2710,27 +2745,20 @@ class BridgeService : Service() {
         pub(HaDiscovery.dlnaDiscoveryTopic(p.deviceId), HaDiscovery.dlnaConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.sendspinDiscoveryTopic(p.deviceId), HaDiscovery.sendspinConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.npOverlayDiscoveryTopic(p.deviceId), HaDiscovery.npOverlayConfigPayload(p.deviceId, p.deviceName))
-        publishDlnaState(p)
         // Assistant keep-alive: Android 9+ (both the Portal+ and the Portal 10" silence a background assistant).
         if (keepAlive?.supported == true) {
             pub(HaDiscovery.avaKeepAliveDiscoveryTopic(p.deviceId), HaDiscovery.avaKeepAliveConfigPayload(p.deviceId, p.deviceName))
-            publishAvaKeepAliveState(p)
         } else {
-            client.publish(HaDiscovery.avaKeepAliveDiscoveryTopic(p.deviceId), emptyRetained())
+            clear(HaDiscovery.avaKeepAliveDiscoveryTopic(p.deviceId))
         }
         // Soft self-heal (SelfHeal): its switch and its status sensor.
         pub(HaDiscovery.selfHealSwitchDiscoveryTopic(p.deviceId), HaDiscovery.selfHealSwitchConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.selfHealSensorDiscoveryTopic(p.deviceId), HaDiscovery.selfHealSensorConfigPayload(p.deviceId, p.deviceName))
-        publishSelfHealSwitchState(p)
-        selfHeal?.republish()
         // YouTube screen: open / close buttons + the showing sensor (TvAppActivity).
         pub(HaDiscovery.youtubeOpenDiscoveryTopic(p.deviceId), HaDiscovery.youtubeOpenConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.youtubeCloseDiscoveryTopic(p.deviceId), HaDiscovery.youtubeCloseConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.youtubeSensorDiscoveryTopic(p.deviceId), HaDiscovery.youtubeSensorConfigPayload(p.deviceId, p.deviceName))
-        publishYoutubeState(p)
         pub(HaDiscovery.watchSensorDiscoveryTopic(p.deviceId), HaDiscovery.watchSensorConfigPayload(p.deviceId, p.deviceName))
-        watch.republish()
-        watch.announce()
 
         // Camera, motion-enable and streaming-enable switches exist only while
         // the camera service is enabled; motion entities additionally require
@@ -2741,15 +2769,15 @@ class BridgeService : Service() {
             pub(HaDiscovery.motionEnableDiscoveryTopic(p.deviceId), HaDiscovery.motionEnableConfigPayload(p.deviceId, p.deviceName))
             pub(HaDiscovery.streamEnableDiscoveryTopic(p.deviceId), HaDiscovery.streamEnableConfigPayload(p.deviceId, p.deviceName))
         } else {
-            client.publish(HaDiscovery.cameraDiscoveryTopic(p.deviceId), emptyRetained())
-            client.publish(HaDiscovery.motionEnableDiscoveryTopic(p.deviceId), emptyRetained())
-            client.publish(HaDiscovery.streamEnableDiscoveryTopic(p.deviceId), emptyRetained())
+            clear(HaDiscovery.cameraDiscoveryTopic(p.deviceId))
+            clear(HaDiscovery.motionEnableDiscoveryTopic(p.deviceId))
+            clear(HaDiscovery.streamEnableDiscoveryTopic(p.deviceId))
         }
         if (p.cameraServiceEnabled && p.motionEnabled) {
             pub(HaDiscovery.motionDiscoveryTopic(p.deviceId), HaDiscovery.motionConfigPayload(p.deviceId, p.deviceName))
             pub(HaDiscovery.motionSensitivityDiscoveryTopic(p.deviceId), HaDiscovery.motionSensitivityConfigPayload(p.deviceId, p.deviceName))
         } else {
-            HaDiscovery.motionEntityTopics(p.deviceId).forEach { client.publish(it, emptyRetained()) }
+            HaDiscovery.motionEntityTopics(p.deviceId).forEach { clear(it) }
         }
 
         // Screen-timeout controls always present; presence sensor only while enabled.
@@ -2759,8 +2787,9 @@ class BridgeService : Service() {
         if (p.presenceEnabled) {
             pub(HaDiscovery.presenceDiscoveryTopic(p.deviceId), HaDiscovery.presenceConfigPayload(p.deviceId, p.deviceName))
         } else {
-            client.publish(HaDiscovery.presenceDiscoveryTopic(p.deviceId), emptyRetained())
+            clear(HaDiscovery.presenceDiscoveryTopic(p.deviceId))
         }
+        return out
     }
 
     // Presence sensor discovery toggled live (when presence is enabled/disabled
