@@ -30,6 +30,11 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
     private var lastPss = 0.0
     private var lastPublishMs = 0L
     private var loggedRenderer = false
+    // fleet (2026-11-15, net diet meter): this app uid's traffic at the last successful report (TrafficStats; covers
+    // RTSP, MQTT, Sendspin and the WebView - its network stack runs in our uid).
+    private var lastRx = -1L
+    private var lastTx = -1L
+    private var lastTrafficMs = 0L
 
     private val tick = object : Runnable {
         override fun run() {
@@ -67,6 +72,17 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
             val sys = ActivityManager.MemoryInfo().also { am?.getMemoryInfo(it) }
             val upH = (now - Process.getStartElapsedRealtime()) / 3_600_000.0
             val load = loadAvg()
+            val uid = Process.myUid()
+            val rx = android.net.TrafficStats.getUidRxBytes(uid)
+            val tx = android.net.TrafficStats.getUidTxBytes(uid)
+            val haveTraffic = rx >= 0 && tx >= 0   // TrafficStats.UNSUPPORTED = -1
+            val winS = if (lastTrafficMs == 0L) 0.0 else (now - lastTrafficMs) / 1000.0
+            // Averages since the previous report; null on the first report, after a counter reset or without stats.
+            fun kbps(cur: Long, prev: Long): String =
+                if (!haveTraffic || prev < 0 || cur < prev || winS < 1.0) "null" else "%.1f".format(Locale.US, (cur - prev) * 8 / 1000.0 / winS)
+            val traffic = "\"rx_bytes\":${if (haveTraffic) rx else "null"},\"tx_bytes\":${if (haveTraffic) tx else "null"}," +
+                "\"rx_kbps\":${kbps(rx, lastRx)},\"tx_kbps\":${kbps(tx, lastTx)}," +
+                "\"traffic_window_s\":${if (winS >= 1.0) "%.0f".format(Locale.US, winS) else "null"},"
             val attrs = "{\"pss_mb\":${mb(pss)},\"java_heap_mb\":${stat("summary.java-heap")}," +
                 "\"native_heap_mb\":${stat("summary.native-heap")},\"graphics_mb\":${stat("summary.graphics")}," +
                 "\"code_mb\":${stat("summary.code")},\"stack_mb\":${stat("summary.stack")}," +
@@ -76,11 +92,12 @@ class BridgeMemory(private val ctx: Context, private val sink: (state: String, a
                 "\"system_low_memory\":${sys.lowMemory},\"low_memory_threshold_mb\":${mb(sys.threshold / 1048576.0)}," +
                 "\"process_uptime_h\":${"%.2f".format(Locale.US, upH)},\"device_uptime_h\":${"%.2f".format(Locale.US, now / 3_600_000.0)}," +
                 "\"load_1m\":${load[0]},\"load_5m\":${load[1]},\"load_15m\":${load[2]},\"swap_used_mb\":${swapUsedMb()}," +
-                "\"sampled_at\":\"${isoNow()}\"}"
+                traffic + "\"sampled_at\":\"${isoNow()}\"}"
             if (sink(mb(pss), attrs)) {
                 if (lastPublishMs == 0L || moved) Log.i(TAG, "memory: pss ${mb(pss)} MB, system free ${mb(sys.availMem / 1048576.0)} MB" +
                     (if (moved) " (moved >= 10 % from ${mb(lastPss)})" else ""))
                 lastPss = pss; lastPublishMs = now
+                if (haveTraffic) { lastRx = rx; lastTx = tx; lastTrafficMs = now }
             }
         }.onFailure { Log.w(TAG, "memory: sample failed: ${it.message}") }
     }
