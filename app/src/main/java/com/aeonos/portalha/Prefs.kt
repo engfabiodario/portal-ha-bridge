@@ -117,6 +117,21 @@ class Prefs(private val context: Context) {
         get() = sp.getFloat("smart_camera_scale", 1.0f)
         set(v) = sp.edit().putFloat("smart_camera_scale", v).apply()
 
+    // fleet (2026-11-15, net diet): camera encoder, MQTT portal/<id>/config/camera_encoder/set. Defaults 10 fps,
+    // 1.2 Mbit/s, key frame every 2 s, mode 'vbr' requested (RootEncoder 2.4.6 still runs CBR - see RtspStreamer.start).
+    var streamFps: Int
+        get() = sp.getInt("stream_fps", 10)
+        set(v) = sp.edit().putInt("stream_fps", v).apply()
+    var streamBitrate: Int
+        get() = sp.getInt("stream_bitrate", 1_200_000)
+        set(v) = sp.edit().putInt("stream_bitrate", v).apply()
+    var streamIFrameS: Int
+        get() = sp.getInt("stream_iframe_s", 2)
+        set(v) = sp.edit().putInt("stream_iframe_s", v).apply()
+    var streamBitrateMode: String
+        get() = sp.getString("stream_bitrate_mode", "vbr") ?: "vbr"
+        set(v) = sp.edit().putString("stream_bitrate_mode", v).apply()
+
     // Fleet: encoder size override "WxH" (landscape, before rotation); "" = model default
     // (Portal+ 720x720, Portal 10" / TV 1280x720). See RtspStreamer.sizeOverride.
     var streamSize: String

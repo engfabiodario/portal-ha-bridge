@@ -14,7 +14,11 @@ import com.aeonos.portalha.rtspserver.IpType
 // it replaces the MJPEG path; motion detection can't run at the same time.
 class RtspStreamer(private val context: Context, private val port: Int = 8554) : ConnectChecker {
 
-    companion object { private const val TAG = "PortalHA" }
+    companion object {
+        private const val TAG = "PortalHA"
+        /** RootEncoder 2.4.6 always configures CBR when the codec supports it (see [start]). */
+        const val EFFECTIVE_MODE = "cbr"
+    }
 
     private var stream: FleetRtspServerStream? = null
     @Volatile var isStreaming = false
@@ -72,8 +76,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // Capture params from the last start(), reused by restart() on rotation change.
     private var baseWidth = 1280
     private var baseHeight = 720
-    private var baseFps = 15
-    private var baseBitrate = 2_000_000
+    private var baseFps = 10
+    private var baseBitrate = 1_200_000
+    private var baseIFrameS = 2
     private var baseAudio = true
 
     /** One line for adb rtspStatus / logs: the server's clients, their progress and evictions. */
@@ -89,9 +94,15 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
 
     private fun currentRotation(): Int = (((rotationOffset + autoRotation) % 360) + 360) % 360
 
-    fun start(width: Int, height: Int, fps: Int, bitrate: Int, withAudio: Boolean): Boolean {
+    /**
+     * fleet (2026-11-15, net diet): encoder fps / bitrate / key-frame interval come from Prefs (MQTT camera_encoder).
+     * Bitrate MODE: RootEncoder 2.4.6's VideoEncoder hard-codes BITRATE_MODE_CBR whenever the codec supports it (no hook:
+     * the MediaFormat is local to prepareVideoEncoder), so a 'vbr' request cannot be honoured without vendoring the
+     * encoder - [effectiveMode] reports what actually runs.
+     */
+    fun start(width: Int, height: Int, fps: Int, bitrate: Int, withAudio: Boolean, iFrameS: Int = 2): Boolean {
         if (isStreaming) return true
-        baseWidth = width; baseHeight = height; baseFps = fps; baseBitrate = bitrate; baseAudio = withAudio
+        baseWidth = width; baseHeight = height; baseFps = fps; baseBitrate = bitrate; baseAudio = withAudio; baseIFrameS = iFrameS
         return runCatching {
             // Portal cameras are all front-facing; RootEncoder defaults to BACK
             // (empty here), so build the source explicitly on FRONT.
@@ -166,9 +177,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
                 val level = if (w * h > 921_600) MediaCodecInfo.CodecProfileLevel.AVCLevel4
                             else MediaCodecInfo.CodecProfileLevel.AVCLevel31
                 val br = if (w * h > 921_600) maxOf(bitrate, 3_000_000) else bitrate
-                if (s.prepareVideo(w, h, br, fps, 2, rot, profile, level)) return true
+                if (s.prepareVideo(w, h, br, fps, iFrameS, rot, profile, level)) return true
                 Log.w(TAG, "Constrained-Baseline prepare failed at ${w}x$h; using encoder default profile")
-                return s.prepareVideo(w, h, br, fps, 2, rot)
+                return s.prepareVideo(w, h, br, fps, iFrameS, rot)
             }
             var videoOk = prepare(encW, encH)
             if (!videoOk && fullSensor) {
@@ -226,8 +237,16 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
         // the port in-process). 700ms + the BridgeService dead-stream backoff
         // retries cover the tail.
         runCatching { Thread.sleep(700) }   // let the accept thread die + port release
-        return start(baseWidth, baseHeight, baseFps, baseBitrate, baseAudio)
+        return start(baseWidth, baseHeight, baseFps, baseBitrate, baseAudio, baseIFrameS)
     }
+
+    /** New encoder settings for the next start()/restart() (the caller restarts a running stream). */
+    fun setEncoder(fps: Int, bitrate: Int, iFrameS: Int) {
+        baseFps = fps; baseBitrate = bitrate; baseIFrameS = iFrameS
+    }
+
+    /** What the running (or next) encoder uses: "fps=10 bitrate=1200000 iframe_s=2". */
+    fun encoderLine(): String = "fps=$baseFps bitrate=$baseBitrate iframe_s=$baseIFrameS"
 
     fun stop() {
         isStreaming = false

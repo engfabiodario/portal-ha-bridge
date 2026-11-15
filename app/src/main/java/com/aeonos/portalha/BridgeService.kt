@@ -979,6 +979,72 @@ class BridgeService : Service() {
         Log.i(TAG, cameraViewStatus(p))
     }
 
+    // ── Camera encoder (fleet 2026-11-15, net diet) ─────────────────────────────
+    // MQTT portal/<id>/config/camera_encoder/set (not an HA entity; or DEBUG_CONFIG --es cameraEncoder):
+    //   JSON, any subset: {"fps":10,"bitrate":1200000,"iframe_s":2,"mode":"cbr"|"vbr"}  -> persisted, ONE stream restart
+    //   "status" -> reply only;  "reset" -> the defaults (10 fps, 1.2 Mbit/s, 2 s, vbr requested)
+    // Reply (not retained) on portal/<id>/config/camera_encoder/status. Ranges: fps 5..30, bitrate 250000..6000000,
+    // iframe_s 1..10. 'vbr' is stored but RootEncoder 2.4.6 configures CBR whenever the codec supports it: the reply
+    // names the effective mode.
+    private fun cameraEncoderTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/set"
+    private fun cameraEncoderStatusTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/status"
+    private fun encFps(p: Prefs) = p.streamFps.coerceIn(5, 30)
+    private fun encBitrate(p: Prefs) = p.streamBitrate.coerceIn(250_000, 6_000_000)
+    private fun encIFrame(p: Prefs) = p.streamIFrameS.coerceIn(1, 10)
+
+    private fun cameraEncoderStatus(p: Prefs, note: String = ""): String =
+        "cameraencoder: fps=${encFps(p)} bitrate=${encBitrate(p)} iframe_s=${encIFrame(p)} mode=${p.streamBitrateMode} " +
+            "effective_mode=${RtspStreamer.EFFECTIVE_MODE} running=${rtspStreamer?.let { if (it.isStreaming) it.encoderLine() else "stopped" } ?: "none"}" +
+            if (note.isNotEmpty()) " | $note" else ""
+
+    private fun handleCameraEncoderCommand(payload: String, p: Prefs) {
+        val cmd = payload.trim()
+        var note = ""
+        var changed = false
+        when {
+            cmd.equals("status", true) || cmd.isEmpty() -> {}
+            cmd.equals("reset", true) -> {
+                changed = p.streamFps != 10 || p.streamBitrate != 1_200_000 || p.streamIFrameS != 2
+                p.streamFps = 10; p.streamBitrate = 1_200_000; p.streamIFrameS = 2; p.streamBitrateMode = "vbr"
+                note = "reset to the defaults"
+            }
+            cmd.startsWith("{") -> {
+                val o = runCatching { org.json.JSONObject(cmd) }.getOrNull()
+                if (o == null) note = "refused: not valid JSON"
+                else {
+                    val bad = mutableListOf<String>()
+                    var fps = p.streamFps; var br = p.streamBitrate; var ifr = p.streamIFrameS; var mode = p.streamBitrateMode
+                    if (o.has("fps")) o.optInt("fps", -1).let { if (it in 5..30) fps = it else bad += "fps (5..30)" }
+                    if (o.has("bitrate")) o.optInt("bitrate", -1).let { if (it in 250_000..6_000_000) br = it else bad += "bitrate (250000..6000000)" }
+                    if (o.has("iframe_s")) o.optInt("iframe_s", -1).let { if (it in 1..10) ifr = it else bad += "iframe_s (1..10)" }
+                    if (o.has("mode")) o.optString("mode").lowercase().let { if (it == "cbr" || it == "vbr") mode = it else bad += "mode (cbr|vbr)" }
+                    if (bad.isNotEmpty()) note = "refused: bad ${bad.joinToString(", ")} - nothing changed"
+                    else {
+                        changed = fps != p.streamFps || br != p.streamBitrate || ifr != p.streamIFrameS
+                        p.streamFps = fps; p.streamBitrate = br; p.streamIFrameS = ifr; p.streamBitrateMode = mode
+                        note = if (changed) "applied" else "unchanged"
+                    }
+                }
+            }
+            else -> note = "refused: unknown command (JSON | status | reset)"
+        }
+        if (changed) {
+            commandExecutor.submit {
+                rtspStreamer?.let {
+                    it.setEncoder(encFps(p), encBitrate(p), encIFrame(p))
+                    if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                }
+                val line = cameraEncoderStatus(p, "$note (stream restarted once)")
+                Log.i(TAG, line)
+                publishRaw(cameraEncoderStatusTopic(p.deviceId), line, 0, retained = false)
+            }
+            return
+        }
+        val line = cameraEncoderStatus(p, note)
+        Log.i(TAG, line)
+        publishRaw(cameraEncoderStatusTopic(p.deviceId), line, 0, retained = false)
+    }
+
     private fun noteRtspStarted() {
         smartCamera?.reassert("stream start")   // the virtual camera was (re)attached
         lastRtspStartMs = System.currentTimeMillis()
@@ -2216,6 +2282,8 @@ class BridgeService : Service() {
                 if (intent.getBooleanExtra("rotationStatus", false)) Log.i(TAG, rotationStatus())
                 // Camera view (fleet, SmartCamera.kt): --es cameraView wide|auto|fixed:x,y,scale|size:WxH|status
                 intent.getStringExtra("cameraView")?.let { v -> handleCameraViewCommand(v, p) }
+                // --es cameraEncoder '{"fps":10,"bitrate":1200000,"iframe_s":2,"mode":"vbr"}' | status | reset
+                intent.getStringExtra("cameraEncoder")?.let { v -> handleCameraEncoderCommand(v, p) }
                 // --es displayDensity <dpi|dpi!|reset|status>  (DisplayDensity; 100..320, SDK 28 only with '!')
                 intent.getStringExtra("displayDensity")?.let { v -> handleDisplayDensityCommand(v, p) }
                 // --ez desktopMode true|false (DesktopMode: launcher in front on purpose), --ei desktopMinutes N (5..240)
@@ -2540,6 +2608,7 @@ class BridgeService : Service() {
             HaDiscovery.selfHealCommandTopic(p.deviceId),
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             cameraViewTopic(p.deviceId),
+            cameraEncoderTopic(p.deviceId),
             displayDensityTopic(p.deviceId),
             HaDiscovery.desktopCommandTopic(p.deviceId),
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId),
@@ -2915,6 +2984,7 @@ class BridgeService : Service() {
             HaDiscovery.selfHealCommandTopic(p.deviceId)          -> handleSelfHealCommand(payload, p)
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
             cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
+            cameraEncoderTopic(p.deviceId)                        -> handleCameraEncoderCommand(payload, p)
             displayDensityTopic(p.deviceId)                       -> handleDisplayDensityCommand(payload, p)
             HaDiscovery.desktopCommandTopic(p.deviceId)           -> handleDesktopCommand(payload)
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId)    -> handleDesktopMinutesCommand(payload, p)
@@ -3137,7 +3207,7 @@ class BridgeService : Service() {
     private fun publishCapabilities(p: Prefs) {
         val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"wifi_perf_lock\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
-            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\"]," +
+            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
         publishRaw(capabilitiesTopic(p.deviceId), json, 1, retained = true)
     }
@@ -3540,7 +3610,7 @@ class BridgeService : Service() {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
                     // stream itself never opens the mic, so calls/Alexa/wake word
                     // are unaffected; their yields just mute the track briefly.
-                    val ok = r.start(1280, 720, 15, 2_000_000, withAudio = p.streamAudioEnabled)
+                    val ok = r.start(1280, 720, encFps(p), encBitrate(p), withAudio = p.streamAudioEnabled, iFrameS = encIFrame(p))
                     cameraActive = ok
                     publishRaw(HaDiscovery.cameraStateTopic(p.deviceId), if (ok) "ON" else "OFF", 1, retained = true)
                     if (ok) noteRtspStarted() else Log.w(TAG, "RTSP failed to start")
