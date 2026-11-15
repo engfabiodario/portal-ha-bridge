@@ -48,9 +48,10 @@ class Prefs(private val context: Context) {
         set(v) = sp.edit().putString("device_name", v).apply()
 
     // Advertise the Portal as a DLNA/UPnP MediaRenderer so it shows up as a speaker in Music
-    // Assistant (and any DLNA controller). On by default — that's the point of the feature.
+    // Assistant (and any DLNA controller). fleet (2026-11-15): OFF by default - the fleet plays through Sendspin, and the
+    // renderer holds a multicast lock + sends SSDP NOTIFYs. A stored value (the HA switch) still wins.
     var dlnaEnabled: Boolean
-        get() = sp.getBoolean("dlna_enabled", true)
+        get() = sp.getBoolean("dlna_enabled", false)
         set(v) = sp.edit().putBoolean("dlna_enabled", v).apply()
 
     // Closing the now-playing screen also stops the music, rather than just dismissing the
@@ -61,6 +62,11 @@ class Prefs(private val context: Context) {
 
     // Join Music Assistant as a Sendspin player — synchronised multi-room audio, which DLNA
     // can't do (it gives each Portal standalone playback). Experimental, so off by default.
+    // YouTube phone-cast receiver (DialServer). fleet (2026-11-15): off by default on every model (DEBUG_CONFIG dialEnabled).
+    var dialEnabled: Boolean
+        get() = sp.getBoolean("dial_enabled", false)
+        set(v) = sp.edit().putBoolean("dial_enabled", v).apply()
+
     var sendspinEnabled: Boolean
         get() = sp.getBoolean("sendspin_enabled", false)
         set(v) = sp.edit().putBoolean("sendspin_enabled", v).apply()

@@ -1207,26 +1207,8 @@ class BridgeService : Service() {
         // Stops Portal's launcher from idle-kicking us to the home screen.
         mediaKeepAlive.start(this)
 
-        // YouTube cast receiver: DIAL discovery makes this Portal show up in the
-        // cast menu of any YouTube app on the LAN; a cast launches TvAppActivity.
-        dialServer = DialServer(
-            this,
-            friendlyName = { prefs?.deviceName ?: "Portal" },
-            onLaunch = { query ->
-                Handler(Looper.getMainLooper()).post {
-                    if (inCall) {
-                        // Don't punt a live call into PiP for a YouTube cast.
-                        Log.i(TAG, "cast: launch refused — Portal is on a call")
-                        return@post
-                    }
-                    ScreenControl.wake(this)                       // cast-to-wake
-                    lastActivityMs = System.currentTimeMillis()
-                    runCatching { TvAppActivity.launch(this, query) }
-                        .onFailure { Log.w(TAG, "cast: launch failed: ${it.message}") }
-                }
-            },
-            onStopApp = { TvAppActivity.close() }
-        ).also { it.start() }
+        // YouTube cast receiver (DIAL): off unless dialEnabled (fleet 2026-11-15) - see startDial().
+        if (p.dialEnabled) startDial() else Log.i(TAG, "cast: DIAL receiver off (DEBUG_CONFIG --ez dialEnabled true to enable)")
 
         // DLNA MediaRenderer: makes the Portal a speaker in Music Assistant (and any DLNA
         // controller). Modelled on DialServer; playback yields to calls/Alexa via audio focus.
@@ -1441,7 +1423,7 @@ class BridgeService : Service() {
         wakeDetector?.stop()
         falconReadiness?.stop(); falconReadiness = null
         twoWay?.stop(); twoWayOrb?.hide()
-        dialServer?.stop(); dialServer = null
+        stopDial()
         stopDlna()
         stopSendspin()
         wakeHandler.removeCallbacks(reclaimTimeout); wakeHandler.removeCallbacks(reclaimDebounce)
@@ -1708,6 +1690,36 @@ class BridgeService : Service() {
         Handler(Looper.getMainLooper()).post {
             intercomOverlays.forEach { runCatching { it.bringToFront() } }
         }
+    }
+
+    // YouTube cast receiver: DIAL discovery makes this Portal show up in the cast menu of any YouTube app on the LAN; a
+    // cast launches TvAppActivity. fleet (2026-11-15, net diet): OFF by default (pref dialEnabled) - nobody casts from a
+    // phone, and the receiver held a multicast lock forever (every LAN multicast frame woke the CPU) and answered every
+    // SSDP search. YouTube via HA / watch together (MQTT) do not need it.
+    private fun startDial() {
+        if (dialServer != null) return
+        dialServer = DialServer(
+            this,
+            friendlyName = { prefs?.deviceName ?: "Portal" },
+            onLaunch = { query ->
+                Handler(Looper.getMainLooper()).post {
+                    if (inCall) {
+                        // Don't punt a live call into PiP for a YouTube cast.
+                        Log.i(TAG, "cast: launch refused — Portal is on a call")
+                        return@post
+                    }
+                    ScreenControl.wake(this)                       // cast-to-wake
+                    lastActivityMs = System.currentTimeMillis()
+                    runCatching { TvAppActivity.launch(this, query) }
+                        .onFailure { Log.w(TAG, "cast: launch failed: ${it.message}") }
+                }
+            },
+            onStopApp = { TvAppActivity.close() }
+        ).also { it.start() }
+    }
+
+    private fun stopDial() {
+        dialServer?.stop(); dialServer = null
     }
 
     /** Reconnect the synced player on new server settings, if it's running. */
@@ -2125,6 +2137,13 @@ class BridgeService : Service() {
                 //                                  (--el / --es are accepted too.)
                 //   --es keepAlivePackage com.example.ava
                 //   --ez keepAliveStatus true      (logs one "keepalive: status ..." line)
+                //   --ez dialEnabled true|false   YouTube phone-cast (DIAL) receiver (fleet default off)
+                if (intent.hasExtra("dialEnabled")) {
+                    val on = intent.getBooleanExtra("dialEnabled", false)
+                    p.dialEnabled = on
+                    if (on) startDial() else stopDial()
+                    Log.i(TAG, "config: DIAL cast receiver ${if (on) "ON" else "OFF"}")
+                }
                 if (intent.hasExtra("avaKeepAlive")) {
                     val on = intent.getBooleanExtra("avaKeepAlive", true)
                     p.avaKeepAlive = on
