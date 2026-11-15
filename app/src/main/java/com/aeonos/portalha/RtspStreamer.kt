@@ -202,7 +202,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             }
             // Always prepare the audio encoder — startStream() requires it even with
             // NoAudioSource (NoAudioSource just means no mic is opened, no data fed).
-            val audioOk = s.prepareAudio(16000, false, 64_000)
+            // fleet (2026-11-15, net diet): 32 kbit/s (was 64). The track stays (go2rtc stalls on an empty one), but
+            // Frigate takes the Portal's sound from Ava's mic stream, so this one carries silence nearly always.
+            val audioOk = s.prepareAudio(16000, false, 32_000)
             if (videoOk && audioOk) {
                 // fleet (2026-11-15): the encoder fps is only a rate-control hint with a surface input - the camera may
                 // deliver more. Cap the GL render + encoder to it so 10 fps really means 10 frames/s on the wire.
