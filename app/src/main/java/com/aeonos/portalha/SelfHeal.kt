@@ -93,6 +93,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         fun busyReason(): String?
         /** null = the app has no broker configured (n/a). */
         fun mqttConnected(): Boolean?
+        /** ms since the live MQTT session last RECEIVED anything (PINGRESP, PUBACK, a message); null = unknown / no session. */
+        fun mqttInboundAgeMs(): Long? = null
         fun mqttReconnect(): String
         /** null = stream not wanted (camera/stream off by the user) or not judgeable yet; else ms since the last encoded frame. */
         fun streamFrameAgeMs(): Long?
@@ -368,6 +370,10 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         // target failed. No other target = the live session is the proof (no probe at all).
         val mqttUp = !faked(Check.MQTT) && runCatching { host.mqttConnected() }.getOrNull() == true
         if (mqttUp && targets.size == 1) { lanProbedText = "none (MQTT session up)"; return "ok" }
+        // fleet (2026-11-15, net diet): a session that RECEIVED traffic in the last 2 min proves the LAN - no TCP connect
+        // to the router every 30 s (~8 Wi-Fi frames each). A quiet or half-dead session still gets the full probe.
+        val inAge = if (mqttUp) runCatching { host.mqttInboundAgeMs() }.getOrNull() else null
+        if (inAge != null && inAge in 0..LAN_MQTT_FRESH_MS) { lanProbedText = "none (MQTT inbound ${inAge / 1000} s ago)"; return "ok" }
         val order = if (mqttUp) targets.drop(1) + targets.first() else targets
         val results = mutableListOf<Pair<String, String?>>()
         for ((h, port) in order) {
@@ -688,6 +694,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         const val STREAM_JUST_STARTED = -1L
         private const val HOUR_MS = 60 * 60_000L
         const val LAN_FAST_MS = 30_000L
+        private const val LAN_MQTT_FRESH_MS = 120_000L
         /** Unchanged state is re-sent this often (HA last_reported; the watcher's freshness window is 12 min). */
         const val HEARTBEAT_MS = 10 * 60_000L
         private const val LAN_BACKOFF_BASE_MS = 60_000L

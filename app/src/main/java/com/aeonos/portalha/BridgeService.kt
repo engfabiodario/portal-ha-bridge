@@ -2438,6 +2438,7 @@ class BridgeService : Service() {
                 if (mqtt === client) mqtt = null
             }
             override fun messageArrived(topic: String, msg: MqttMessage) {
+                lastMqttInboundMs = android.os.SystemClock.elapsedRealtime()
                 // Intercom traffic is binary (PCM audio) and must NOT be string-
                 // decoded or run on the command executor — route it straight to
                 // the manager from the raw bytes. handleRawMessage is non-blocking.
@@ -2451,7 +2452,7 @@ class BridgeService : Service() {
                     }
                 }
             }
-            override fun deliveryComplete(token: IMqttDeliveryToken?) = Unit
+            override fun deliveryComplete(token: IMqttDeliveryToken?) { lastMqttInboundMs = android.os.SystemClock.elapsedRealtime() }
         })
 
         client.connect(MqttConnectOptions().apply {
@@ -2638,6 +2639,32 @@ class BridgeService : Service() {
                 }.onFailure { Log.w(TAG, "mqtt: re-publish failed: ${it.message}") }
             }, "portal-ha-mqtt-republish").also { it.isDaemon = true }.start()
         }, delayMs)
+    }
+
+    // ── MQTT inbound age (self-heal lan check, 2026-11-15) ─────────────────────
+    // Our own marks (messages, PUBACKs) plus Paho's ClientState.lastInboundActivity (System.nanoTime, also PINGRESP),
+    // read by reflection (no minify; Paho 1.2.5 pinned). Either source alone is enough; neither = null (probe as before).
+    @Volatile private var lastMqttInboundMs = 0L
+    private var pahoInboundField: java.lang.reflect.Field? = null
+    private var pahoReflectFailed = false
+
+    private fun mqttInboundAge(): Long? {
+        val c = mqtt ?: return null
+        if (!c.isConnected) return null
+        val own = lastMqttInboundMs.let { if (it == 0L) null else android.os.SystemClock.elapsedRealtime() - it }
+        val paho = if (pahoReflectFailed) null else runCatching {
+            val ac = MqttClient::class.java.getDeclaredField("aClient").apply { isAccessible = true }.get(c)
+                ?: return@runCatching null
+            val comms = org.eclipse.paho.client.mqttv3.MqttAsyncClient::class.java.getDeclaredField("comms")
+                .apply { isAccessible = true }.get(ac) ?: return@runCatching null
+            val cs = comms.javaClass.getMethod("getClientState").invoke(comms) ?: return@runCatching null
+            val f = pahoInboundField ?: cs.javaClass.getDeclaredField("lastInboundActivity").apply { isAccessible = true }
+                .also { pahoInboundField = it }
+            val ns = f.getLong(cs)
+            if (ns == 0L) null else (System.nanoTime() - ns) / 1_000_000L
+        }.onFailure { pahoReflectFailed = true; Log.w(TAG, "mqtt: Paho inbound time unreadable (${it.javaClass.simpleName}) - own marks only") }
+            .getOrNull()
+        return listOfNotNull(own, paho).minOrNull()
     }
 
     // fleet (2026-11-15, net diet): the retained discovery configs go out ONCE per broker session (the connect burst).
@@ -2894,6 +2921,7 @@ class BridgeService : Service() {
             else -> null
         }
 
+        override fun mqttInboundAgeMs(): Long? = mqttInboundAge()
         override fun mqttConnected(): Boolean? {
             val p = prefs ?: return null
             if (p.brokerHost.isBlank()) return null
