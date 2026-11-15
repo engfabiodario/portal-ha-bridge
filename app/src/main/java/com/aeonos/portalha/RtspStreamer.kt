@@ -204,6 +204,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // NoAudioSource (NoAudioSource just means no mic is opened, no data fed).
             val audioOk = s.prepareAudio(16000, false, 64_000)
             if (videoOk && audioOk) {
+                // fleet (2026-11-15): the encoder fps is only a rate-control hint with a surface input - the camera may
+                // deliver more. Cap the GL render + encoder to it so 10 fps really means 10 frames/s on the wire.
+                runCatching { s.forceFpsLimit(true) }.onFailure { Log.w(TAG, "forceFpsLimit failed: ${it.message}") }
                 s.startStream()
                 isStreaming = true
                 if (fullSensor) {
@@ -213,7 +216,7 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
                         .onSuccess { Log.i(TAG, "camera $cameraId: opened for the stream") }
                         .onFailure { Log.w(TAG, "camera $cameraId: open failed (${it.message}); staying on Camera 0") }
                 }
-                Log.i(TAG, "RTSP streaming on ${url()} ${encW}x${encH} rot=$rot squash=$squashedFrontCam camera=${if (fullSensor) cameraId else "0"} (audio=$withAudio)")
+                Log.i(TAG, "RTSP streaming on ${url()} ${encW}x${encH} ${encoderLine()} mode=$EFFECTIVE_MODE rot=$rot squash=$squashedFrontCam camera=${if (fullSensor) cameraId else "0"} (audio=$withAudio)")
                 true
             } else {
                 Log.w(TAG, "RTSP prepare failed (video=$videoOk audio=$audioOk)")
