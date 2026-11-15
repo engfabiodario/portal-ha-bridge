@@ -56,6 +56,9 @@ class SendspinPlayer(
     // app restart or reboot shows up in Music Assistant as a NEW player (stale duplicates, and HA's
     // media_player points at a dead one). Blank = library default (random).
     private val clientId: () -> String = { "" },
+    // fleet (2026-11-15, net diet): ask for album art only when something shows it (the now-playing overlay). Off =
+    // no ARTWORK role in the hello, so Music Assistant sends no JPEG per track to this Portal.
+    private val wantArtwork: () -> Boolean = { true },
 ) {
     private companion object { const val TAG = "PortalHA" }
 
@@ -149,17 +152,28 @@ class SendspinPlayer(
 
     val isConnected: Boolean get() = client != null
 
+    /** Whether this session's hello asked for artwork (a pref change needs a Sendspin restart to apply). */
+    @Volatile var artworkRequested = true
+        private set
+
     fun start() {
         if (scope != null) return
         val s = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope = s
 
-        // mDNS needs multicast to survive Wi-Fi power saving, same as the DLNA/DIAL servers.
-        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        multicastLock = wifi.createMulticastLock("portalha-sendspin").apply {
-            setReferenceCounted(false)
-            runCatching { acquire() }
+        // fleet (2026-11-15, net diet): the multicast lock is taken further down ONLY when mDNS discovery runs (no fixed
+        // server URL). Held, it makes the Wi-Fi chip hand every multicast frame on the LAN to the CPU, screen off too.
+        val fixedUrl = normalizeServerUrl(serverUrl())
+        if (fixedUrl == null) {
+            // mDNS needs multicast to survive Wi-Fi power saving, same as the DLNA/DIAL servers.
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("portalha-sendspin").apply {
+                setReferenceCounted(false)
+                runCatching { acquire() }
+            }
         }
+        val artwork = wantArtwork()
+        artworkRequested = artwork
 
         val okHttp = OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
@@ -180,13 +194,14 @@ class SendspinPlayer(
                 AudioFormat(codec = "pcm", channels = 2, sampleRate = 44100, bitDepth = 16),
                 AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
             ),
-            artworkChannels = listOf(ArtworkChannel(source = "album", format = "jpeg")),
+            artworkChannels = if (artwork) listOf(ArtworkChannel(source = "album", format = "jpeg")) else emptyList(),
             // NOT "set_static_delay": Music Assistant 2.10.5 (aiosendspin 10.0.0) rejects the whole
             // client/hello as malformed when it is listed (2026-10-10 pilot: endless reconnect loop,
             // player unavailable). The static-delay handler stays for a server that accepts it.
             playerSupportedCommands = listOf("volume", "mute"),
-            supportedOptionalRoles = setOf(
-                OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER),
+            supportedOptionalRoles = if (artwork)
+                setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER)
+            else setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.CONTROLLER),
         )
 
         val c = SendSpinClient(
@@ -221,7 +236,7 @@ class SendspinPlayer(
             .also { runCatching { audio.requestAudioFocus(it) } }
 
         // A fixed server URL skips discovery; the client reconnects on its own after drops.
-        val fixed = normalizeServerUrl(serverUrl())
+        val fixed = fixedUrl
         if (fixed != null) {
             connectJob = s.launch {
                 Log.i(TAG, "sendspin: connecting to fixed server $fixed")

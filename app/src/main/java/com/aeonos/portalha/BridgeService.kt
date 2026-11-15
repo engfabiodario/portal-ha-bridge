@@ -1690,7 +1690,8 @@ class BridgeService : Service() {
         ensureNowPlayingOverlay()
         sendspinPlayer = SendspinPlayer(this, deviceName = { prefs?.deviceName ?: "Portal" },
                 serverUrl = { prefs?.sendspinServerUrl ?: "" },
-                clientId = { prefs?.deviceId?.let { "portal-ha-bridge-$it" } ?: "" }).apply {
+                clientId = { prefs?.deviceId?.let { "portal-ha-bridge-$it" } ?: "" },
+                wantArtwork = { prefs?.nowPlayingOverlayEnabled == true }).apply {
             onTrack = { t -> onSendspinTrack(t) }
             onArtwork = { bytes -> nowPlayingOverlay?.setArtwork(bytes) }
             start()
@@ -3342,6 +3343,14 @@ class BridgeService : Service() {
         val on = payload.equals("ON", ignoreCase = true)
         if (on != p.nowPlayingOverlayEnabled) p.nowPlayingOverlayEnabled = on
         if (!on) nowPlayingOverlay?.hide()   // takes effect for the next track if turned back on
+        // fleet (2026-11-15): the artwork role follows the overlay; it is set in the hello, so reconnect - but never cut a
+        // playing song (then it applies at the next Sendspin start).
+        sendspinPlayer?.let { sp ->
+            if (sp.artworkRequested != on) {
+                if (ssLastTrack?.playing == true) Log.i(TAG, "sendspin: artwork ${if (on) "on" else "off"} at the next Sendspin start (playing now)")
+                else { Log.i(TAG, "sendspin: reconnecting so the artwork role follows the overlay ($on)"); restartSendspin() }
+            }
+        }
         publishDlnaState(p)
         Log.i(TAG, "dlna: HA set now-playing overlay enabled=$on")
     }
