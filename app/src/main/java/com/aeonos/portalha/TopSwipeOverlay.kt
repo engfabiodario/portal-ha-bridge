@@ -77,22 +77,10 @@ class TopSwipeOverlay(private val context: Context) {
             }
             root = v
             wm.addView(v, p)
+            // y=0 is the physical top edge also under the walls' `wm overscan` (measured on Master Bedroom 11-16: input frame
+            // y 8..26 for an 18 dp strip). getLocationOnScreen reports -52 there - do NOT 'correct' by it (that put it 60 px down).
             Log.i(TAG, "topswipe: shown (${width}x${dp(HEIGHT_DP)} at the top centre)")
-            // Under `wm overscan` (the walls push the status bar 52 px off-screen) a window asked for at y=0 lands ABOVE
-            // the visible screen. Measure where it really landed (as AvaKeepAlive does) and move it down by the shift.
-            main.postDelayed({ fixOverscan(v, p) }, 300L)
         }.onFailure { Log.w(TAG, "topswipe: show failed: ${it.message}"); root = null }
-    }
-
-    private fun fixOverscan(v: View, p: WindowManager.LayoutParams) {
-        if (root !== v || v.height <= 0) return
-        val loc = IntArray(2)
-        runCatching { v.getLocationOnScreen(loc) }.onFailure { return }
-        val dy = loc[1] - p.y
-        if (dy >= 0) return
-        p.y = -dy
-        runCatching { wm.updateViewLayout(v, p) }
-        Log.i(TAG, "topswipe: landed $dy px above the screen (overscan) - moved down to y=${p.y}")
     }
 
     private fun hideNow() {
