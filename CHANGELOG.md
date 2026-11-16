@@ -6,6 +6,29 @@ the latest GitHub release.
 
 ## Unreleased
 
+**Fleet build 2026-11-15 - network / CPU diet** (rollback: the previous fleet APK, `-PRE-NETDIET-0b492b76`)
+- **Camera stream**: 10 fps, 1.2 Mbit/s, key frame every 2 s by default (was 15 fps, 2 Mbit/s), render capped to the
+  encoder fps. Settable live: MQTT `portal/<id>/config/camera_encoder/set` = JSON (any subset)
+  `{"fps":10,"bitrate":1200000,"iframe_s":2,"mode":"cbr"|"vbr"}`, `status` or `reset`; reply on
+  `.../camera_encoder/status`; adb `DEBUG_CONFIG --es cameraEncoder ...`. One stream restart per change. `mode` is stored,
+  but RootEncoder 2.4.6 configures CBR whenever the codec supports it (the reply says `effective_mode`).
+- **RTSP over TCP**: packets are flushed when the client's queue drains (or every ~7.4 KB), not one by one - no more
+  28-byte runt segment after every 1476-byte packet (about half the Wi-Fi frames and ACKs for the same video).
+- **RTSP audio track** 64 -> 32 kbit/s (the track stays; it carries silence - sound comes from Ava's mic stream).
+- **MQTT discovery** once per broker session. The +20 s re-publish and Home Assistant's birth message send states only
+  (configs again only when the config set changed). Light / RGB / accelerometer / temperature heartbeat 60 s -> 10 min,
+  their last values ride along with every state burst.
+- **Self heal lan check**: no TCP probe of the router while the MQTT session received traffic in the last 2 min.
+- **Sendspin**: no artwork role while the now-playing overlay is off; multicast lock only for mDNS discovery (none with a
+  fixed server URL); while no stream runs, clock bursts + client/state every 60 s (library: 10 s / 5 s) - any stream
+  runs the library's own loops untouched.
+- **DIAL (YouTube phone cast) receiver off by default** (`DEBUG_CONFIG --ez dialEnabled true`); DLNA default off.
+- **Dashboard WebView paused** (`WebView.onPause`) while the screen is off, the photos are on top or the dashboard is
+  stopped; JS and the websocket keep running (`DEBUG_CONFIG --ez webviewPause false` turns it off).
+- **Keep-alive corner cover**: the 3 s copy is skipped when the dashboard drew nothing; identical pixels are not re-set.
+- **Meter**: `sensor.<slug>_bridge_memory` attributes `rx_bytes`, `tx_bytes`, `rx_kbps`, `tx_kbps`,
+  `traffic_window_s` (this app's uid, averaged since the previous report).
+
 **Added**
 - **Dashboard Path**: open the kiosk on any dashboard or view (`/dashboard-kitchen`) from a Home
   Assistant text entity (or adb), while the HA URL stays the plain address the app's REST calls
