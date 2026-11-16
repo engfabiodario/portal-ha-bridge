@@ -280,7 +280,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             "backoff=${if (backoffUntil > now) (backoffUntil - now) / 1000 else 0}s cover=$coverShown " +
             "switch=${if (userEnabled) "on" else "off"} paused=${pauseLeftSec()}s " +
             "copies=$n copyAvg=${String.format(java.util.Locale.US, "%.1f", avgMs)}ms " +
-            "copyMax=${copyMaxUs / 1000}ms shield=${shieldRegistered.ifEmpty { "none" }}"
+            "copyMax=${copyMaxUs / 1000}ms skipped=$skippedCopies same=$sameCopies shield=${shieldRegistered.ifEmpty { "none" }}"
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
