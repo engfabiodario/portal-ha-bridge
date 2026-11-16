@@ -137,6 +137,7 @@ class BridgeService : Service() {
         // MQTT publisher (audit bridge-code.3).
         private const val PUB_WAIT_MS = 5_000L
         private const val PUB_QUEUE_MAX = 1000
+        private const val PIPELINE_WINDOW = 32
 
         // ── Telling "the user left" apart from "an app barged in" ─────────────────────
         // Android reports the two IDENTICALLY. Measured with an Alexa announcement
@@ -2535,7 +2536,8 @@ class BridgeService : Service() {
     //  fast_lane      : navigate, screen on/off, show dashboard and screensaver dismiss run on their own command thread,
     //                   so an alert never waits behind a slow command (a camera restart, a stream re-prepare: seconds).
     //  webview_destroy: DashboardActivity.onDestroy calls WebView.destroy() (no native WebView left behind per recreate).
-    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy")
+    //  burst_pipeline : discovery configs published pipelined (32 in flight) instead of one PUBACK wait each.
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2928,13 +2930,29 @@ class BridgeService : Service() {
         val configs = buildDiscovery(p)
         val sig = configs.hashCode()
         if (force || discoverySigClient !== client || sig != discoverySigSent) {
-            configs.forEach { (topic, payload) ->
+            if (prefs?.toggle("burst_pipeline") == true) publishPipelined(client, configs)
+            else configs.forEach { (topic, payload) ->
                 client.publish(topic, if (payload.isEmpty()) emptyRetained() else retained(payload))
             }
             discoverySigSent = sig; discoverySigClient = client
             Log.i(TAG, "mqtt: discovery published (${configs.size} configs${if (force) "" else ", changed since the connect"})")
         }
         publishDiscoveryStates(p)
+    }
+
+    /**
+     * Toggle burst_pipeline (default off): the discovery configs go out without waiting for each PUBACK - up to
+     * [PIPELINE_WINDOW] in flight (Paho's maxInflight is 100), in order on the wire, then every token is awaited with
+     * the client's 30 s limit (a failure still throws and ends the session, as before). Was ~65 round trips in a row:
+     * ~20 s on Office's 250-350 ms link before the first state went out.
+     */
+    private fun publishPipelined(client: MqttClient, configs: List<Pair<String, String>>) {
+        val pending = ArrayDeque<IMqttDeliveryToken>()
+        for ((topic, payload) in configs) {
+            while (pending.size >= PIPELINE_WINDOW) pending.removeFirst().waitForCompletion(client.timeToWait)
+            pending.addLast(client.getTopic(topic).publish(if (payload.isEmpty()) emptyRetained() else retained(payload)))
+        }
+        while (pending.isNotEmpty()) pending.removeFirst().waitForCompletion(client.timeToWait)
     }
 
     /** The states that used to ride along with the discovery burst. */
