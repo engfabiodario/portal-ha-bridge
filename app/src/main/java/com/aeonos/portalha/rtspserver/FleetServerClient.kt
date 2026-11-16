@@ -93,6 +93,8 @@ class FleetServerClient(
         private const val MAX_REQUEST = 16 * 1024
         /** Flush at the latest after this many buffered bytes (~5 full TCP segments; below the 16 KB buffer). */
         private const val FLUSH_CAP = 7_400
+        /** Batch the TCP flushes (see sendLoop). Default false = the old flush per packet. Live for every client. */
+        @Volatile @JvmStatic var batchFlush = false
     }
 
     val remotePort: Int = socket.port
@@ -409,7 +411,8 @@ class FleetServerClient(
                     // fleet (2026-11-15, net diet): flush only when the queue is drained (end of a frame's burst) or
                     // FLUSH_CAP bytes are pending. A flush per packet with TCP_NODELAY sent every 1476-byte RTP packet
                     // as a full 1448-byte segment + a 28-byte runt: ~2x the Wi-Fi frames (and ACKs) for the same video.
-                    if (unflushed >= FLUSH_CAP || queue.isEmpty()) flushOut()
+                    // Toggle batchFlush (camera_encoder {"batch_flush": true}); default false = a flush per packet, as before.
+                    if (!batchFlush || unflushed >= FLUSH_CAP || queue.isEmpty()) flushOut()
                 } else {
                     val rtp = udpRtp ?: continue
                     runBlocking { rtp.sendFrame(f, false) }

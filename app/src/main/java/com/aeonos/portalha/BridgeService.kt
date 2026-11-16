@@ -982,7 +982,10 @@ class BridgeService : Service() {
     // ── Camera encoder (fleet 2026-11-15, net diet) ─────────────────────────────
     // MQTT portal/<id>/config/camera_encoder/set (not an HA entity; or DEBUG_CONFIG --es cameraEncoder):
     //   JSON, any subset: {"fps":10,"bitrate":1200000,"iframe_s":2,"mode":"cbr"|"vbr"}  -> persisted, ONE stream restart
-    //   "status" -> reply only;  "reset" -> the defaults (10 fps, 1.2 Mbit/s, 2 s, vbr requested)
+    //   "status" -> reply only;  "reset" -> the defaults (10 fps, 1.2 Mbit/s, 2 s, vbr requested, both toggles off)
+    //   Opt-in toggles (after the 21bb2cf6 no-video pilot), both default false = old behaviour:
+    //     "fps_cap": true|false      RootEncoder render fps cap (forceFpsLimit) - stream restart; known to stall 2.4.6
+    //     "batch_flush": true|false  RTSP TCP: flush when the queue drains instead of per packet - live, no restart
     // Reply (not retained) on portal/<id>/config/camera_encoder/status. Ranges: fps 5..30, bitrate 250000..6000000,
     // iframe_s 1..10. 'vbr' is stored but RootEncoder 2.4.6 configures CBR whenever the codec supports it: the reply
     // names the effective mode.
@@ -994,6 +997,7 @@ class BridgeService : Service() {
 
     private fun cameraEncoderStatus(p: Prefs, note: String = ""): String =
         "cameraencoder: fps=${encFps(p)} bitrate=${encBitrate(p)} iframe_s=${encIFrame(p)} mode=${p.streamBitrateMode} " +
+            "fps_cap=${p.streamFpsCap} batch_flush=${p.rtspBatchFlush} " +
             "effective_mode=${RtspStreamer.EFFECTIVE_MODE} running=${rtspStreamer?.let { if (it.isStreaming) it.encoderLine() else "stopped" } ?: "none"}" +
             if (note.isNotEmpty()) " | $note" else ""
 
@@ -1005,7 +1009,10 @@ class BridgeService : Service() {
             cmd.equals("status", true) || cmd.isEmpty() -> {}
             cmd.equals("reset", true) -> {
                 changed = p.streamFps != 10 || p.streamBitrate != 1_200_000 || p.streamIFrameS != 2
+                changed = changed || p.streamFpsCap
                 p.streamFps = 10; p.streamBitrate = 1_200_000; p.streamIFrameS = 2; p.streamBitrateMode = "vbr"
+                p.streamFpsCap = false; p.rtspBatchFlush = false
+                com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush = false
                 note = "reset to the defaults"
             }
             cmd.startsWith("{") -> {
@@ -1014,15 +1021,28 @@ class BridgeService : Service() {
                 else {
                     val bad = mutableListOf<String>()
                     var fps = p.streamFps; var br = p.streamBitrate; var ifr = p.streamIFrameS; var mode = p.streamBitrateMode
+                    var cap = p.streamFpsCap; var batch = p.rtspBatchFlush
+                    fun flag(k: String, cur: Boolean): Boolean {
+                        val v = o.opt(k)
+                        return when (v) { is Boolean -> v; "true", "on", "ON" -> true; "false", "off", "OFF" -> false
+                            else -> { bad += "$k (true|false)"; cur } }
+                    }
+                    if (o.has("fps_cap")) cap = flag("fps_cap", cap)
+                    if (o.has("batch_flush")) batch = flag("batch_flush", batch)
                     if (o.has("fps")) o.optInt("fps", -1).let { if (it in 5..30) fps = it else bad += "fps (5..30)" }
                     if (o.has("bitrate")) o.optInt("bitrate", -1).let { if (it in 250_000..6_000_000) br = it else bad += "bitrate (250000..6000000)" }
                     if (o.has("iframe_s")) o.optInt("iframe_s", -1).let { if (it in 1..10) ifr = it else bad += "iframe_s (1..10)" }
                     if (o.has("mode")) o.optString("mode").lowercase().let { if (it == "cbr" || it == "vbr") mode = it else bad += "mode (cbr|vbr)" }
                     if (bad.isNotEmpty()) note = "refused: bad ${bad.joinToString(", ")} - nothing changed"
                     else {
-                        changed = fps != p.streamFps || br != p.streamBitrate || ifr != p.streamIFrameS
-                        p.streamFps = fps; p.streamBitrate = br; p.streamIFrameS = ifr; p.streamBitrateMode = mode
-                        note = if (changed) "applied" else "unchanged"
+                        changed = fps != p.streamFps || br != p.streamBitrate || ifr != p.streamIFrameS || cap != p.streamFpsCap
+                        if (batch != p.rtspBatchFlush) {   // live, no restart
+                            p.rtspBatchFlush = batch
+                            com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush = batch
+                            if (!changed) note = "batch_flush=$batch applied live"
+                        }
+                        p.streamFps = fps; p.streamBitrate = br; p.streamIFrameS = ifr; p.streamBitrateMode = mode; p.streamFpsCap = cap
+                        if (changed) note = "applied" else if (note.isEmpty()) note = "unchanged"
                     }
                 }
             }
@@ -1032,6 +1052,7 @@ class BridgeService : Service() {
             commandExecutor.submit {
                 rtspStreamer?.let {
                     it.setEncoder(encFps(p), encBitrate(p), encIFrame(p))
+                    it.fpsCap = p.streamFpsCap
                     if (it.isStreaming) { it.restart(); noteRtspStarted() }
                 }
                 val line = cameraEncoderStatus(p, "$note (stream restarted once)")
@@ -3623,6 +3644,8 @@ class BridgeService : Service() {
                 if (isAloha) r.autoRotation = displayAutoRotation(p)
                 r.cameraId = p.streamCameraId
                 r.sizeOverride = parseStreamSize(p.streamSize)
+                r.fpsCap = p.streamFpsCap
+                com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush = p.rtspBatchFlush
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
                     // stream itself never opens the mic, so calls/Alexa/wake word

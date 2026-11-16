@@ -7,13 +7,18 @@ the latest GitHub release.
 ## Unreleased
 
 **Fleet build 2026-11-15 - network / CPU diet** (rollback: the previous fleet APK, `-PRE-NETDIET-0b492b76`)
-- **Camera stream**: 10 fps, 1.2 Mbit/s, key frame every 2 s by default (was 15 fps, 2 Mbit/s), render capped to the
-  encoder fps. Settable live: MQTT `portal/<id>/config/camera_encoder/set` = JSON (any subset)
+- **Camera stream**: 10 fps, 1.2 Mbit/s, key frame every 2 s by default (was 15 fps, 2 Mbit/s); the render fps cap is
+  opt-in (see below). Settable live: MQTT `portal/<id>/config/camera_encoder/set` = JSON (any subset)
   `{"fps":10,"bitrate":1200000,"iframe_s":2,"mode":"cbr"|"vbr"}`, `status` or `reset`; reply on
   `.../camera_encoder/status`; adb `DEBUG_CONFIG --es cameraEncoder ...`. One stream restart per change. `mode` is stored,
   but RootEncoder 2.4.6 configures CBR whenever the codec supports it (the reply says `effective_mode`).
-- **RTSP over TCP**: packets are flushed when the client's queue drains (or every ~7.4 KB), not one by one - no more
-  28-byte runt segment after every 1476-byte packet (about half the Wi-Fi frames and ACKs for the same video).
+- **Pilot fix (21bb2cf6 streamed no video on Coffee Area)**: the render fps cap (RootEncoder `forceFpsLimit`) is OFF -
+  on 2.4.6 a skipped frame is never consumed from the camera's SurfaceTexture (`GlStreamInterface.draw` returns before
+  `updateTexImage`), the camera buffer queue fills and frames stop. It and the TCP batch flush below are opt-in toggles,
+  both default off (old behaviour): `camera_encoder/set` `{"fps_cap": true}` (stream restart) / `{"batch_flush": true}`
+  (live).
+- **RTSP over TCP (opt-in `batch_flush`)**: packets are flushed when the client's queue drains (or every ~7.4 KB), not one
+  by one - no 28-byte runt segment after every 1476-byte packet (about half the Wi-Fi frames and ACKs for the same video).
 - **RTSP audio track** 64 -> 32 kbit/s (the track stays; it carries silence - sound comes from Ava's mic stream).
 - **MQTT discovery** once per broker session. The +20 s re-publish and Home Assistant's birth message send states only
   (configs again only when the config set changed). Light / RGB / accelerometer / temperature heartbeat 60 s -> 10 min,

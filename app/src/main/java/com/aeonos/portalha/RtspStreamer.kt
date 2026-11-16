@@ -206,9 +206,12 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // Frigate takes the Portal's sound from Ava's mic stream, so this one carries silence nearly always.
             val audioOk = s.prepareAudio(16000, false, 32_000)
             if (videoOk && audioOk) {
-                // fleet (2026-11-15): the encoder fps is only a rate-control hint with a surface input - the camera may
-                // deliver more. Cap the GL render + encoder to it so 10 fps really means 10 frames/s on the wire.
-                runCatching { s.forceFpsLimit(true) }.onFailure { Log.w(TAG, "forceFpsLimit failed: ${it.message}") }
+                // fleet (2026-11-15): render fps cap - OFF by default. The 21bb2cf6 pilot (Coffee Area, Portal+) streamed
+                // NO video with it on: RootEncoder 2.4.6 GlStreamInterface.draw() returns early on a frame FpsLimiter
+                // skips, BEFORE MainRender.updateFrame() (SurfaceTexture.updateTexImage) - a skipped camera buffer is
+                // never consumed, the camera's buffer queue fills and frames stop for good (no SPS/PPS ever encoded).
+                // Kept only as an opt-in experiment (camera_encoder {"fps_cap": true}).
+                if (fpsCap) runCatching { s.forceFpsLimit(true) }.onFailure { Log.w(TAG, "forceFpsLimit failed: ${it.message}") }
                 s.startStream()
                 isStreaming = true
                 if (fullSensor) {
@@ -250,8 +253,11 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
         baseFps = fps; baseBitrate = bitrate; baseIFrameS = iFrameS
     }
 
+    /** Opt-in render fps cap (see start): DANGEROUS on RootEncoder 2.4.6, default false. Applies at the next start. */
+    @Volatile var fpsCap = false
+
     /** What the running (or next) encoder uses: "fps=10 bitrate=1200000 iframe_s=2". */
-    fun encoderLine(): String = "fps=$baseFps bitrate=$baseBitrate iframe_s=$baseIFrameS"
+    fun encoderLine(): String = "fps=$baseFps bitrate=$baseBitrate iframe_s=$baseIFrameS fps_cap=$fpsCap batch_flush=${com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush}"
 
     fun stop() {
         isStreaming = false

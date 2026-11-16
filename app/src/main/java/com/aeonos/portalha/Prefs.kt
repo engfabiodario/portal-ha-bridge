@@ -133,6 +133,14 @@ class Prefs(private val context: Context) {
     var streamIFrameS: Int
         get() = sp.getInt("stream_iframe_s", 2)
         set(v) = sp.edit().putInt("stream_iframe_s", v).apply()
+    // Opt-in experiments after the 21bb2cf6 pilot (no video): both default OFF = the old behaviour.
+    var streamFpsCap: Boolean
+        get() = sp.getBoolean("stream_fps_cap", false)
+        set(v) = sp.edit().putBoolean("stream_fps_cap", v).apply()
+    var rtspBatchFlush: Boolean
+        get() = sp.getBoolean("rtsp_batch_flush", false)
+        set(v) = sp.edit().putBoolean("rtsp_batch_flush", v).apply()
+
     var streamBitrateMode: String
         get() = sp.getString("stream_bitrate_mode", "vbr") ?: "vbr"
         set(v) = sp.edit().putString("stream_bitrate_mode", v).apply()
