@@ -68,6 +68,104 @@ class SendspinPlayer(
     private var connectJob: Job? = null
     private var idleJob: Job? = null
     @Volatile private var audioPlayer: SendspinAudioPlayer? = null
+    @Volatile private var idle: IdleThrottle? = null
+
+    /**
+     * fleet (2026-11-15, net diet): sendspin-jvm 0.3.4 sends a clock burst (8 x client/time, 200 ms apart) every 10 s and
+     * a client/state every 5 s for as long as it is connected - playing or not (~2 messages/s each way per Portal, all
+     * day). While NO stream runs this throttle stops the library's two loops (its private clockJob / stateJob, by
+     * reflection - minify is off and the jar is pinned) and drives them itself: one library burst every 60 s, one
+     * client/state every 60 s (state changes - volume, mute - are still sent by the library at once).
+     * Whenever a stream is active the library's OWN loops run untouched (startClockSync / startPeriodicStateReports are
+     * re-invoked: a burst goes out at once, then the stock 10 s / 5 s cadence), so sync while playing is identical.
+     * Stock cadence also for the first 60 s after each server hello and 30 s after a stream ends. Any reflection
+     * failure = the throttle switches itself off for good (library default behaviour).
+     */
+    private inner class IdleThrottle(private val c: SendSpinClient, private val scope: CoroutineScope) {
+        private val cls = SendSpinClient::class.java
+        @Volatile private var failed = false
+        @Volatile private var throttled = false
+        @Volatile private var streaming = false
+        @Volatile private var lastActiveMs = android.os.SystemClock.elapsedRealtime()
+        @Volatile private var lastHelloMs = android.os.SystemClock.elapsedRealtime()
+        private var lastBurstMs = 0L
+        private var lastStateMs = 0L
+        private var loop: Job? = null
+
+        private fun now() = android.os.SystemClock.elapsedRealtime()
+
+        private fun call(name: String) {
+            cls.getDeclaredMethod(name).apply { isAccessible = true }.invoke(c)
+        }
+        private fun cancelJob(field: String) {
+            (cls.getDeclaredField(field).apply { isAccessible = true }.get(c) as? Job)?.cancel()
+        }
+        private inline fun guarded(what: String, block: () -> Unit) {
+            if (failed) return
+            runCatching(block).onFailure {
+                failed = true; throttled = false
+                Log.w(TAG, "sendspin: idle throttle off ($what: ${it.javaClass.simpleName}: ${it.message}) - library cadence")
+                runCatching { call("startClockSync"); call("startPeriodicStateReports") }
+            }
+        }
+
+        fun start() {
+            loop = scope.launch {
+                while (true) {
+                    delay(2_000)
+                    tick()
+                }
+            }
+        }
+
+        /** Library state changes: CLOCK_SYNCING = a fresh server hello (the library restarted its loops itself). */
+        fun onState(st: Any?) {
+            if (st?.toString() == "CLOCK_SYNCING") { lastHelloMs = now(); throttled = false }
+        }
+
+        /** stream/start (true) / stream/end (false), from the audio player - called on the library's thread. */
+        fun onStream(on: Boolean) {
+            streaming = on
+            lastActiveMs = now()
+            if (on && throttled) restore("stream start")
+        }
+
+        @Synchronized private fun restore(why: String) {
+            if (!throttled) return
+            guarded("restore") {
+                call("startClockSync")            // cancels any job of ours' burst, sends a burst now, then every 10 s
+                call("startPeriodicStateReports")
+                throttled = false
+                Log.i(TAG, "sendspin: library clock sync + state reports back to 10 s / 5 s ($why)")
+            }
+        }
+
+        @Synchronized private fun tick() {
+            if (failed || client !== c) return
+            val t = now()
+            val active = streaming || t - lastActiveMs < 30_000L || t - lastHelloMs < 60_000L
+            if (active) { if (throttled) restore("active"); return }
+            if (!throttled) {
+                guarded("throttle") {
+                    cancelJob("clockJob"); cancelJob("stateJob")
+                    throttled = true; lastBurstMs = t; lastStateMs = t
+                    Log.i(TAG, "sendspin: idle - clock burst + client/state every 60 s (library: 10 s / 5 s)")
+                }
+                return
+            }
+            if (t - lastStateMs >= 60_000L) { lastStateMs = t; guarded("state") { call("sendClientState") } }
+            if (t - lastBurstMs >= 60_000L) {
+                lastBurstMs = t
+                guarded("burst") { call("startClockSync") }   // one stock burst (8 probes in 1.6 s) ...
+                scope.launch {
+                    delay(2_500)
+                    synchronized(this@IdleThrottle) { if (throttled && !failed) guarded("burst end") { cancelJob("clockJob") } }
+                }
+            }
+        }
+
+        fun stop() { loop?.cancel(); loop = null }
+    }
     private var focusRequest: AudioFocusRequest? = null
 
     /**
@@ -214,10 +312,11 @@ class SendspinPlayer(
             productName = "Portal HA Bridge",
             softwareVersion = BuildConfig.VERSION_NAME,
             audioPlayerFactory = { buffer, clock ->
-                SendspinAudioPlayer(buffer, clock).also { audioPlayer = it }
+                SendspinAudioPlayer(buffer, clock).also { ap -> audioPlayer = ap; ap.onActive = { on -> idle?.onStream(on) } }
             },
         )
         client = c
+        idle = IdleThrottle(c, s)
         // Building an AudioTrack takes 50-300 ms; ask the server to schedule a stream's first
         // chunk (start / join / seek) at least this far ahead so nothing is late at start.
         c.setRequiredLeadTimeMs(400)
@@ -254,7 +353,8 @@ class SendspinPlayer(
             }
         }
 
-        s.launch { c.state.collect { Log.i(TAG, "sendspin: state $it") } }
+        s.launch { c.state.collect { Log.i(TAG, "sendspin: state $it"); idle?.onState(it) } }
+        idle?.start()
         s.launch { c.albumArtwork.collect { art ->
             Log.i(TAG, "sendspin: artwork ${art?.size ?: 0} bytes")
             if (art != null && art.isNotEmpty()) onArtwork?.invoke(art)
@@ -303,6 +403,7 @@ class SendspinPlayer(
     }
 
     fun stop() {
+        idle?.stop(); idle = null
         connectJob?.cancel(); connectJob = null
         idleJob?.cancel(); idleJob = null
         focusRequest?.let { req ->

@@ -163,9 +163,13 @@ class SendspinAudioPlayer(
         if (wasRunning) start()
     }
 
+    /** fleet (2026-11-15): stream/start (true) and stream/end (false) - SendspinPlayer's idle-chatter throttle. */
+    @Volatile var onActive: ((Boolean) -> Unit)? = null
+
     override fun start() {
         val t = track ?: run { Log.w(TAG, "sendspin: start with no track"); return }
         if (running) return
+        runCatching { onActive?.invoke(true) }   // clock sync back to the library's own cadence BEFORE the first chunk
         running = true
         written = 0
         runCatching { t.play() }.onFailure { Log.w(TAG, "sendspin: play failed: ${it.message}") }
@@ -183,6 +187,7 @@ class SendspinAudioPlayer(
     }
 
     override fun stop() {
+        runCatching { onActive?.invoke(false) }
         stopFeeder()
         releaseTrack()
         buffer.flush()            // leftovers of this stream must not leak into the next one
