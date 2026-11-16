@@ -103,6 +103,11 @@ class DashboardActivity : AppCompatActivity() {
         /** True while a dashboard activity exists. */
         fun alive(): Boolean = instance != null
 
+        /** fleet (2026-11-15): +1 per draw pass of the dashboard window (ViewTreeObserver.OnDrawListener) - the
+         *  keep-alive corner cover re-copies only when something was drawn since its last copy. */
+        @Volatile var drawSeq = 0L
+            private set
+
         // fleet (2026-11-15, net diet): the service says the dashboard is not seen (screen off, photo screensaver on
         // top). Then - or while the activity is stopped (YouTube / another app in front) - the WebView is paused with
         // WebView.onPause(): no drawing, animations or compositing. JavaScript and the HA websocket keep running
@@ -178,6 +183,7 @@ class DashboardActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         CrashRecorder.install(this)   // fleet: crash/last-crash.txt (idempotent; the service installs it too)
         setContentView(R.layout.activity_dashboard)
+        runCatching { window.decorView.viewTreeObserver.addOnDrawListener { drawSeq++ } }
 
         prefs = Prefs(this)
         BridgeService.start(this)

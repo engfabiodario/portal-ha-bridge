@@ -914,7 +914,12 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         if (!want) return
         val now = SystemClock.elapsedRealtime()
         // -50 ms: the refresh must not slip a whole 1 s tick on jitter.
-        if (forceCopy || now - lastCoverCopyMs >= COVER_REFRESH_MS - 50L) copyCover()
+        if (forceCopy || now - lastCoverCopyMs >= COVER_REFRESH_MS - 50L) {
+            // fleet (2026-11-15, net diet): the steady 3 s refresh skips the PixelCopy when the dashboard drew nothing
+            // since the last copy (its OnDrawListener counter); bursts and the YouTube screen always copy.
+            if (!forceCopy && !host.youtubeInFront && DashboardActivity.drawSeq == lastCopiedDrawSeq) { skippedCopies++; lastCoverCopyMs = now; return }
+            copyCover()
+        }
     }
 
     /**
@@ -923,13 +928,26 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
      * up to ~100 ms while a page loads (it waits for the render thread) - so it runs on a thread of
      * its own; only setting the bitmap happens on the main thread.
      */
+    private var lastCopiedDrawSeq = -1L
+    @Volatile private var skippedCopies = 0
+    @Volatile private var sameCopies = 0
+    private var lastCoverBmp: Bitmap? = null
+
     private fun copyCover() {
         lastCoverCopyMs = SystemClock.elapsedRealtime()
+        lastCopiedDrawSeq = DashboardActivity.drawSeq
         val r = Rect(coverRect)
         val h = copier() ?: return
         h.post {
             val t0 = SystemClock.elapsedRealtimeNanos()
-            val cb = { bmp: Bitmap? -> if (bmp != null && coverShown) coverView?.setImageBitmap(bmp) }
+            val cb = { bmp: Bitmap? ->
+                if (bmp != null && coverShown) {
+                    // Same pixels as on screen already: no setImageBitmap (no overlay redraw / recomposition).
+                    val prev = lastCoverBmp
+                    if (prev != null && prev.width == bmp.width && prev.height == bmp.height && prev.sameAs(bmp)) sameCopies++
+                    else { lastCoverBmp = bmp; coverView?.setImageBitmap(bmp) }
+                }
+            }
             if (host.youtubeInFront) TvAppActivity.copyRegion(r, cb) else DashboardActivity.copyRegion(r, cb)
             val us = (SystemClock.elapsedRealtimeNanos() - t0) / 1000L
             if (copyCount == Int.MAX_VALUE) { copyCount = 0; copyTotalUs = 0L }
