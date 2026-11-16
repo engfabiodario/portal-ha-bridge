@@ -1292,6 +1292,7 @@ class BridgeService : Service() {
 
         registerScreenReceiver()
         registerAudioReceiver()
+        if (p.toggle("fast_reconnect")) ensureNetworkCallback()
         // Stops Portal's launcher from idle-kicking us to the home screen.
         mediaKeepAlive.start(this)
 
@@ -1552,6 +1553,9 @@ class BridgeService : Service() {
         timeoutHandler.removeCallbacks(displayRotateApply)
         runCatching { getSystemService(CameraManager::class.java).unregisterAvailabilityCallback(cameraAvailabilityCallback) }
         mediaKeepAlive.stop()
+        netCallback?.let { cb -> runCatching { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } }
+        netCallback = null
+        fastExecutor.shutdownNow()
         presenceMonitor?.release()
         timeoutHandler.removeCallbacks(timeoutRunnable)
         timeoutThread.quitSafely()
@@ -2234,6 +2238,10 @@ class BridgeService : Service() {
                 //                                  (--el / --es are accepted too.)
                 //   --es keepAlivePackage com.example.ava
                 //   --ez keepAliveStatus true      (logs one "keepalive: status ..." line)
+                //   --es toggle <name>:on|off     reliability toggles (fast_reconnect, fast_lane); 'list' logs them
+                intent.getStringExtra("toggle")?.let { t ->
+                    Log.i(TAG, "config: " + if (t.trim() == "list") togglesLine(p) else applyToggle(t, p))
+                }
                 //   --ez webviewPause true|false  pause the dashboard WebView while not seen (default true)
                 if (intent.hasExtra("webviewPause")) {
                     p.webviewPauseHidden = intent.getBooleanExtra("webviewPause", true)
@@ -2519,6 +2527,62 @@ class BridgeService : Service() {
         runCatching { c.disconnectForcibly(0L, timeoutMs) }
     }
 
+    // ── Opt-in toggles (reliability pass 2026-11-15; Prefs.toggle, all default OFF = old behaviour) ──────────────
+    //  fast_reconnect : a network that becomes available cuts the MQTT reconnect backoff short (0-2 s jitter) - after
+    //                   a Deco reboot / Wi-Fi drop the Portal reconnects as soon as Wi-Fi is back instead of up to 15 s later.
+    //  fast_lane      : navigate, screen on/off, show dashboard and screensaver dismiss run on their own command thread,
+    //                   so an alert never waits behind a slow command (a camera restart, a stream re-prepare: seconds).
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane")
+    private fun toggleOn(name: String) = prefs?.toggle(name) == true
+    private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
+    /** "<name>:on|off" -> applied line, or an error. */
+    private fun applyToggle(arg: String, p: Prefs): String {
+        val name = arg.substringBefore(':').trim().lowercase()
+        val v = arg.substringAfter(':', "").trim().lowercase()
+        if (name !in TOGGLES) return "unknown toggle '$name' (${TOGGLES.joinToString()})"
+        if (v != "on" && v != "off") return "toggle $name: use on|off"
+        p.setToggle(name, v == "on")
+        if (name == "fast_reconnect") ensureNetworkCallback()
+        return "toggle $name=$v | ${togglesLine(p)}"
+    }
+
+    // fast_reconnect: the reconnect backoff waits on this monitor; a network coming up wakes it (only with the toggle on).
+    private val backoffWake = Object()
+    @Volatile private var backoffWoken = false
+    private fun waitBackoff(ms: Long) {
+        synchronized(backoffWake) {
+            backoffWoken = false
+            val end = android.os.SystemClock.elapsedRealtime() + ms
+            while (!backoffWoken && running.get()) {
+                val left = end - android.os.SystemClock.elapsedRealtime()
+                if (left <= 0) break
+                try { backoffWake.wait(left) } catch (e: InterruptedException) { Thread.currentThread().interrupt(); return }
+            }
+        }
+        if (backoffWoken) { Log.i(TAG, "mqtt: network available - reconnecting now (fast_reconnect)"); sleep((Math.random() * 2_000).toLong()) }
+    }
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private fun ensureNetworkCallback() {
+        if (netCallback != null) return
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                if (!toggleOn("fast_reconnect")) return
+                if (mqtt?.isConnected == true) return
+                synchronized(backoffWake) { backoffWoken = true; backoffWake.notifyAll() }
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(cb); netCallback = cb }
+            .onFailure { Log.w(TAG, "mqtt: network callback failed: ${it.message}") }
+    }
+
+    // Fast lane (toggle fast_lane): the UI commands an alert needs, on their own single thread.
+    private val fastExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "portal-ha-cmd-fast").also { it.isDaemon = true } }
+    private fun isFastLane(topic: String, p: Prefs): Boolean =
+        topic == HaDiscovery.navigateCommandTopic(p.deviceId) || topic == HaDiscovery.NAVIGATE_FLEET_TOPIC ||
+            topic == HaDiscovery.commandTopic(p.deviceId) || topic == HaDiscovery.showDashboardCommandTopic(p.deviceId) ||
+            topic == HaDiscovery.screensaverDismissCommandTopic(p.deviceId) || topic == HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC
+
     // The session loop waits on this instead of a plain 5 s sleep: a lost / dropped session is noticed at once.
     private val mqttWake = Object()
     private fun wakeMqttLoop() { synchronized(mqttWake) { mqttWake.notifyAll() } }
@@ -2539,7 +2603,7 @@ class BridgeService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "MQTT error, retry in ~${backoff / 1000}s: ${e.message}")
             }
-            if (running.get()) sleep(backoff + (Math.random() * backoff * 0.2).toLong())
+            if (running.get()) waitBackoff(backoff + (Math.random() * backoff * 0.2).toLong())
             backoff = minOf(backoff * 2, MQTT_BACKOFF_MAX_MS)
         }
     }
@@ -2589,7 +2653,8 @@ class BridgeService : Service() {
                 val payload = msg.toString().trim()
                 Log.i(TAG, "messageArrived: topic=$topic payload=$payload")
                 runCatching {
-                    commandExecutor.submit {
+                    val ex = if (p.toggle("fast_lane") && isFastLane(topic, p)) fastExecutor else commandExecutor
+                    ex.submit {
                         runCatching { handleMessage(topic, payload, p) }
                             .onFailure { Log.w(TAG, "command handler failed: ${it.message}") }
                     }
@@ -2672,10 +2737,16 @@ class BridgeService : Service() {
             WatchTogether.TOPIC,
             WatchTogether.MEMBERS_FILTER,
             HA_STATUS_TOPIC
-        ).forEach { client.subscribe(it, 1) }
+        ).let { topics ->
+            // fleet (2026-11-15, reliability): ONE SUBSCRIBE packet for all ~45 filters (was one synchronous round trip
+            // each - ~45 x RTT before any command could arrive; on Office's 250-350 ms Wi-Fi ~15 s after every reconnect).
+            // Same filters, same QoS; Paho still throws if the broker refuses any of them.
+            val all = topics + (intercom?.subscriptions()?.map { it.first } ?: emptyList())
+            val qos = IntArray(topics.size) { 1 } + (intercom?.subscriptions()?.map { it.second } ?: emptyList()).toIntArray()
+            client.subscribe(all.toTypedArray(), qos)
+        }
 
-        // Intercom: subscribe to presence/lock/audio and announce ourselves.
-        intercom?.subscriptions()?.forEach { (topic, qos) -> client.subscribe(topic, qos) }
+        // Intercom: announce ourselves (its subscriptions went out with the batch above).
         intercom?.publishPresence()
 
         // Clear stale retained entities from old builds
@@ -3261,7 +3332,7 @@ class BridgeService : Service() {
     private val serviceRestarts = ArrayDeque<Long>()
 
     private fun publishCapabilities(p: Prefs) {
-        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"wifi_perf_lock\",\"status\"]," +
+        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
             "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
@@ -3310,6 +3381,8 @@ class BridgeService : Service() {
                     }.onFailure { Log.w(TAG, "control: restart_service failed: ${it.message}") }
                 }, 1_500L)
             }
+            cmd == "toggles" -> say(togglesLine(p))
+            cmd.startsWith("toggle:") -> say(applyToggle(cmd.substringAfter("toggle:"), p))
             cmd.startsWith("wifi_perf_lock") -> {
                 val v = cmd.substringAfter(':', "").trim()
                 if (v == "on" || v == "off") { p.wifiPerfLock = v == "on"; updateWifiPerfLock("control") }
