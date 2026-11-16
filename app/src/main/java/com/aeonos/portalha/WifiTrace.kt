@@ -133,13 +133,19 @@ object WifiTrace {
             Log.i(TAG, "wifi trace: network id from earlier traces: $lastNetId")
         }
         while (running) {
+            // fleet (2026-11-15): the process + file are closed in finally - an exception (write error, storage gone)
+            // left the logcat child running (blocked on a full pipe) and the FileWriter open, one more of each per minute.
+            var pRef: Process? = null
+            var outRef: FileWriter? = null
             try {
                 // -T 1: start at the newest line (no backlog dump into the file on every restart).
                 val cmd = listOf("logcat", "-v", "threadtime", "-T", "1", "-s") + FILTER + nmTags()
                 val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+                pRef = p
                 process = p
                 if (first) { Log.i(TAG, "wifi trace: recording to ${File(dir, "wifi-trace.txt")}"); first = false }
                 var out = FileWriter(File(dir, "wifi-trace.txt"), true)
+                outRef = out
                 var size = File(dir, "wifi-trace.txt").length()
                 out.write("---- wifi trace started ${java.util.Date()} (NetworkMonitor/$nmStart..${nmStart + NM_WINDOW - 1})\n"); out.flush()
                 var nextWindowCheck = System.currentTimeMillis() + 60_000L
@@ -180,6 +186,7 @@ object WifiTrace {
                             val cur = File(dir, "wifi-trace.txt"); val old = File(dir, "wifi-trace.1.txt")
                             runCatching { old.delete(); cur.renameTo(old) }
                             out = FileWriter(File(dir, "wifi-trace.txt"), true); size = 0L
+                            outRef = out
                         }
                     }
                 }
@@ -188,6 +195,8 @@ object WifiTrace {
                 if (rewindow) { runCatching { p.destroy() }; continue }   // new NetworkMonitor window, no 60 s pause
             } catch (e: Exception) {
                 Log.w(TAG, "wifi trace: reader stopped: ${e.message} (READ_LOGS granted?)")
+                runCatching { outRef?.close() }
+                runCatching { pRef?.destroy() }
             }
             if (running) runCatching { Thread.sleep(60_000L) }
         }
