@@ -6,6 +6,20 @@ the latest GitHub release.
 
 ## Unreleased
 
+**Fleet build 2026-11-15 - reliability pass** (on top of the network diet; rollback: the NETDIET2 APK `c5788776`)
+- Always on (behaviour-neutral): MQTT disconnects bounded to 1-2 s (Paho's `disconnect()` waits forever - it could wedge
+  the self-heal thread or the main thread at stop); the session loop notices a lost session at once (was up to 5 s);
+  ONE SUBSCRIBE for all topic filters (was ~45 round trips before the first command could arrive); the RTSP accept loop
+  pauses 250 ms on a failing accept() (fd exhaustion spun it); the motion camera's thread is released; logcat readers
+  that end at once back off (a new logcat every 2 s); the Wi-Fi trace closes its file + logcat child on errors; the
+  HA token is never logged; the keep-alive cover tick runs every 10 s while the screen is off; control `status` shows
+  the command thread (`cmd busy Ns on '<topic>'`, logged past 60 s).
+- Opt-in toggles, all OFF by default: MQTT `portal/<id>/control/set` `toggle:<name>:on|off`, `toggles` (list); adb
+  `DEBUG_CONFIG --es toggle <name>:on|off|list`. `fast_reconnect` (a network coming up cuts the reconnect backoff),
+  `fast_lane` (navigate / screen / show dashboard / screensaver dismiss on their own thread), `webview_destroy`
+  (destroy the dashboard WebView with its activity), `burst_pipeline` (discovery configs pipelined, 32 in flight),
+  `mqtt_stale_check` (self-heal: connected but nothing received for 100 s = down).
+
 **Fleet build 2026-11-15 - network / CPU diet** (rollback: the previous fleet APK, `-PRE-NETDIET-0b492b76`)
 - **Camera stream**: 10 fps, 1.2 Mbit/s, key frame every 2 s by default (was 15 fps, 2 Mbit/s); the render fps cap is
   opt-in (see below). Settable live: MQTT `portal/<id>/config/camera_encoder/set` = JSON (any subset)
