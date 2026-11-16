@@ -1169,6 +1169,7 @@ class BridgeService : Service() {
         override fun run() {
             checkScreenTimeout()
             runCatching { reconcileWebPause("tick") }
+            runCatching { checkCommandThread() }
             runCatching { checkScreensaver() }.onFailure { Log.w(TAG, "screensaver check: ${it.message}") }
             runCatching { checkCallReturn() }.onFailure { Log.w(TAG, "call-return check: ${it.message}") }
             timeoutHandler.postDelayed(this, 15_000L)
@@ -1495,6 +1496,7 @@ class BridgeService : Service() {
         publishOfflineBeforeStop()
         mqtt?.let { disconnectBounded(it, 1_000L) }
         wakeMqttLoop()
+        synchronized(backoffWake) { backoffWake.notifyAll() }   // the old loop ends now, not after its backoff
         screenReceiver?.let { unregisterReceiver(it) }
         audioReceiver?.let { unregisterReceiver(it) }
         alexaTurnDoneReceiver?.let { runCatching { unregisterReceiver(it) } }
@@ -2583,6 +2585,25 @@ class BridgeService : Service() {
             topic == HaDiscovery.commandTopic(p.deviceId) || topic == HaDiscovery.showDashboardCommandTopic(p.deviceId) ||
             topic == HaDiscovery.screensaverDismissCommandTopic(p.deviceId) || topic == HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC
 
+    // Command-thread watch (diagnostics only): which MQTT command the single command thread is in, since when. A handler
+    // stuck there holds up every later command (navigate, screen, alerts) - now visible in control 'status' and logged.
+    @Volatile private var cmdBusySince = 0L
+    @Volatile private var cmdBusyTopic = ""
+    private var cmdBusyLogged = 0L
+    private fun cmdBusyLine(): String {
+        val t = cmdBusySince
+        return if (t == 0L) "cmd idle" else "cmd busy ${(android.os.SystemClock.elapsedRealtime() - t) / 1000}s on '$cmdBusyTopic'"
+    }
+    private fun checkCommandThread() {
+        val t = cmdBusySince
+        if (t == 0L) return
+        val age = android.os.SystemClock.elapsedRealtime() - t
+        if (age > 60_000L && t != cmdBusyLogged) {
+            cmdBusyLogged = t
+            Log.w(TAG, "command thread: still in '$cmdBusyTopic' after ${age / 1000} s - later commands wait (fast_lane toggle bypasses it for alerts)")
+        }
+    }
+
     // The session loop waits on this instead of a plain 5 s sleep: a lost / dropped session is noticed at once.
     private val mqttWake = Object()
     private fun wakeMqttLoop() { synchronized(mqttWake) { mqttWake.notifyAll() } }
@@ -2662,8 +2683,12 @@ class BridgeService : Service() {
                 runCatching {
                     val ex = if (p.toggle("fast_lane") && isFastLane(topic, p)) fastExecutor else commandExecutor
                     ex.submit {
-                        runCatching { handleMessage(topic, payload, p) }
-                            .onFailure { Log.w(TAG, "command handler failed: ${it.message}") }
+                        val fast = ex === fastExecutor
+                        if (!fast) { cmdBusyTopic = topic; cmdBusySince = android.os.SystemClock.elapsedRealtime() }
+                        try {
+                            runCatching { handleMessage(topic, payload, p) }
+                                .onFailure { Log.w(TAG, "command handler failed: ${it.message}") }
+                        } finally { if (!fast) cmdBusySince = 0L }
                     }
                 }
             }
@@ -3349,7 +3374,7 @@ class BridgeService : Service() {
     private fun bridgeStatusExtras(): String =
         "${FleetCameraSource.status()} | revive attempts=$reviveAttempts last='$reviveLast' | ${presenceMonitor?.status() ?: "presence: off"} | " +
             "${pubStatus()} | wifiPerfLock pref=${prefs?.wifiPerfLock} held=${wifiPerfLock?.isHeld == true} | webview failedFor=${DashboardActivity.loadFailedForMs() / 1000}s | " +
-            "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null}"
+            "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null} | ${cmdBusyLine()} | ${prefs?.let { togglesLine(it) } ?: ""}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
