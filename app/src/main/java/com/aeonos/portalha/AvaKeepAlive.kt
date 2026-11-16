@@ -757,7 +757,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     private val coverTick = object : Runnable {
         override fun run() {
             runCatching { updateCover() }
-            main.postDelayed(this, COVER_TICK_MS)
+            // fleet (2026-11-15): screen off + no cover = nothing for this tick to do (wantCover needs the screen on, and
+            // onScreen(true) updates the cover at once): 10 s instead of 1 s - ~50k fewer main-thread wakeups a night.
+            main.postDelayed(this, if (host.screenIsOn || coverShown) COVER_TICK_MS else 10_000L)
         }
     }
 
