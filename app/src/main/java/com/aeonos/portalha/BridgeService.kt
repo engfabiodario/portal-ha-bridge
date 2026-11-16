@@ -2534,7 +2534,8 @@ class BridgeService : Service() {
     //                   a Deco reboot / Wi-Fi drop the Portal reconnects as soon as Wi-Fi is back instead of up to 15 s later.
     //  fast_lane      : navigate, screen on/off, show dashboard and screensaver dismiss run on their own command thread,
     //                   so an alert never waits behind a slow command (a camera restart, a stream re-prepare: seconds).
-    private val TOGGLES = listOf("fast_reconnect", "fast_lane")
+    //  webview_destroy: DashboardActivity.onDestroy calls WebView.destroy() (no native WebView left behind per recreate).
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */

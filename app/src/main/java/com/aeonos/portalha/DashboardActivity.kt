@@ -754,6 +754,19 @@ class DashboardActivity : AppCompatActivity() {
         retryHandler.removeCallbacks(loadRetry)
         runCatching { unregisterReceiver(clearCacheReceiver) }
         if (instance === this) instance = null
+        // fleet (2026-11-15, toggle webview_destroy, default off): a destroyed dashboard (renderer-gone recreate(), kiosk
+        // rebuild, display-density change) never called WebView.destroy() - each such WebView's native Chromium side
+        // (AwContents, its tiles and JS heap references) stayed allocated; after a renderer OOM that is exactly the
+        // memory the new dashboard needs. Android requires destroy() after onRenderProcessGone.
+        if (::webView.isInitialized && runCatching { prefs.toggle("webview_destroy") }.getOrDefault(false)) {
+            runCatching {
+                (webView.parent as? android.view.ViewGroup)?.removeView(webView)
+                webView.stopLoading()
+                webView.removeJavascriptInterface("externalApp")
+                webView.destroy()
+                android.util.Log.i("PortalHA", "webview: destroyed with its activity (webview_destroy)")
+            }.onFailure { android.util.Log.w("PortalHA", "webview: destroy failed: ${it.message}") }
+        }
         super.onDestroy()
     }
 }
