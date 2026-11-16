@@ -2651,7 +2651,14 @@ class BridgeService : Service() {
                 // the manager from the raw bytes. handleRawMessage is non-blocking.
                 if (intercom?.handleRawMessage(topic, msg.payload) == true) return
                 val payload = msg.toString().trim()
-                Log.i(TAG, "messageArrived: topic=$topic payload=$payload")
+                // fleet (2026-11-15): never log the HA token (it went to logcat - and from there into the crash/exit dumps
+                // on /sdcard that the Fleet Agent serves); cap other payloads at 300 chars.
+                val shown = when {
+                    topic == HaDiscovery.haTokenCommandTopic(p.deviceId) -> "<redacted, ${payload.length} chars>"
+                    payload.length > 300 -> payload.take(300) + "... (${payload.length} chars)"
+                    else -> payload
+                }
+                Log.i(TAG, "messageArrived: topic=$topic payload=$shown")
                 runCatching {
                     val ex = if (p.toggle("fast_lane") && isFastLane(topic, p)) fastExecutor else commandExecutor
                     ex.submit {
