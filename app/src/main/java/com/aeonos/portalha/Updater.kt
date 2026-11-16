@@ -20,6 +20,7 @@ object Updater {
     private const val TAG = "PortalHA"
     private const val REPO = "RoadRunner-1024/portal-ha-bridge"
     private const val APK_ASSET = "portal-ha-bridge.apk"
+    private const val FLEET_BUILD = true
 
     data class Release(val version: String, val apkUrl: String, val notes: String = "")
 
@@ -27,6 +28,9 @@ object Updater {
     // and the release notes body (markdown — shown as the changelog in prompts).
     // Runs on a background thread; throws on network/parse error.
     fun fetchLatest(): Release {
+        // Fleet 2026-11-16: never offer upstream releases - they are signed with another key (the install can only fail)
+        // and the prompt is a full-screen activity over the dashboard (camera off). Fleet updates: Setup-All / Fleet Agent.
+        if (FLEET_BUILD) throw IllegalStateException("fleet build - updates come from Setup-All / the Fleet Agent")
         val conn = (URL("https://api.github.com/repos/$REPO/releases/latest").openConnection()
             as HttpURLConnection).apply {
             connectTimeout = 10_000; readTimeout = 10_000

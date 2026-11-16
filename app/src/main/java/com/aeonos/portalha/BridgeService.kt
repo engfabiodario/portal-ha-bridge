@@ -1128,6 +1128,9 @@ class BridgeService : Service() {
     // (e.g. the 10" Portal) keep the accelerometer auto-rotate.
     private val isAloha = android.os.Build.DEVICE.equals("aloha", true)
     private val isCipher = android.os.Build.DEVICE.equals("cipher", true)
+    // Fleet 2026-11-16: the Echo Show 8 (crown) camera is fixed too - the accelerometer path set its stream to 90 deg on
+    // some starts and 0 on others (11-16: both Shows sideways after a reinstall). Fixed = streamRotation only (Shows: 90).
+    private val isFixedCamera = isCipher || android.os.Build.DEVICE.equals("crown", true)
     private val orientationApply = Runnable { commitDeviceOrientation() }
     // Fleet (aloha): stream rotation = streamRotation (landscape base) + the DISPLAY rotation.
     // The Portal+ camera sits in the pivoting screen, so a portrait screen (display rotation 1)
@@ -1337,8 +1340,8 @@ class BridgeService : Service() {
         if (p.cameraServiceEnabled && isAloha) {
             registerDisplayRotationWatch()
             Log.i(TAG, "orientation: aloha stream follows the display rotation (auto=${p.streamAutoRotate}, base=${p.streamRotation})")
-        } else if (p.cameraServiceEnabled && isCipher) {
-            Log.i(TAG, "orientation auto-rotate disabled (Portal+ camera is fixed; uses streamRotation)")
+        } else if (p.cameraServiceEnabled && isFixedCamera) {
+            Log.i(TAG, "orientation auto-rotate disabled (fixed camera on ${android.os.Build.DEVICE}; uses streamRotation=${p.streamRotation})")
         } else if (p.cameraServiceEnabled && orientationListener.canDetectOrientation()) {
             orientationListener.enable()
             Log.i(TAG, "orientation auto-rotate enabled (accelerometer)")
