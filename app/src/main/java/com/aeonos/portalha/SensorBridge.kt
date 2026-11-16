@@ -27,7 +27,9 @@ class SensorBridge(
         private const val GRAVITY_ALPHA = 0.85f
 
         // Publish deadbands (see Gate). A change must clear both the absolute and the relative band.
-        private const val HEARTBEAT_MS = 60_000L
+        // fleet (2026-11-15, net diet): 10 min (was 60 s). Changes still go out at once, and every MQTT connect / HA
+        // birth burst re-sends the last values ([republish]), which is what the heartbeat was for.
+        private const val HEARTBEAT_MS = 10 * 60_000L
         private const val LIGHT_MIN_LX = 5f            // ambient light: >= max(5 lx, 10 %)
         private const val LIGHT_REL = 0.10f
         private const val LIGHT_MIN_INTERVAL_MS = 5_000L
@@ -84,6 +86,13 @@ class SensorBridge(
                 return
             }
             if (now - lastMs >= HEARTBEAT_MS) { lastMs = now; onPublish(topic(p), last, 0) }
+        }
+
+        /** The last published payload again (MQTT connect / HA birth burst). Sensor thread. */
+        fun resend() {
+            val p = prefs ?: return
+            val last = payload ?: return
+            onPublish(topic(p), last, 0)
         }
 
         // Publishes the latest reading at once (first reading, or a settings change like the offset).
@@ -187,6 +196,11 @@ class SensorBridge(
         { pubTemp = lastTemp; "%.1f".format(lastTemp + (prefs?.tempOffset ?: 0f)) })
 
     @Volatile private var prefs: Prefs? = null
+
+    /** Re-send every sensor's last value (the MQTT state burst); off the caller's thread. */
+    fun republish() {
+        handler.post { listOf(lightGate, rgbGate, accelGate, tempGate).forEach { runCatching { it.resend() } } }
+    }
 
     fun start(prefs: Prefs) {
         this.prefs = prefs

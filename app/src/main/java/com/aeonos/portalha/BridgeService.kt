@@ -2710,6 +2710,7 @@ class BridgeService : Service() {
             } ?: recomputePresence(p)
         }
         publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
+        sensorBridge?.republish()   // light / rgb / accel / temperature: the 10-min heartbeat relies on this burst
         publishWifiSignal(force = true)
         publishDesktopState(p)
         publishDashboardPathState(p)
