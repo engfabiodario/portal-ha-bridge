@@ -106,9 +106,13 @@ class FleetRtspServer(
             } catch (e: SocketException) {
                 break          // server.close() called
             } catch (e: IOException) {
+                // fleet (2026-11-15, reliability): an accept() that keeps failing (EMFILE - out of file descriptors -
+                // or ENOBUFS) used to spin this loop at full speed, logging thousands of lines a second. Pause briefly.
                 Log.w(TAG, "rtsp: accept error: ${e.message}")
+                try { Thread.sleep(250) } catch (ie: InterruptedException) { break }
             } catch (e: Exception) {
                 Log.w(TAG, "rtsp: accept loop error: ${e.message}", e)
+                try { Thread.sleep(250) } catch (ie: InterruptedException) { break }
             }
         }
         Log.i(TAG, "rtsp: server finished")

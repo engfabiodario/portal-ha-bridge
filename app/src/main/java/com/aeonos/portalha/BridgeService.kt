@@ -1492,7 +1492,8 @@ class BridgeService : Service() {
         commandExecutor.shutdownNow()
         // fleet: a clean stop tells HA right away (the broker drops the last will on a clean DISCONNECT).
         publishOfflineBeforeStop()
-        runCatching { mqtt?.disconnect(0) }
+        mqtt?.let { disconnectBounded(it, 1_000L) }
+        wakeMqttLoop()
         screenReceiver?.let { unregisterReceiver(it) }
         audioReceiver?.let { unregisterReceiver(it) }
         alexaTurnDoneReceiver?.let { runCatching { unregisterReceiver(it) } }
@@ -2503,9 +2504,26 @@ class BridgeService : Service() {
      * is what actually reconnects, so this only has to make the existing session end.
      */
     private fun restartMqtt() {
-        runCatching { mqtt?.disconnect(0) }
+        val c = mqtt
         mqtt = null
+        c?.let { disconnectBounded(it) }
+        wakeMqttLoop()
         Log.i(TAG, "config: dropped the broker connection — reconnecting with the new settings")
+    }
+
+    // fleet (2026-11-15, reliability): Paho's MqttClient.disconnect(long) waits for its token with NO timeout
+    // (waitForCompletion()), so on a half-dead link the caller could hang for good - restartMqtt runs on the self-heal
+    // thread (its MQTT fix would wedge every later self-heal check) and onDestroy on the main thread (ANR). The forcible
+    // variant sends the same DISCONNECT (clean: no last will) and gives up after [timeoutMs].
+    private fun disconnectBounded(c: MqttClient, timeoutMs: Long = 2_000L) {
+        runCatching { c.disconnectForcibly(0L, timeoutMs) }
+    }
+
+    // The session loop waits on this instead of a plain 5 s sleep: a lost / dropped session is noticed at once.
+    private val mqttWake = Object()
+    private fun wakeMqttLoop() { synchronized(mqttWake) { mqttWake.notifyAll() } }
+    private fun waitMqttWake(ms: Long) {
+        synchronized(mqttWake) { try { mqttWake.wait(ms) } catch (e: InterruptedException) { Thread.currentThread().interrupt() } }
     }
 
     // fleet (2026-10-08): reconnect backoff 5 s -> 10 s -> 15 s cap (was 60 s) with up to +20 % jitter, so a
@@ -2560,6 +2578,7 @@ class BridgeService : Service() {
             override fun connectionLost(cause: Throwable?) {
                 Log.w(TAG, "Connection lost: ${cause?.message}")
                 if (mqtt === client) mqtt = null
+                wakeMqttLoop()
             }
             override fun messageArrived(topic: String, msg: MqttMessage) {
                 lastMqttInboundMs = android.os.SystemClock.elapsedRealtime()
@@ -2698,14 +2717,14 @@ class BridgeService : Service() {
         DashboardActivity.retryIfFailed("MQTT connected")
 
             while (running.get() && client.isConnected && mqtt === client) {
-                sleep(5_000)
+                waitMqttWake(5_000)
+                if (!running.get() || !client.isConnected || mqtt !== client) break
                 pollChangedStates(p)
             }
         } finally {
             runCatching { intercom?.clearPresence() }   // retract our retained presence
             if (mqtt === client) mqtt = null
-            runCatching { client.disconnect(0) }
-            if (runCatching { client.isConnected }.getOrDefault(false)) runCatching { client.disconnectForcibly(0L, 1_000L) }
+            if (runCatching { client.isConnected }.getOrDefault(false)) disconnectBounded(client)
             runCatching { client.close() }
         }
     }
@@ -3675,7 +3694,8 @@ class BridgeService : Service() {
     // Stop the motion CameraStream without its onStateChange firing a stale OFF
     // (which would race an RTSP ON publish — the camera-state flicker bug).
     private fun stopCameraStreamSilently() {
-        cameraStream?.let { it.onStateChange = null; it.stop() }
+        // release() = stop() + quit its HandlerThread (stop() alone leaked one thread per motion -> stream switch).
+        cameraStream?.let { it.onStateChange = null; it.release() }
         cameraStream = null
     }
 
