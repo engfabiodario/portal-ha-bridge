@@ -121,6 +121,7 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
             if (last != null) onLogLine(last)
         }
         while (started && me === logThread) {
+            val began = android.os.SystemClock.elapsedRealtime()
             try {
                 val p = ProcessBuilder("logcat", "-v", "brief", "-T", "1", "-s", "ActivityManager:W", "MicrophoneInput:E")
                     .redirectErrorStream(true).start()
@@ -131,7 +132,9 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
                         onLogLine(line)
                     }
                 }
-                failures = 0
+                // fleet (2026-11-15): a reader that ends at once (logd restart, READ_LOGS gone) counted as healthy and was
+                // restarted every 2 s forever - a new logcat process each time. Only a reader that lived 5 min resets it.
+                if (android.os.SystemClock.elapsedRealtime() - began > 5 * 60_000L) failures = 0 else failures++
             } catch (e: Exception) {
                 if (me === logThread) { failures++; Log.w(TAG, "avamic: log reader: ${e.message}") }
             } finally {

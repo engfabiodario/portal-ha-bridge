@@ -704,6 +704,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         var failures = 0
         val me = Thread.currentThread()
         while (started && enabled && me === logThread) {
+            val began = android.os.SystemClock.elapsedRealtime()
             try {
                 // -T 1: start at the newest line (no backlog). READ_LOGS is granted at provisioning.
                 val p = ProcessBuilder("logcat", "-v", "brief", "-T", "1", "-s", "AudioPolicyService")
@@ -716,7 +717,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
                         onLogLine(line)
                     }
                 }
-                failures = 0
+                // fleet (2026-11-15): a reader that ends at once (logd restart, READ_LOGS gone) counted as healthy and was
+                // restarted every 2 s forever - a new logcat process each time. Only a reader that lived 5 min resets it.
+                if (android.os.SystemClock.elapsedRealtime() - began > 5 * 60_000L) failures = 0 else failures++
             } catch (e: Exception) {
                 if (me === logThread) { failures++; Log.w(TAG, "keepalive: log reader: ${e.message}") }
             } finally {
