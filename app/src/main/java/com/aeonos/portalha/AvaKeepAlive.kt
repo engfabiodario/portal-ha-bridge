@@ -631,7 +631,15 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     }
 
     private fun resolve(): Boolean {
-        if (component != null && avaUid >= 0) return true
+        if (component != null && avaUid >= 0) {
+            // fleet (2026-11-16): Ava re-installed (fleet-build swap = uninstall + install) gets a NEW uid; the cached one
+            // made the AudioPolicyService watch ignore the real Ava (silenced, never re-parked) until a Bridge restart.
+            val now = runCatching { ctx.packageManager.getApplicationInfo(pkg, 0).uid }.getOrDefault(-1)
+            if (now == avaUid) return true
+            Log.i(TAG, "keepalive: $pkg uid $avaUid -> $now (re-installed)")
+            component = null; avaUid = -1; avaFg = -1; avaAppState = -1
+            if (now < 0) return false
+        }
         return runCatching {
             val pm = ctx.packageManager
             val ai = pm.getApplicationInfo(pkg, 0)
