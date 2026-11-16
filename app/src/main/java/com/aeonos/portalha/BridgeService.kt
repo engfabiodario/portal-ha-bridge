@@ -1295,6 +1295,7 @@ class BridgeService : Service() {
         registerScreenReceiver()
         registerAudioReceiver()
         if (p.toggle("fast_reconnect")) ensureNetworkCallback()
+        wakeHandler.post { applyTopSwipe() }
         // Stops Portal's launcher from idle-kicking us to the home screen.
         mediaKeepAlive.start(this)
 
@@ -1489,6 +1490,7 @@ class BridgeService : Service() {
         runCatching { smartCamera?.stop() }; smartCamera = null
         runCatching { screensaver.hide() }
         runCatching { desktopButton.hide() }
+        runCatching { topSwipe.hide() }
         runCatching { sleepCover.hide() }   // never outlive the service holding the screen black
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
         dreamObserver = null
@@ -2538,7 +2540,8 @@ class BridgeService : Service() {
     //  webview_destroy: DashboardActivity.onDestroy calls WebView.destroy() (no native WebView left behind per recreate).
     //  burst_pipeline : discovery configs published pipelined (32 in flight) instead of one PUBACK wait each.
     //  mqtt_stale_check: self-heal treats a 'connected' session with nothing received for 100 s as down (-> reconnect).
-    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check")
+    //  top_swipe      : (2026-11-16) a downward swipe from the middle of the top edge opens desktop mode (TopSwipeOverlay).
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2549,6 +2552,7 @@ class BridgeService : Service() {
         if (v != "on" && v != "off") return "toggle $name: use on|off"
         p.setToggle(name, v == "on")
         if (name == "fast_reconnect") ensureNetworkCallback()
+        if (name == "top_swipe") wakeHandler.post { applyTopSwipe() }
         return "toggle $name=$v | ${togglesLine(p)}"
     }
 
@@ -4153,6 +4157,12 @@ class BridgeService : Service() {
     private val desktopEndRunnable = Runnable { checkDesktopEnd() }
     // Fleet 2026-10-23: the floating "Back | Dashboard" pill, shown ONLY while desktop mode is on (the walls have no
     // on-screen Back/Home: bar overscanned away, Immortal quick buttons off - a full-screen app trapped the user).
+    // Fleet 2026-11-16: swipe down from the top edge = desktop mode (toggle top_swipe; hidden while desktop mode is on).
+    private val topSwipe by lazy { TopSwipeOverlay(this).also { t -> t.onPull = { wakeHandler.post { startDesktopNow() } } } }
+    /** Main thread. Strip shown only with the toggle on and desktop mode off. */
+    private fun applyTopSwipe() {
+        if (toggleOn("top_swipe") && !desktopMode) topSwipe.show() else if (topSwipe.isShowing) topSwipe.hide()
+    }
     private val desktopButton by lazy {
         DesktopButtonOverlay(this).also { b ->
             b.onDashboard = { wakeHandler.post { endDesktopNow("desktop button") } }
@@ -4203,7 +4213,7 @@ class BridgeService : Service() {
     private fun desktopStatus(): String =
         "desktop: status on=$desktopMode since=${if (desktopSinceMs == 0L) "-" else isoTime(desktopSinceMs)} " +
             "endsAt=${if (desktopEndsAtMs == 0L) "-" else isoTime(desktopEndsAtMs)} ($desktopEndWhy) last='$desktopLastEnd' " +
-            "dashboardFg=$dashboardForeground userLeft=$userLeftDashboard fg=$foregroundPkg ${desktopButton.status()}"
+            "dashboardFg=$dashboardForeground userLeft=$userLeftDashboard fg=$foregroundPkg ${desktopButton.status()} ${topSwipe.status()}"
 
     /** Main thread. Logs the status and publishes it once (not retained) on portal/<id>/desktop/status_line. */
     private fun publishDesktopStatusLine() {
@@ -4273,6 +4283,7 @@ class BridgeService : Service() {
         holdDesktopScreen(desktopEndsAtMs)
         launchHome()
         desktopButton.show()                              // the way back over any full-screen app
+        if (topSwipe.isShowing) topSwipe.hide()            // the pill is the way back while desktop mode is on
         Log.i(TAG, "desktop: ON - launcher in front, camera paused, auto-return $desktopEndWhy (${isoTime(desktopEndsAtMs)})")
         publishDesktopState(p)
     }
@@ -4289,6 +4300,7 @@ class BridgeService : Service() {
         if (!desktopMode) return
         desktopMode = false
         desktopButton.hide()                              // every exit path comes through here
+        applyTopSwipe()
         desktopLastEnd = "$why at ${isoTime(System.currentTimeMillis())}"
         wakeHandler.removeCallbacks(desktopEndRunnable)
         desktopEndsAtMs = 0L
