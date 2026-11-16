@@ -95,6 +95,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         fun mqttConnected(): Boolean?
         /** ms since the live MQTT session last RECEIVED anything (PINGRESP, PUBACK, a message); null = unknown / no session. */
         fun mqttInboundAgeMs(): Long? = null
+        /** Toggle mqtt_stale_check: a 'connected' session that received nothing for [MQTT_STALE_MS] counts as down. */
+        fun mqttStaleCheck(): Boolean = false
         fun mqttReconnect(): String
         /** null = stream not wanted (camera/stream off by the user) or not judgeable yet; else ms since the last encoded frame. */
         fun streamFrameAgeMs(): Long?
@@ -409,7 +411,12 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         if (faked(Check.MQTT)) return "bad: test (selfHealTest mqtt)"
         return when (runCatching { host.mqttConnected() }.getOrNull()) {
             null -> "n/a: no broker"
-            true -> "ok"
+            true -> {
+                // fleet (2026-11-15, toggle mqtt_stale_check): Paho pings every 30 s when idle, so a session with nothing
+                // received for 3 keepalives is half-open even if Paho still says connected (a missed ping timeout).
+                val age = if (runCatching { host.mqttStaleCheck() }.getOrDefault(false)) runCatching { host.mqttInboundAgeMs() }.getOrNull() else null
+                if (age != null && age > MQTT_STALE_MS) "bad: connected but nothing received for ${age / 1000}s" else "ok"
+            }
             false -> "bad: broker disconnected"
         }
     }
@@ -695,6 +702,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         private const val HOUR_MS = 60 * 60_000L
         const val LAN_FAST_MS = 30_000L
         private const val LAN_MQTT_FRESH_MS = 120_000L
+        private const val MQTT_STALE_MS = 100_000L
         /** Unchanged state is re-sent this often (HA last_reported; the watcher's freshness window is 12 min). */
         const val HEARTBEAT_MS = 10 * 60_000L
         private const val LAN_BACKOFF_BASE_MS = 60_000L

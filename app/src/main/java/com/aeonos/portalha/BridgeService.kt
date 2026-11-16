@@ -2537,7 +2537,8 @@ class BridgeService : Service() {
     //                   so an alert never waits behind a slow command (a camera restart, a stream re-prepare: seconds).
     //  webview_destroy: DashboardActivity.onDestroy calls WebView.destroy() (no native WebView left behind per recreate).
     //  burst_pipeline : discovery configs published pipelined (32 in flight) instead of one PUBACK wait each.
-    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline")
+    //  mqtt_stale_check: self-heal treats a 'connected' session with nothing received for 100 s as down (-> reconnect).
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2903,7 +2904,12 @@ class BridgeService : Service() {
         val c = mqtt ?: return null
         if (!c.isConnected) return null
         val own = lastMqttInboundMs.let { if (it == 0L) null else android.os.SystemClock.elapsedRealtime() - it }
-        val paho = if (pahoReflectFailed) null else runCatching {
+        return listOfNotNull(own, pahoInboundAge(c)).minOrNull()
+    }
+
+    /** Paho's own last-inbound age (includes PINGRESP), or null when it can't be read. */
+    private fun pahoInboundAge(c: MqttClient): Long? {
+        return if (pahoReflectFailed) null else runCatching {
             val ac = MqttClient::class.java.getDeclaredField("aClient").apply { isAccessible = true }.get(c)
                 ?: return@runCatching null
             val comms = org.eclipse.paho.client.mqttv3.MqttAsyncClient::class.java.getDeclaredField("comms")
@@ -2915,7 +2921,6 @@ class BridgeService : Service() {
             if (ns == 0L) null else (System.nanoTime() - ns) / 1_000_000L
         }.onFailure { pahoReflectFailed = true; Log.w(TAG, "mqtt: Paho inbound time unreadable (${it.javaClass.simpleName}) - own marks only") }
             .getOrNull()
-        return listOfNotNull(own, paho).minOrNull()
     }
 
     // fleet (2026-11-15, net diet): the retained discovery configs go out ONCE per broker session (the connect burst).
@@ -3190,6 +3195,8 @@ class BridgeService : Service() {
         }
 
         override fun mqttInboundAgeMs(): Long? = mqttInboundAge()
+        // Only with Paho's own inbound time (PINGRESP counts): our marks alone can be minutes old on a quiet, healthy session.
+        override fun mqttStaleCheck(): Boolean = toggleOn("mqtt_stale_check") && mqtt?.let { pahoInboundAge(it) } != null
         override fun mqttConnected(): Boolean? {
             val p = prefs ?: return null
             if (p.brokerHost.isBlank()) return null
