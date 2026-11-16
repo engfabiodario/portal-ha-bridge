@@ -26,7 +26,7 @@ import android.view.WindowManager
 class TopSwipeOverlay(private val context: Context) {
     companion object {
         private const val TAG = "PortalHA"
-        private const val HEIGHT_DP = 18f
+        private const val HEIGHT_DP = 28f
         private const val WIDTH_FRACTION = 0.4f
         private const val PULL_DP = 56f
     }
