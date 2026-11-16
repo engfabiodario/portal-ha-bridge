@@ -2696,7 +2696,9 @@ class BridgeService : Service() {
                     }
                 }
             }
-            override fun deliveryComplete(token: IMqttDeliveryToken?) { lastMqttInboundMs = android.os.SystemClock.elapsedRealtime() }
+            // fleet (2026-11-16, review): no inbound mark here - Paho calls deliveryComplete for QoS-0 sends as soon as they
+            // hit the socket, so a half-open link looked alive. PUBACK/PINGRESP are in Paho's own lastInboundActivity.
+            override fun deliveryComplete(token: IMqttDeliveryToken?) {}
         })
 
         client.connect(MqttConnectOptions().apply {
@@ -2776,10 +2778,16 @@ class BridgeService : Service() {
         ).let { topics ->
             // fleet (2026-11-15, reliability): ONE SUBSCRIBE packet for all ~45 filters (was one synchronous round trip
             // each - ~45 x RTT before any command could arrive; on Office's 250-350 ms Wi-Fi ~15 s after every reconnect).
-            // Same filters, same QoS; Paho still throws if the broker refuses any of them.
+            // Same filters, same QoS. Paho 1.2.5 throws only for a refused SINGLE topic, so the granted QoS array is checked
+            // here (0x80 = refused) and a refusal fails the connect loudly, as the per-topic subscribe did (review 2026-11-16).
             val all = topics + (intercom?.subscriptions()?.map { it.first } ?: emptyList())
             val qos = IntArray(topics.size) { 1 } + (intercom?.subscriptions()?.map { it.second } ?: emptyList()).toIntArray()
             client.subscribe(all.toTypedArray(), qos)
+            val refused = all.filterIndexed { i, _ -> i < qos.size && qos[i] == 0x80 }
+            if (refused.isNotEmpty()) {
+                Log.e(TAG, "mqtt: broker refused ${refused.size} subscription(s): ${refused.joinToString().take(300)}")
+                throw MqttException(MqttException.REASON_CODE_SUBSCRIBE_FAILED.toInt())
+            }
         }
 
         // Intercom: announce ourselves (its subscriptions went out with the batch above).

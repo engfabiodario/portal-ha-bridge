@@ -104,7 +104,12 @@ class FleetRtspServer(
                 }
                 client.start()
             } catch (e: SocketException) {
-                break          // server.close() called
+                // fleet (2026-11-16, review): Android maps EVERY accept() errno to SocketException (ENETDOWN/EHOSTUNREACH
+                // during a Wi-Fi drop, EMFILE, ENOBUFS...). Only a real stopServer()/close ends the loop; anything else used
+                // to end it too - the socket stayed open with nobody accepting = Frigate 0 fps until a stream restart.
+                if (!running || server?.isClosed != false) break
+                Log.w(TAG, "rtsp: accept error (socket): ${e.message}")
+                try { Thread.sleep(250) } catch (ie: InterruptedException) { break }
             } catch (e: IOException) {
                 // fleet (2026-11-15, reliability): an accept() that keeps failing (EMFILE - out of file descriptors -
                 // or ENOBUFS) used to spin this loop at full speed, logging thousands of lines a second. Pause briefly.

@@ -305,6 +305,8 @@ class CameraStream(private val context: Context) {
 
     fun release() {
         stop()
-        thread.quitSafely()
+        // fleet (2026-11-16, review): quitting at once lost an in-flight openCamera's onOpened (posted to a dead handler)
+        // = camera 0 never closed. Give a pending open 3 s to land (onOpened closes a camera nobody wants), then quit.
+        handler.postDelayed({ thread.quitSafely() }, 3_000L)
     }
 }

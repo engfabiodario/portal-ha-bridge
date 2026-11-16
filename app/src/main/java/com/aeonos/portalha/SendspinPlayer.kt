@@ -100,6 +100,8 @@ class SendspinPlayer(
         private fun cancelJob(field: String) {
             (cls.getDeclaredField(field).apply { isAccessible = true }.get(c) as? Job)?.cancel()
         }
+        private fun jobActive(field: String): Boolean =
+            (cls.getDeclaredField(field).apply { isAccessible = true }.get(c) as? Job)?.isActive == true
         private inline fun guarded(what: String, block: () -> Unit) {
             if (failed) return
             runCatching(block).onFailure {
@@ -128,6 +130,14 @@ class SendspinPlayer(
             streaming = on
             lastActiveMs = now()
             if (on && throttled) restore("stream start")
+            // fleet (2026-11-16, review): a cancel that raced a reconnect (tick / burst end vs the library's fresh hello)
+            // can leave throttled=false with the library's clock job dead - a stream would then run with no clock sync.
+            else if (on && !failed) synchronized(this) {
+                guarded("stream check") {
+                    if (!jobActive("clockJob")) { call("startClockSync"); Log.i(TAG, "sendspin: clock sync was not running at stream start - restarted") }
+                    if (!jobActive("stateJob")) call("startPeriodicStateReports")
+                }
+            }
         }
 
         @Synchronized private fun restore(why: String) {
