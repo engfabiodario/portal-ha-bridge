@@ -244,7 +244,12 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
         // port 8554 yet and the new bind died with EADDRINUSE (which also leaks
         // the port in-process). 700ms + the BridgeService dead-stream backoff
         // retries cover the tail.
-        runCatching { Thread.sleep(700) }   // let the accept thread die + port release
+        // fleet (2026-11-20, review b1-07): an interrupt here = the service is being destroyed (shutdownNow): no start.
+        try { Thread.sleep(700) } catch (e: InterruptedException) {   // let the accept thread die + port release
+            Thread.currentThread().interrupt()
+            Log.i(TAG, "RTSP restart interrupted (service stopping) - not starting again")
+            return false
+        }
         return start(baseWidth, baseHeight, baseFps, baseBitrate, baseAudio, baseIFrameS)
     }
 

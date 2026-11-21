@@ -142,6 +142,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     @Volatile private var started = false
     @Volatile private var fake: Check? = null
     @Volatile private var state = "ok"
+    @Volatile private var externalFault: String? = null
     @Volatile private var lastCheckWall = 0L
     @Volatile private var lastAction = ""
     @Volatile private var lastReason = ""
@@ -235,6 +236,20 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val line = "enablenet: WifiManager.enableNetwork($nid, true) = $ok while connected (no-op)"
         Log.w(TAG, line)
         return line
+    }
+
+    /**
+     * fleet (2026-11-20, review b1-01): a fault the Bridge itself found outside these checks (the command thread stuck).
+     * Non-null = state 'failing' with the reason in last_reason / external_fault until it is cleared with null.
+     */
+    fun setExternalFault(why: String?) {
+        handler.post {
+            if (why == externalFault) return@post
+            externalFault = why
+            if (why != null) { lastReason = why; Log.w(TAG, "external fault: $why") } else Log.i(TAG, "external fault cleared")
+            updateState(if (why != null) "external fault" else "external fault cleared")
+            publish(force = true)
+        }
     }
 
     /** Re-send the HA state (MQTT just connected, HA birth, the 20 s re-publish). */
@@ -336,7 +351,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         val lanStuck = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             checks.getValue(Check.LAN).bad >= BAD_TICKS_FOR_ACTION
         val newState = when {
-            worst >= FAILING_TICKS || lanStuck -> "failing"
+            worst >= FAILING_TICKS || lanStuck || externalFault != null -> "failing"
             worst > 0 -> "fixing"
             else -> "ok"
         }
@@ -666,7 +681,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             "\"lan\":\"${esc(checks.getValue(Check.LAN).last)}\",\"lan_targets\":\"${esc(lanTargetsText)}\"," +
             "\"lan_unreachable_since\":${if (lanBadSinceWall == 0L) "null" else "\"${isoOf(lanBadSinceWall)}\""}," +
             "\"busy\":${if (busyNow.isEmpty()) "null" else "\"${esc(busyNow)}\""}," +
-            "\"busy_since\":${if (busySinceWall == 0L) "null" else "\"${isoOf(busySinceWall)}\""}"
+            "\"busy_since\":${if (busySinceWall == 0L) "null" else "\"${isoOf(busySinceWall)}\""}," +
+            "\"external_fault\":${externalFault?.let { "\"${esc(it)}\"" } ?: "null"}"
         val state = stateNow()
         val key = "$state|$core"
         val now = SystemClock.elapsedRealtime()

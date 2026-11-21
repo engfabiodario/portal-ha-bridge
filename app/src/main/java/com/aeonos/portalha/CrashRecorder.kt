@@ -161,6 +161,21 @@ object CrashRecorder {
         }.onFailure { Log.w(TAG, "exit dump failed: ${it.message}") }
     }
 
+    /**
+     * fleet (2026-11-20, review b1-01): a diagnostic note crash/<prefix>-MMdd-HHmmss.txt (e.g. a stuck thread's stack),
+     * newest [EXIT_KEEP] per prefix kept. Synchronous (small file); never throws.
+     */
+    fun writeNote(ctx: Context, prefix: String, text: String) {
+        val d = crashDir(ctx) ?: return
+        runCatching {
+            val f = File(d, prefix + "-" + SimpleDateFormat("MMdd-HHmmss", Locale.US).format(Date()) + ".txt")
+            f.writeText("recorded=${stamp(System.currentTimeMillis())} pid=${Process.myPid()} boot=$bootIdCached " +
+                "er=${android.os.SystemClock.elapsedRealtime()} version=${BuildConfig.VERSION_NAME}\n$text")
+            d.listFiles { x -> x.name.startsWith("$prefix-") }?.sortedBy { it.name }?.dropLast(EXIT_KEEP)?.forEach { it.delete() }
+            Log.i(TAG, "note: ${f.name}")
+        }.onFailure { Log.w(TAG, "note $prefix failed: ${it.message}") }
+    }
+
     /** Service destroyed normally: mark the run as ended cleanly. */
     fun onServiceStop() {
         hbRunning = false

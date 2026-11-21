@@ -132,12 +132,18 @@ class BridgeService : Service() {
         private const val DASHBOARD_RETURN_MS = 90_000L
         // Camera revive (audit bridge-code.0): first check 90 s after the trigger, then every 4 min without an end.
         private const val CAMERA_REVIVE_FIRST_MS = 90_000L
+        // fleet (2026-11-20, review b1-05): with the screen OFF the quick dashboard attempts all skip, so the revive goes early.
+        private const val CAMERA_REVIVE_DARK_MS = 15_000L
+        // Command-thread watchdog (review b1-01): stack dump + self-heal 'failing' after this long in one task.
+        private const val CMD_STUCK_DUMP_MS = 90_000L
         private const val CAMERA_REVIVE_REPEAT_MS = 4 * 60_000L
         private const val CAMERA_REVIVE_SLOW_MS = 15 * 60_000L
         // MQTT publisher (audit bridge-code.3).
         private const val PUB_WAIT_MS = 5_000L
         private const val PUB_QUEUE_MAX = 1000
         private const val PIPELINE_WINDOW = 32
+        // Publisher thread window with burst_pipeline on (review b1-02).
+        private const val PUB_WINDOW = 16
 
         // ── Telling "the user left" apart from "an app barged in" ─────────────────────
         // Android reports the two IDENTICALLY. Measured with an Alexa announcement
@@ -211,6 +217,14 @@ class BridgeService : Service() {
         private const val MQTT_KEEPALIVE_S = 30
         private const val MQTT_OFFLINE_PUBLISH_WAIT_MS = 1_500L
         private const val REPUBLISH_AFTER_CONNECT_MS = 20_000L
+        // fleet (2026-11-20, review b1-08): a full state re-publish at most this often (later HA births are folded into one).
+        private const val REPUBLISH_MIN_GAP_MS = 60_000L
+        // Main review 11-20: an HA birth (HA restarted / its MQTT client reconnected = it may have lost states) waits only
+        // this long behind the previous burst; the 60 s gap stays for every other request.
+        private const val REPUBLISH_BIRTH_GAP_MS = 10_000L
+        // fleet (2026-11-20, review b1-03): reconnect within 0-1 s after a session that ran at least 10 s.
+        private const val MQTT_SHORT_SESSION_MS = 10_000L
+        private const val MQTT_QUICK_RETRY_MAX_MS = 1_000L
         private const val ACTION_APPLY_DISPLAY = "com.aeonos.portalha.APPLY_DISPLAY"
         private const val ACTION_APPLY_MEDIA = "com.aeonos.portalha.APPLY_MEDIA"
 
@@ -489,12 +503,46 @@ class BridgeService : Service() {
     }
 
     private val running = AtomicBoolean(false)
+    // fleet (2026-11-20, review b1-07): set first thing in onDestroy - a late task of this instance never starts a stream.
+    @Volatile private var destroyed = false
+
+    /**
+     * fleet (2026-11-20, review b1-01): a single-thread executor that knows WHAT it runs and since when - every task
+     * (MQTT commands and the camera start / stop / restart work alike), so the command-thread watchdog sees a camera call
+     * that never returns too. A submit after shutdown (a delayed lambda of a destroyed service) is logged and dropped
+     * instead of throwing RejectedExecutionException on the main thread (= app crash, review b1-07).
+     */
+    private class WatchedExecutor(private val name: String) {
+        @Volatile var thread: Thread? = null
+            private set
+        @Volatile var busySince = 0L      // elapsedRealtime the running task started; 0 = idle
+            private set
+        @Volatile var busyLabel = ""
+            private set
+        private val ex = Executors.newSingleThreadExecutor { r -> Thread(r, name).also { it.isDaemon = true; thread = it } }
+
+        fun submit(label: String = "internal task", task: () -> Unit): java.util.concurrent.Future<*>? = try {
+            ex.submit(Runnable {
+                busyLabel = label; busySince = android.os.SystemClock.elapsedRealtime()
+                try { task() } finally { busySince = 0L }
+            })
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            Log.w(TAG, "$name: '$label' dropped - the executor is stopped"); null
+        }
+
+        fun busyMs(): Long = busySince.let { if (it == 0L) 0L else android.os.SystemClock.elapsedRealtime() - it }
+        fun shutdownNow() { ex.shutdownNow() }
+        fun awaitTermination(ms: Long): Boolean =
+            runCatching { ex.awaitTermination(ms, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrDefault(false)
+    }
+
     // Paho's callback thread must never block: a synchronous publish() from inside
     // messageArrived deadlocks the client — QoS 0 token completion is dispatched by
     // that same callback thread. All inbound commands run on this executor instead.
-    private val commandExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "portal-ha-cmd").also { it.isDaemon = true }
-    }
+    private val commandExecutor = WatchedExecutor("portal-ha-cmd")
+    // fleet (2026-11-20, review b1-01): control/set and selfheal/set always run here, so 'status' and 'restart_service'
+    // still answer while the command thread hangs (restart_stream hands its camera work to the command thread).
+    private val controlExecutor = WatchedExecutor("portal-ha-control")
     @Volatile private var mqtt: MqttClient? = null
     @Volatile private var mqttThread: Thread? = null
     @Volatile private var prefs: Prefs? = null
@@ -550,6 +598,7 @@ class BridgeService : Service() {
     private var wakeDetector: WakeWordDetector? = null
     private var startedWakePhrase: String? = null   // phrase the live recognizer was built with
     private var voiceAnnounce: VoiceAnnounce? = null
+    @Volatile private var bridgeIntercomOff = false   // review b1-09 (toggle intercom_off), set in onCreate
     private var receiveOrb: AnnounceOrbOverlay? = null
 
     // Portal-to-Portal intercom (audio-only push-to-announce) + optional overlays.
@@ -970,7 +1019,7 @@ class BridgeService : Service() {
                     commandExecutor.submit {
                         rtspStreamer?.let {
                             it.sizeOverride = parseStreamSize(p.streamSize)
-                            if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                            if (it.isStreaming) restartStream(it, "camera view size")
                         }
                     }
                 }
@@ -1054,7 +1103,7 @@ class BridgeService : Service() {
                 rtspStreamer?.let {
                     it.setEncoder(encFps(p), encBitrate(p), encIFrame(p))
                     it.fpsCap = p.streamFpsCap
-                    if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                    if (it.isStreaming) restartStream(it, "camera encoder")
                 }
                 val line = cameraEncoderStatus(p, "$note (stream restarted once)")
                 Log.i(TAG, line)
@@ -1072,6 +1121,27 @@ class BridgeService : Service() {
         lastRtspStartMs = System.currentTimeMillis()
         wakeHandler.removeCallbacks(rtspHealthCheck)
         wakeHandler.postDelayed(rtspHealthCheck, RTSP_HEALTH_CHECK_MS)
+    }
+
+    // fleet (2026-11-20, review b1-06): the ONE way to restart a running stream (command executor only). restart() returns
+    // false when the encoder could not be prepared / started - the stream is then STOPPED, and every check that heals a
+    // dead stream (health check, dead-stream callbacks) only acts while it runs, so nothing brought it back and HA kept
+    // showing the camera ON. Now: camera OFF in HA, flagged, and the dead-stream recovery armed (1-30 s backoff with the
+    // dashboard in front, the camera revive in the background); the start that heals it publishes ON again.
+    private val rtspRestartFails = java.util.concurrent.atomic.AtomicLong()
+    private fun restartStream(r: RtspStreamer, why: String): Boolean {
+        if (r.restart()) {
+            // review b1-07: a restart that was stuck past onDestroy must not keep Camera 0 + port 8554 for a dead instance.
+            if (destroyed) { Log.w(TAG, "rtsp: restart finished after the service stopped - stopping it"); r.stop(); return false }
+            noteRtspStarted(); return true
+        }
+        if (destroyed) return false   // interrupted by onDestroy: the next instance publishes the camera state
+        rtspRestartFails.incrementAndGet()
+        cameraActive = false
+        prefs?.let { publishRaw(HaDiscovery.cameraStateTopic(it.deviceId), "OFF", 1, retained = true) }
+        Log.w(TAG, "rtsp: restart FAILED ($why) - stream stopped, camera OFF in HA, recovery armed (fails=${rtspRestartFails.get()})")
+        if (!destroyed) wakeHandler.post { if (!destroyed) onRtspStreamDead("restart failed ($why)") }
+        return false
     }
 
     // A dead stream never healed itself before: isStreaming stayed true so both
@@ -1092,7 +1162,7 @@ class BridgeService : Service() {
         if (!bindFailure && !dashboardForeground) {
             Log.w(TAG, "rtsp stream dead ($reason) while backgrounded — will recover on return to app")
             scheduleDashboardReturn()
-            if (!reviveScheduled) scheduleCameraRevive(CAMERA_REVIVE_FIRST_MS, "stream dead in background: $reason")
+            if (!reviveScheduled) scheduleCameraRevive(firstReviveDelay(), "stream dead in background: $reason")
             return
         }
         if (rtspRecoverAttempts >= RTSP_RECOVER_MAX_ATTEMPTS) {
@@ -1103,13 +1173,20 @@ class BridgeService : Service() {
         rtspRecoverAttempts++
         Log.w(TAG, "rtsp stream dead ($reason) — auto-restart #$rtspRecoverAttempts in ${backoff}ms")
         wakeHandler.postDelayed({
-            commandExecutor.submit {
+            commandExecutor.submit("rtsp dead-stream retry") {
+                if (destroyed) return@submit
                 val p = prefs ?: return@submit
                 val r = rtspStreamer ?: return@submit
-                if (p.cameraServiceEnabled && p.cameraOn && rtspNeedsRestart && r.isStreaming) {
+                if (p.cameraServiceEnabled && p.cameraOn && rtspNeedsRestart) {
                     rtspNeedsRestart = false
-                    r.restart()
-                    noteRtspStarted()
+                    // review b1-06: a stream a failed restart left stopped is started again here (applyCameraState).
+                    if (r.isStreaming) restartStream(r, "dead-stream retry #$rtspRecoverAttempts")
+                    else if (p.streamEnabled) {
+                        applyCameraState(p)
+                        // Start failed too: next step of the same backoff (onRtspStreamDead keeps its attempt cap).
+                        if (rtspStreamer?.isStreaming != true && !destroyed)
+                            wakeHandler.post { if (!destroyed) onRtspStreamDead("start failed after a failed restart") }
+                    }
                 }
             }
         }, backoff)
@@ -1211,7 +1288,13 @@ class BridgeService : Service() {
         // Coexist with an external voice assistant: release the mic. Our own wake word
         // (wakeDetector) needs the mic, so the two are mutually exclusive — wake wins.
         val coexist = p.coexistVoiceAssistant && !p.wakeWordEnabled && !p.alexaWakeEnabled
-        intercom = Intercom(this, p.deviceId, { prefs?.deviceName ?: "Portal" }, { localIp() }, ::publishBytes)
+        // fleet (2026-11-20, review b1-09, toggle intercom_off, default OFF): on a wall where Ava owns the mic (coexist),
+        // with no talk buttons and 2-way off, the Bridge's own intercom / 2-way / voice announce are not built - no ~1 s
+        // mic probe at every start, no intercom subscriptions or retained presence, no Alexa TURN_DONE receiver. Read at
+        // service start only. The house Call / Text bar uses Ava, not these.
+        bridgeIntercomOff = p.toggle("intercom_off") && coexist && !p.intercomOverlayEnabled && !p.twoWayExperimental
+        if (bridgeIntercomOff) Log.i(TAG, "intercom: off (toggle intercom_off, coexist) - no Bridge intercom, 2-way, voice announce, mic probe")
+        intercom = if (bridgeIntercomOff) null else Intercom(this, p.deviceId, { prefs?.deviceName ?: "Portal" }, { localIp() }, ::publishBytes)
             .also {
                 it.attachSoundMonitor(if (coexist) null else soundMonitor)
                 it.setOnDemandCapture(coexist)
@@ -1242,7 +1325,7 @@ class BridgeService : Service() {
             }
         // On-device "hey jarvis": fed the warm mic, fires the assistant wake handoff.
         // "<phrase> announce" instead triggers a hands-free intercom broadcast.
-        voiceAnnounce = VoiceAnnounce({ soundMonitor }, { intercom }, orb = AnnounceOrbOverlay(this, blue = false, interactive = true), onDone = {
+        voiceAnnounce = if (bridgeIntercomOff) null else VoiceAnnounce({ soundMonitor }, { intercom }, orb = AnnounceOrbOverlay(this, blue = false, interactive = true), onDone = {
             wakeDetector?.pauseMatching(3_000L)   // end tone / room echo can't re-trigger
         })
         wakeDetector = WakeWordDetector(this,
@@ -1260,7 +1343,7 @@ class BridgeService : Service() {
         // RTSP audio tap: resolved through the streamer on every chunk, so stream
         // restarts re-tap automatically. No-op (null micTap) when audio is off.
         soundMonitor?.streamSink = { buf, n -> rtspStreamer?.micTap?.feed(buf, n) }
-        twoWay = TwoWayEngine(this, { intercom }, { talking ->
+        twoWay = if (bridgeIntercomOff) null else TwoWayEngine(this, { intercom }, { talking ->
             lastTwoWayActivityMs = System.currentTimeMillis()
             twoWayOrb?.setTransmitting(talking)   // my orb warms blue→orange while I hold the floor
             Log.i(TAG, "2way: talking=$talking")
@@ -1297,7 +1380,7 @@ class BridgeService : Service() {
 
         registerScreenReceiver()
         registerAudioReceiver()
-        if (p.toggle("fast_reconnect")) ensureNetworkCallback()
+        ensureNetworkCallback()
         wakeHandler.post { applyTopSwipe() }
         // Stops Portal's launcher from idle-kicking us to the home screen.
         mediaKeepAlive.start(this)
@@ -1380,7 +1463,7 @@ class BridgeService : Service() {
             val deg = intent.getIntExtra(EXTRA_ROTATION, 0)
             commandExecutor.submit {
                 cameraStream?.rotation = deg                    // motion path (live)
-                rtspStreamer?.let { it.rotationOffset = deg; if (it.isStreaming) { it.restart(); noteRtspStarted() } }
+                rtspStreamer?.let { it.rotationOffset = deg; if (it.isStreaming) restartStream(it, "manual rotation") }
                 Log.i(TAG, "manual rotation offset set to $deg deg")
             }
         }
@@ -1396,8 +1479,7 @@ class BridgeService : Service() {
                             // now so the camera can reopen — restart to recover.
                             rtspNeedsRestart = false
                             Log.i(TAG, "ensureCamera: recovering dead stream — restart")
-                            r.restart()
-                            noteRtspStarted()
+                            restartStream(r, "ensureCamera")
                         } else {
                             applyCameraState(p)
                         }
@@ -1483,6 +1565,11 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
+        // fleet (2026-11-20, review b1-07): first - a late task / timer of this instance never starts a stream or submits
+        // to the stopped executors, and every timer still queued on the main-thread handler (dashboardReturn re-posts
+        // itself every 90 s, a pending dead-stream retry) is dropped. Posts made further down still run.
+        destroyed = true
+        wakeHandler.removeCallbacksAndMessages(null)
         serviceAlive = false
         running.set(false)
         runCatching { keepAlive?.stop() }; keepAlive = null
@@ -1498,13 +1585,14 @@ class BridgeService : Service() {
         dreamObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
         dreamObserver = null
         commandExecutor.shutdownNow()
+        controlExecutor.shutdownNow()
         // fleet: a clean stop tells HA right away (the broker drops the last will on a clean DISCONNECT).
         publishOfflineBeforeStop()
         mqtt?.let { disconnectBounded(it, 1_000L) }
         wakeMqttLoop()
         synchronized(backoffWake) { backoffWake.notifyAll() }   // the old loop ends now, not after its backoff
-        screenReceiver?.let { unregisterReceiver(it) }
-        audioReceiver?.let { unregisterReceiver(it) }
+        screenReceiver?.let { runCatching { unregisterReceiver(it) } }
+        audioReceiver?.let { runCatching { unregisterReceiver(it) } }
         alexaTurnDoneReceiver?.let { runCatching { unregisterReceiver(it) } }
         debugWakeReceiver?.let { runCatching { unregisterReceiver(it) } }
         debugCallReceiver?.let { runCatching { unregisterReceiver(it) } }
@@ -1552,6 +1640,11 @@ class BridgeService : Service() {
         hideIntercomOverlays()
         instance = null
         cameraStream?.release()
+        // review b1-07: a camera task still in flight (a restart between its stop and start) must end before the stop,
+        // or it starts a stream after it and keeps Camera 0 + port 8554 for this dead instance ('Server creation failed'
+        // for the next one). shutdownNow() above interrupted it; wait up to 3 s, then stop - and stop again in case it
+        // was still starting when the wait ran out.
+        if (!commandExecutor.awaitTermination(3_000L)) Log.w(TAG, "onDestroy: the command thread did not end within 3 s")
         rtspStreamer?.stop()
         runCatching { orientationListener.disable() }
         displayRotationListener?.let { l ->
@@ -1568,6 +1661,7 @@ class BridgeService : Service() {
         timeoutHandler.removeCallbacks(timeoutRunnable)
         timeoutThread.quitSafely()
         hideCameraOverlay()
+        rtspStreamer?.let { if (it.isStreaming) { Log.w(TAG, "onDestroy: a late stream start - stopping it again"); it.stop() } }
         CrashRecorder.onServiceStop()   // heartbeat clean=true: this run ended normally
         super.onDestroy()
     }
@@ -2117,7 +2211,7 @@ class BridgeService : Service() {
                 }
             }
         }
-        runCatching {
+        if (!bridgeIntercomOff) runCatching {   // review b1-09: never needed on a coexist wall (Alexa wake is off there)
             registerReceiver(alexaTurnDoneReceiver, IntentFilter().apply {
                 addAction("com.amazon.alexa.multimodal.falcon.TURN_DONE")
             })
@@ -2326,7 +2420,7 @@ class BridgeService : Service() {
                             val auto = if (isAloha) displayAutoRotation(p) else r.autoRotation
                             if (r.rotationOffset != p.streamRotation || r.autoRotation != auto) {
                                 r.rotationOffset = p.streamRotation; r.autoRotation = auto
-                                if (r.isStreaming) { r.restart(); noteRtspStarted() }
+                                if (r.isStreaming) restartStream(r, "config rotation")
                             }
                         }
                         Log.i(TAG, "config: " + rotationStatus())
@@ -2408,7 +2502,7 @@ class BridgeService : Service() {
                         commandExecutor.submit {
                             rtspStreamer?.let {
                                 it.cameraId = p.streamCameraId
-                                if (it.isStreaming) { it.restart(); noteRtspStarted() }
+                                if (it.isStreaming) restartStream(it, "config camera id")
                             }
                         }
                     }
@@ -2536,15 +2630,22 @@ class BridgeService : Service() {
     }
 
     // ── Opt-in toggles (reliability pass 2026-11-15; Prefs.toggle, all default OFF = old behaviour) ──────────────
-    //  fast_reconnect : a network that becomes available cuts the MQTT reconnect backoff short (0-2 s jitter) - after
-    //                   a Deco reboot / Wi-Fi drop the Portal reconnects as soon as Wi-Fi is back instead of up to 15 s later.
-    //  fast_lane      : navigate, screen on/off, show dashboard and screensaver dismiss run on their own command thread,
+    //  fast_reconnect : (no effect since 2026-11-20, see below) a network that becomes available cuts the MQTT reconnect
+    //                   backoff short (0-2 s jitter) - the Portal reconnects as soon as Wi-Fi is back instead of up to 15 s later.
+    //  fast_lane     : navigate, screen on/off, show dashboard and screensaver dismiss run on their own command thread,
     //                   so an alert never waits behind a slow command (a camera restart, a stream re-prepare: seconds).
     //  webview_destroy: DashboardActivity.onDestroy calls WebView.destroy() (no native WebView left behind per recreate).
-    //  burst_pipeline : discovery configs published pipelined (32 in flight) instead of one PUBACK wait each.
+    //  burst_pipeline : discovery configs published pipelined (32 in flight) instead of one PUBACK wait each; since
+    //                   2026-11-20 (review b1-02) also the connect's first states and the publisher thread (16 in flight).
     //  mqtt_stale_check: self-heal treats a 'connected' session with nothing received for 100 s as down (-> reconnect).
     //  top_swipe      : (2026-11-16) a downward swipe from the middle of the top edge opens desktop mode (TopSwipeOverlay).
-    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe")
+    //  intercom_off   : (2026-11-20, review b1-09) with coexist on, no talk buttons and 2-way off: the Bridge's own intercom,
+    //                   2-way engine, voice announce, their mic probe / MQTT subscriptions / presence and the Alexa TURN_DONE
+    //                   receiver are not created. Applies at the next service start (control/set restart_service).
+    //  fast_reconnect : since 2026-11-20 (review b1-03) the network wake is ALWAYS on; the toggle is kept so old commands
+    //                   still answer, it no longer changes anything.
+    private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe",
+        "intercom_off")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2554,17 +2655,21 @@ class BridgeService : Service() {
         if (name !in TOGGLES) return "unknown toggle '$name' (${TOGGLES.joinToString()})"
         if (v != "on" && v != "off") return "toggle $name: use on|off"
         p.setToggle(name, v == "on")
-        if (name == "fast_reconnect") ensureNetworkCallback()
         if (name == "top_swipe") wakeHandler.post { applyTopSwipe() }
-        return "toggle $name=$v | ${togglesLine(p)}"
+        val note = when (name) {
+            "intercom_off" -> " (applies at the next service start: restart_service)"
+            "fast_reconnect" -> " (no effect since 2026-11-20: the network wake is always on)"
+            else -> ""
+        }
+        return "toggle $name=$v$note | ${togglesLine(p)}"
     }
 
-    // fast_reconnect: the reconnect backoff waits on this monitor; a network coming up wakes it (only with the toggle on).
+    // The reconnect backoff waits on this monitor; a network coming up wakes it. The flag is cleared when a connect attempt
+    // starts (mqttLoop), not here: a wake that lands between a failed attempt and this wait is kept (review b1-03).
     private val backoffWake = Object()
     @Volatile private var backoffWoken = false
     private fun waitBackoff(ms: Long) {
         synchronized(backoffWake) {
-            backoffWoken = false
             val end = android.os.SystemClock.elapsedRealtime() + ms
             while (!backoffWoken && running.get()) {
                 val left = end - android.os.SystemClock.elapsedRealtime()
@@ -2572,15 +2677,16 @@ class BridgeService : Service() {
                 try { backoffWake.wait(left) } catch (e: InterruptedException) { Thread.currentThread().interrupt(); return }
             }
         }
-        if (backoffWoken) { Log.i(TAG, "mqtt: network available - reconnecting now (fast_reconnect)"); sleep((Math.random() * 2_000).toLong()) }
+        if (backoffWoken) { Log.i(TAG, "mqtt: network available - reconnecting now"); sleep((Math.random() * 2_000).toLong()) }
     }
+    // fleet (2026-11-20, review b1-03): registered on every Bridge (was only with the fast_reconnect toggle - the Coffee
+    // Area pilot): a Wi-Fi that comes back cuts the reconnect backoff short instead of waiting up to 15 s more.
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private fun ensureNetworkCallback() {
         if (netCallback != null) return
         val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
         val cb = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
-                if (!toggleOn("fast_reconnect")) return
                 if (mqtt?.isConnected == true) return
                 synchronized(backoffWake) { backoffWoken = true; backoffWake.notifyAll() }
             }
@@ -2590,28 +2696,48 @@ class BridgeService : Service() {
     }
 
     // Fast lane (toggle fast_lane): the UI commands an alert needs, on their own single thread.
-    private val fastExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "portal-ha-cmd-fast").also { it.isDaemon = true } }
+    private val fastExecutor = WatchedExecutor("portal-ha-cmd-fast")
     private fun isFastLane(topic: String, p: Prefs): Boolean =
         topic == HaDiscovery.navigateCommandTopic(p.deviceId) || topic == HaDiscovery.NAVIGATE_FLEET_TOPIC ||
             topic == HaDiscovery.commandTopic(p.deviceId) || topic == HaDiscovery.showDashboardCommandTopic(p.deviceId) ||
             topic == HaDiscovery.screensaverDismissCommandTopic(p.deviceId) || topic == HaDiscovery.SCREENSAVER_FLEET_DISMISS_TOPIC
 
-    // Command-thread watch (diagnostics only): which MQTT command the single command thread is in, since when. A handler
-    // stuck there holds up every later command (navigate, screen, alerts) - now visible in control 'status' and logged.
-    @Volatile private var cmdBusySince = 0L
-    @Volatile private var cmdBusyTopic = ""
+    // Command-thread watch: which task the single command thread is in (an MQTT command topic or an internal camera
+    // task), since when. A task stuck there holds up every later command (navigate, screen, alerts) and every camera
+    // start / restart. fleet (2026-11-20, review b1-01) WATCHDOG on the 15 s tick: busy > 90 s = the thread's stack
+    // trace -> crash/stuck-cmd-<stamp>.txt and self-heal sensor 'failing' (cleared when the task ends). control/set and
+    // selfheal/set run on their own thread, so 'status' and 'restart_service' still answer during the hang. A process
+    // self-restart after 3 min is NOT built (held: whole-process restarts need Fabio's OK).
     private var cmdBusyLogged = 0L
+    private var cmdStuckDumped = 0L
+    @Volatile private var cmdStuckFault = false
     private fun cmdBusyLine(): String {
-        val t = cmdBusySince
-        return if (t == 0L) "cmd idle" else "cmd busy ${(android.os.SystemClock.elapsedRealtime() - t) / 1000}s on '$cmdBusyTopic'"
+        val ms = commandExecutor.busyMs()
+        return if (ms == 0L) "cmd idle" else "cmd busy ${ms / 1000}s on '${commandExecutor.busyLabel}'"
     }
+
+    private fun threadStack(t: Thread?): String =
+        t?.stackTrace?.joinToString("\n") { "    at $it" } ?: "    (thread not started)"
+
     private fun checkCommandThread() {
-        val t = cmdBusySince
-        if (t == 0L) return
+        val t = commandExecutor.busySince
+        if (t == 0L) {
+            if (cmdStuckFault) { cmdStuckFault = false; selfHeal?.setExternalFault(null); Log.i(TAG, "command thread: free again") }
+            return
+        }
         val age = android.os.SystemClock.elapsedRealtime() - t
+        val label = commandExecutor.busyLabel
         if (age > 60_000L && t != cmdBusyLogged) {
             cmdBusyLogged = t
-            Log.w(TAG, "command thread: still in '$cmdBusyTopic' after ${age / 1000} s - later commands wait (fast_lane toggle bypasses it for alerts)")
+            Log.w(TAG, "command thread: still in '$label' after ${age / 1000} s - later commands wait (fast_lane toggle bypasses it for alerts)")
+        }
+        if (age > CMD_STUCK_DUMP_MS && t != cmdStuckDumped) {
+            cmdStuckDumped = t
+            val stack = threadStack(commandExecutor.thread)
+            CrashRecorder.writeNote(this, "stuck-cmd", "command thread busy ${age / 1000} s in '$label'\n\n$stack\n")
+            Log.e(TAG, "command thread: STUCK ${age / 1000} s in '$label' - stack saved (crash/stuck-cmd-*.txt)\n$stack")
+            cmdStuckFault = true
+            selfHeal?.setExternalFault("command thread stuck in '$label' since ${isoTime(System.currentTimeMillis() - age)}")
         }
     }
 
@@ -2624,9 +2750,19 @@ class BridgeService : Service() {
 
     // fleet (2026-10-08): reconnect backoff 5 s -> 10 s -> 15 s cap (was 60 s) with up to +20 % jitter, so a
     // Portal is back within ~15 s of the broker / LAN returning and 16 Portals don't hit it in lockstep.
+    // fleet (2026-11-20, review b1-03): a session that ENDED (lost link, dropped by self-heal / restartMqtt) after running a
+    // while is followed by an attempt within 0-1 s - the fixed 5-6 s wait made every Wi-Fi blip ~6 s longer for HA. The
+    // 5/10/15 s backoff still applies after a FAILED attempt and after a session shorter than MQTT_SHORT_SESSION_MS (two
+    // clients with one id kicking each other must not loop fast).
+    @Volatile private var mqttSessionUpMs = 0L
+    // review b1-04: failed connects (all) and the ones that ran into the 30 s CONNACK wait - control/set 'status'.
+    private val mqttConnectFailures = java.util.concurrent.atomic.AtomicLong()
+    private val mqttConnectTimeouts = java.util.concurrent.atomic.AtomicLong()
     private fun mqttLoop() {
         var backoff = MQTT_BACKOFF_MIN_MS
         while (running.get()) {
+            synchronized(backoffWake) { backoffWoken = false }
+            mqttSessionUpMs = 0L
             try {
                 connectAndRun()
                 backoff = MQTT_BACKOFF_MIN_MS
@@ -2635,7 +2771,17 @@ class BridgeService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "MQTT error, retry in ~${backoff / 1000}s: ${e.message}")
             }
-            if (running.get()) waitBackoff(backoff + (Math.random() * backoff * 0.2).toLong())
+            if (!running.get()) break
+            // A session that was up long enough, however it ended (lost link or a failed publish inside it).
+            val up = mqttSessionUpMs
+            if (up != 0L && android.os.SystemClock.elapsedRealtime() - up >= MQTT_SHORT_SESSION_MS) {
+                backoff = MQTT_BACKOFF_MIN_MS
+                val j = (Math.random() * MQTT_QUICK_RETRY_MAX_MS).toLong()
+                Log.i(TAG, "mqtt: session ended - reconnecting in ${j} ms")
+                waitBackoff(j)
+                continue   // backoff stays at the minimum for a failure right after this
+            }
+            waitBackoff(backoff + (Math.random() * backoff * 0.2).toLong())
             backoff = minOf(backoff * 2, MQTT_BACKOFF_MAX_MS)
         }
     }
@@ -2692,14 +2838,14 @@ class BridgeService : Service() {
                 }
                 Log.i(TAG, "messageArrived: topic=$topic payload=$shown")
                 runCatching {
-                    val ex = if (p.toggle("fast_lane") && isFastLane(topic, p)) fastExecutor else commandExecutor
-                    ex.submit {
-                        val fast = ex === fastExecutor
-                        if (!fast) { cmdBusyTopic = topic; cmdBusySince = android.os.SystemClock.elapsedRealtime() }
-                        try {
-                            runCatching { handleMessage(topic, payload, p) }
-                                .onFailure { Log.w(TAG, "command handler failed: ${it.message}") }
-                        } finally { if (!fast) cmdBusySince = 0L }
+                    val ex = when {
+                        topic == controlTopic(p.deviceId) || topic == HaDiscovery.selfHealCommandTopic(p.deviceId) -> controlExecutor
+                        p.toggle("fast_lane") && isFastLane(topic, p) -> fastExecutor
+                        else -> commandExecutor
+                    }
+                    ex.submit(topic) {
+                        runCatching { handleMessage(topic, payload, p) }
+                            .onFailure { Log.w(TAG, "command handler failed: ${it.message}") }
                     }
                 }
             }
@@ -2708,30 +2854,50 @@ class BridgeService : Service() {
             override fun deliveryComplete(token: IMqttDeliveryToken?) {}
         })
 
-        client.connect(MqttConnectOptions().apply {
-            isCleanSession = true
-            // fleet (2026-10-08): 10 s connect timeout (was 15); keepalive 30 s = the broker fires the last will
-            // ~45 s (1.5 x keepalive) after the link dies, Paho notices a dead link within ~30-60 s.
-            connectionTimeout = MQTT_CONNECT_TIMEOUT_S
-            keepAliveInterval = MQTT_KEEPALIVE_S
-            maxInflight = 100
-            if (p.username.isNotEmpty()) { userName = p.username; password = p.password.toCharArray() }
-            // Last will = every per-Portal entity unavailable in HA (availability_topic in each discovery
-            // config). Was screen OFF (retained) - only one will per session, availability covers it.
-            setWill(HaDiscovery.availabilityTopic(p.deviceId), HaDiscovery.AVAILABILITY_OFFLINE.toByteArray(), 1, true)
-        })
+        // fleet (2026-11-20, review b1-04): Paho 1.2.5's blocking connect is a 30 s wait on an async connect (no CONNACK
+        // timer). When the broker accepts TCP but never answers (HA / Mosquitto hung or starting) that wait throws while
+        // the client keeps its receiver / sender / callback threads and its socket - one leaked set per attempt (~45 s)
+        // until the process dies, and a late CONNACK could let the orphan kick the live session. Any failure closes it.
+        try {
+            client.connect(MqttConnectOptions().apply {
+                isCleanSession = true
+                // fleet (2026-10-08): 10 s connect timeout (was 15); keepalive 30 s = the broker fires the last will
+                // ~45 s (1.5 x keepalive) after the link dies, Paho notices a dead link within ~30-60 s.
+                connectionTimeout = MQTT_CONNECT_TIMEOUT_S
+                keepAliveInterval = MQTT_KEEPALIVE_S
+                maxInflight = 100
+                if (p.username.isNotEmpty()) { userName = p.username; password = p.password.toCharArray() }
+                // Last will = every per-Portal entity unavailable in HA (availability_topic in each discovery
+                // config). Was screen OFF (retained) - only one will per session, availability covers it.
+                setWill(HaDiscovery.availabilityTopic(p.deviceId), HaDiscovery.AVAILABILITY_OFFLINE.toByteArray(), 1, true)
+            })
+        } catch (e: Throwable) {
+            mqttConnectFailures.incrementAndGet()
+            if (e is MqttException && e.reasonCode == MqttException.REASON_CODE_CLIENT_TIMEOUT.toInt()) mqttConnectTimeouts.incrementAndGet()
+            runCatching { client.disconnectForcibly(0L, 1_000L) }
+            runCatching { client.close() }
+            throw e
+        }
+        // A restart_service while this connect was in flight: this instance is being destroyed - its session would take the
+        // new instance's (same client id) over once. Drop it quietly (review b1-x1).
+        if (!running.get() || destroyed) {
+            Log.i(TAG, "mqtt: connected after the service stopped - dropping this session")
+            disconnectBounded(client, 1_000L)
+            runCatching { client.close() }
+            return
+        }
         mqtt = client
+        mqttSessionUpMs = android.os.SystemClock.elapsedRealtime()
         Log.i(TAG, "MQTT connected to ${p.brokerUri}")
         // fleet (2026-11-09, audit bridge-code.4): the whole connect burst is inside the try/finally - a publish or
         // subscribe that timed out here used to leave a CONNECTED client nobody referenced or disconnected.
         try {
-        // Online first (retained), before discovery and states, so HA never sees the entities unavailable
-        // once this session is up.
-        client.publish(HaDiscovery.availabilityTopic(p.deviceId), retained(HaDiscovery.AVAILABILITY_ONLINE))
-
-        // Purge retained commands left by old builds BEFORE subscribing, so the
-        // broker has nothing stale to replay at us (screen OFF, camera OFF, …).
-        HaDiscovery.commandTopics(p.deviceId).forEach { client.publish(it, emptyRetained()) }
+        // fleet (2026-11-20, review b1-02): purge -> SUBSCRIBE -> online. The ~28 purges of retained commands left by old
+        // builds go out pipelined (one round trip instead of 28) and BEFORE subscribing, so the broker has nothing stale to
+        // replay at us (screen OFF, camera OFF, ...); 'online' comes only once we can hear commands - HA used to show the
+        // Portal available while it was still deaf (~9 s on Office's link). The broker handles one connection's packets
+        // in order, so the purges are done before the SUBSCRIBE takes effect.
+        publishPipelined(client, HaDiscovery.commandTopics(p.deviceId).map { it to "" })
 
         // Subscriptions
         listOfNotNull(
@@ -2797,21 +2963,30 @@ class BridgeService : Service() {
             }
         }
 
+        // Online (retained) now that commands reach us, before discovery and states, so HA never sees the entities
+        // unavailable once this session is up.
+        client.publish(HaDiscovery.availabilityTopic(p.deviceId), retained(HaDiscovery.AVAILABILITY_ONLINE))
+
         // Intercom: announce ourselves (its subscriptions went out with the batch above).
         intercom?.publishPresence()
 
         // Clear stale retained entities from old builds
         HaDiscovery.staleTopics(p.deviceId).forEach { topic -> client.publish(topic, emptyRetained()) }
 
-        // Discovery
-        publishDiscovery(client, p)
+        // burst_pipeline (review b1-02): the first states go out pipelined like the discovery configs.
+        burstTokens = if (p.toggle("burst_pipeline")) ArrayDeque() else null
+        try {
+            // Discovery
+            publishDiscovery(client, p)
 
-        // In-call state is event-driven (audio playback callback); publish the
-        // current value so HA has it from the first connect.
-        publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
+            // In-call state is event-driven (audio playback callback); publish the
+            // current value so HA has it from the first connect.
+            publishRaw(HaDiscovery.inCallStateTopic(p.deviceId), if (inCall) "ON" else "OFF", 1, retained = true)
 
-        // Initial states
-        publishAllStates(p)
+            // Initial states
+            publishAllStates(p)
+            burstTokens?.let { q -> while (q.isNotEmpty()) runCatching { q.removeFirst().waitForCompletion(client.timeToWait) } }
+        } finally { burstTokens = null }
         // fleet (2026-10-05): a state published while HA's own broker session was down is lost for HA - an empty
         // retained publish (navigate cleared) leaves nothing for HA to re-read, so text.<slug>_navigate stayed
         // '/portal-alerts/doorbell' after the HA/broker hang and the proximity wake skipped every Portal. Publish
@@ -2891,21 +3066,41 @@ class BridgeService : Service() {
      * Every retained state again (discovery only if the config set changed), [delayMs] from now, if [client] is still the live session (a newer
      * session publishes for itself). Runs on the command executor like every other publish burst.
      */
-    private fun scheduleRepublish(client: MqttClient, delayMs: Long, why: String) {
-        timeoutHandler.postDelayed({
-            if (mqtt !== client || !client.isConnected) return@postDelayed
-            // fleet (2026-11-09, audit bridge-code.3): on its own thread - on the command thread this burst (discovery +
-            // every state, synchronous QoS 1) held up commands and self-heal actions for ~12 s on a slow link.
-            Thread({
-                runCatching {
-                    val p = prefs ?: return@runCatching
-                    if (mqtt !== client || !client.isConnected) return@runCatching
-                    publishDiscovery(client, p, force = false)   // configs only if they changed this session
-                    publishAllStates(p)
-                    Log.i(TAG, "mqtt: re-published states ($why)")
-                }.onFailure { Log.w(TAG, "mqtt: re-publish failed: ${it.message}") }
-            }, "portal-ha-mqtt-republish").also { it.isDaemon = true }.start()
-        }, delayMs)
+    // fleet (2026-11-20, review b1-08): ONE pending re-publish per session. Every connect scheduled a burst at +20 s and
+    // every HA birth one more, with no de-duplication: a broker restart gave each Portal 3 bursts in ~30 s, a flapping HA
+    // client one fleet-wide burst per flap. Now a new request REPLACES the pending one (so the burst still comes after
+    // the LAST birth - the 10-05 navigate-clear case), and a burst comes at most once per REPUBLISH_MIN_GAP_MS within a
+    // session (a later request waits for that gap instead of being dropped). Slot state lives on the timeout thread.
+    private var republishPending: Runnable? = null
+    private var republishClient: MqttClient? = null
+    private var republishLastMs = 0L
+    private val republishSkipped = java.util.concurrent.atomic.AtomicLong()
+
+    private fun scheduleRepublish(client: MqttClient, delayMs: Long, why: String, minGapMs: Long = REPUBLISH_MIN_GAP_MS) {
+        timeoutHandler.post {
+            if (republishClient !== client) { republishClient = client; republishLastMs = 0L }
+            republishPending?.let { timeoutHandler.removeCallbacks(it); republishSkipped.incrementAndGet() }
+            val now = android.os.SystemClock.elapsedRealtime()
+            val at = maxOf(now + delayMs, if (republishLastMs == 0L) 0L else republishLastMs + minGapMs)
+            val run = Runnable {
+                republishPending = null
+                if (mqtt !== client || !client.isConnected) return@Runnable
+                republishLastMs = android.os.SystemClock.elapsedRealtime()
+                // fleet (2026-11-09, audit bridge-code.3): on its own thread - on the command thread this burst (discovery +
+                // every state, synchronous QoS 1) held up commands and self-heal actions for ~12 s on a slow link.
+                Thread({
+                    runCatching {
+                        val p = prefs ?: return@runCatching
+                        if (mqtt !== client || !client.isConnected) return@runCatching
+                        publishDiscovery(client, p, force = false)   // configs only if they changed this session
+                        publishAllStates(p)
+                        Log.i(TAG, "mqtt: re-published states ($why; ${republishSkipped.get()} folded into later ones so far)")
+                    }.onFailure { Log.w(TAG, "mqtt: re-publish failed: ${it.message}") }
+                }, "portal-ha-mqtt-republish").also { it.isDaemon = true }.start()
+            }
+            republishPending = run
+            timeoutHandler.postDelayed(run, at - now)
+        }
     }
 
     // ── MQTT inbound age (self-heal lan check, 2026-11-15) ─────────────────────
@@ -3143,7 +3338,7 @@ class BridgeService : Service() {
         if (topic == HA_STATUS_TOPIC) {
             // HA's birth message: HA (re)started or its MQTT client reconnected - it may have missed our states.
             if (payload == "online") mqtt?.let { c ->
-                scheduleRepublish(c, 3_000L + (Math.random() * 9_000).toLong(), "Home Assistant came online")
+                scheduleRepublish(c, 3_000L + (Math.random() * 9_000).toLong(), "Home Assistant came online", REPUBLISH_BIRTH_GAP_MS)
                 DashboardActivity.retryIfFailed("Home Assistant came online")
             }
             return
@@ -3247,21 +3442,23 @@ class BridgeService : Service() {
         // Exactly the app's internal dead-stream restart (onRtspStreamDead), on the command executor
         // that serializes every stream start/stop. Camera switches and prefs are never touched.
         override fun streamRestart(): String {
-            commandExecutor.submit {
+            // review b1-01: say so when the command thread is busy - the restart only runs once that task ends.
+            val busy = commandExecutor.busyMs()
+            val queued = if (busy > 5_000L) " (queued behind '${commandExecutor.busyLabel}', busy ${busy / 1000} s)" else ""
+            commandExecutor.submit("self-heal stream restart") {
                 val p = prefs ?: return@submit
                 if (!(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled)) return@submit
                 val r = rtspStreamer
                 if (r != null && r.isStreaming) {
                     Log.w(TAG, "rtsp: self-heal restart (no frames)")
                     rtspNeedsRestart = false
-                    r.restart()
-                    noteRtspStarted()
+                    restartStream(r, "self-heal")
                 } else {
                     Log.w(TAG, "rtsp: self-heal start (stream wanted but not running)")
                     applyCameraState(p)
                 }
             }
-            return "restarted the RTSP streamer"
+            return "restarted the RTSP streamer$queued"
         }
 
         override fun streamCameraIssue(): String? {
@@ -3415,7 +3612,9 @@ class BridgeService : Service() {
     private fun bridgeStatusExtras(): String =
         "${FleetCameraSource.status()} | revive attempts=$reviveAttempts last='$reviveLast' | ${presenceMonitor?.status() ?: "presence: off"} | " +
             "${pubStatus()} | wifiPerfLock pref=${prefs?.wifiPerfLock} held=${wifiPerfLock?.isHeld == true} | webview failedFor=${DashboardActivity.loadFailedForMs() / 1000}s | " +
-            "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null} | ${cmdBusyLine()} | ${prefs?.let { togglesLine(it) } ?: ""}"
+            "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null} | ${cmdBusyLine()} | " +
+            "mqtt connect_fails=${mqttConnectFailures.get()} connect_timeouts=${mqttConnectTimeouts.get()} republish_folded=${republishSkipped.get()} | " +
+            "rtsp restart_fails=${rtspRestartFails.get()} | ${prefs?.let { togglesLine(it) } ?: ""}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
@@ -3426,10 +3625,22 @@ class BridgeService : Service() {
             cmd == "restart_stream" -> {
                 if (!(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled)) { say("restart_stream refused - the camera/stream is switched off"); return }
                 if (inCall || ringing) { say("restart_stream refused - a call"); return }
-                val r = rtspStreamer
-                if (r != null && r.isStreaming) { rtspNeedsRestart = false; r.restart(); noteRtspStarted() } else applyCameraState(p)
-                if (!dashboardForeground) scheduleCameraRevive(25_000L, "restart_stream with the dashboard not in front")
-                say("restart_stream done (camera closed + reopened; ${FleetCameraSource.status()})")
+                // control/set runs on its own thread (review b1-01); the camera work stays on the command thread that
+                // serializes every stream start / stop. The reply comes when it has run.
+                if (commandExecutor.busyMs() > 5_000L) say("restart_stream queued - ${cmdBusyLine()}")
+                commandExecutor.submit("control restart_stream") {
+                    val r = rtspStreamer
+                    val ok = if (r != null && r.isStreaming) { rtspNeedsRestart = false; restartStream(r, "control restart_stream") }
+                             else {
+                                 applyCameraState(p)
+                                 (rtspStreamer?.isStreaming == true).also { started ->
+                                     if (!started && !destroyed) wakeHandler.post { if (!destroyed) onRtspStreamDead("restart_stream: start failed") }
+                                 }
+                             }
+                    if (!dashboardForeground) wakeHandler.post { scheduleCameraRevive(25_000L, "restart_stream with the dashboard not in front") }
+                    say(if (ok) "restart_stream done (camera closed + reopened; ${FleetCameraSource.status()})"
+                        else "restart_stream FAILED (stream not running, recovery armed; ${FleetCameraSource.status()})")
+                }
             }
             cmd == "restart_service" -> {
                 val busy = when {
@@ -3510,7 +3721,21 @@ class BridgeService : Service() {
     }
 
     @Volatile private var reviveScheduled = false
+    private var reviveComingUpChecks = 0   // Main review 11-20 (b1-05 cap), main thread only
+    private val REVIVE_COMING_UP_MAX = 3
+
+    // fleet (2026-11-20, review b1-05): with the screen OFF the quick dashboard returns (+5/15/40/90 s) all skip on
+    // 'screen off' and dashboardReturn idles in the dark, so the first real try was this revive at +90 s. A dark
+    // relaunch is proven safe (the panel stays dark), so with the screen off and nothing that blocks a revive the first
+    // check runs at +15 s. Screen on keeps 90 s (the quick returns cover it); the 4-min repeat is unchanged.
+    private fun firstReviveDelay(): Long {
+        val dark = getSystemService(PowerManager::class.java)?.isInteractive != true
+        val blocked = inCall || ringing || TvAppActivity.isShowing() || desktopMode || keepAlive?.isPaused() == true
+        return if (dark && !blocked) CAMERA_REVIVE_DARK_MS else CAMERA_REVIVE_FIRST_MS
+    }
+
     private fun scheduleCameraRevive(delayMs: Long, why: String) {
+        reviveComingUpChecks = 0
         reviveScheduled = true
         wakeHandler.removeCallbacks(cameraRevive)
         wakeHandler.postDelayed(cameraRevive, delayMs)
@@ -3538,6 +3763,18 @@ class BridgeService : Service() {
         if (!(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled)) { reviveAttempts = 0; reviveLastBlock = ""; return }
         val dead = cameraDeadReason()
         if (dead == null) {
+            val r = rtspStreamer
+            if (r != null && r.isStreaming && r.lastFrameElapsed == 0L && p.streamEnabled && reviveComingUpChecks < REVIVE_COMING_UP_MAX) {
+                // Still coming up (review b1-05: the dark check at +15 s can land here): look again once it had its 20 s.
+                // Main review 11-20: at most REVIVE_COMING_UP_MAX looks - a stream that never delivers a first frame (cover
+                // closed, hung encoder) is left to the health check / self-heal, as before b1-05, instead of a 20 s loop.
+                reviveComingUpChecks++
+                reviveScheduled = true
+                wakeHandler.postDelayed(cameraRevive, 20_000L)
+                return
+            }
+            if (reviveComingUpChecks >= REVIVE_COMING_UP_MAX) Log.w(TAG, "camera revive: still no first frame after $reviveComingUpChecks looks - left to the health check / self-heal")
+            reviveComingUpChecks = 0
             if (reviveAttempts > 0) Log.i(TAG, "camera revive: frames are back (after $reviveAttempts attempt(s))")
             reviveAttempts = 0; reviveLastBlock = ""
             return
@@ -3816,6 +4053,8 @@ class BridgeService : Service() {
                     // stream itself never opens the mic, so calls/Alexa/wake word
                     // are unaffected; their yields just mute the track briefly.
                     val ok = r.start(1280, 720, encFps(p), encBitrate(p), withAudio = p.streamAudioEnabled, iFrameS = encIFrame(p))
+                    // review b1-07: a start that was stuck past onDestroy must not keep Camera 0 + port 8554 for a dead instance.
+                    if (ok && destroyed) { Log.w(TAG, "rtsp: start finished after the service stopped - stopping it"); r.stop(); return }
                     cameraActive = ok
                     publishRaw(HaDiscovery.cameraStateTopic(p.deviceId), if (ok) "ON" else "OFF", 1, retained = true)
                     if (ok) noteRtspStarted() else Log.w(TAG, "RTSP failed to start")
@@ -3894,8 +4133,8 @@ class BridgeService : Service() {
         Log.i(TAG, "orientation commit: snapped=$snapped -> auto=$auto (offset=${r.rotationOffset}, was=${r.autoRotation})")
         if (auto == r.autoRotation) return   // no actual change — leave the stream alone
         r.autoRotation = auto
-        commandExecutor.submit {
-            if (r.isStreaming) { r.restart(); noteRtspStarted() }
+        commandExecutor.submit("orientation restart") {
+            if (r.isStreaming) restartStream(r, "orientation")
         }
     }
 
@@ -3944,7 +4183,7 @@ class BridgeService : Service() {
             if (auto == r.autoRotation) return@submit
             Log.i(TAG, "orientation: $why: display rotation=$lastDisplayRotation -> auto=$auto (base=${r.rotationOffset}, was=${r.autoRotation}) - restarting the stream")
             r.autoRotation = auto
-            if (r.isStreaming) { r.restart(); noteRtspStarted() }
+            if (r.isStreaming) restartStream(r, "display rotation")
         }
     }
 
@@ -5079,7 +5318,7 @@ class BridgeService : Service() {
         Log.i(TAG, "restart: service restarted by Android after the app process died - the dashboard comes back unless something else is in front")
         RESTART_FRONT_DELAYS_MS.forEach { d -> wakeHandler.postDelayed({ restartFrontAttempt(d) }, d) }
         // Whatever those attempts found (screen off, ...): the camera revive keeps trying while the camera has no frames.
-        scheduleCameraRevive(CAMERA_REVIVE_FIRST_MS, "service restart")
+        scheduleCameraRevive(firstReviveDelay(), "service restart")
     }
 
     private fun restartFrontAttempt(delayMs: Long) {
@@ -6135,12 +6374,23 @@ class BridgeService : Service() {
     private fun publishRaw(topic: String, payload: String, qos: Int = 0, retained: Boolean = false) {
         if (Thread.currentThread() === mqttThread || Thread.currentThread() === pubThread) {
             runCatching {
-                mqtt?.publish(topic, MqttMessage(payload.toByteArray()).also { it.qos = qos; it.isRetained = retained })
+                val msg = MqttMessage(payload.toByteArray()).also { it.qos = qos; it.isRetained = retained }
+                val q = if (Thread.currentThread() === mqttThread) burstTokens else null
+                val c = mqtt
+                if (q != null && c != null) {
+                    // Connect burst with burst_pipeline on (review b1-02): no PUBACK wait per state, up to PIPELINE_WINDOW in flight.
+                    while (q.size >= PIPELINE_WINDOW) runCatching { q.removeFirst().waitForCompletion(c.timeToWait) }
+                    q.addLast(c.getTopic(topic).publish(msg))
+                } else c?.publish(topic, msg)
             }
             return
         }
         enqueuePublish(topic, payload.toByteArray(), qos, retained)
     }
+
+    // fleet (2026-11-20, review b1-02): set (MQTT thread only) while the connect burst sends its first states with the
+    // burst_pipeline toggle on; null = the old synchronous publish.
+    @Volatile private var burstTokens: ArrayDeque<IMqttDeliveryToken>? = null
 
     // publishRaw that tells whether the message was handed over while a session is CONNECTED (false = dropped).
     private fun publishRawSent(topic: String, payload: String, qos: Int = 0, retained: Boolean = false): Boolean {
@@ -6210,16 +6460,46 @@ class BridgeService : Service() {
     private fun pubStatusNoLock(): String =
         "sent=${pubSent.get()} slow=${pubSlow.get()} dropped_state=${pubDroppedState.get()} dropped_event=${pubDroppedEvent.get()} failed=${pubFailed.get()}"
 
+    // fleet (2026-11-20, review b1-02): with the burst_pipeline toggle on the publisher keeps up to PUB_WINDOW messages in
+    // flight instead of waiting for each PUBACK (stop-and-wait = one message per round trip: ~3/s on Office's link).
+    // Same order on the wire (one sender thread), same QoS; each message still gets its PUB_WAIT_MS before it counts as
+    // slow. Toggle off = the old one-at-a-time wait. Publisher thread only.
+    private class InFlight(val tok: IMqttDeliveryToken, val topic: String, val sentAt: Long)
+    private val pubInFlight = ArrayDeque<InFlight>()
+
+    private fun settleInFlight(keep: Int) {
+        while (pubInFlight.size > keep) {
+            val f = pubInFlight.removeFirst()
+            val left = PUB_WAIT_MS - (android.os.SystemClock.elapsedRealtime() - f.sentAt)
+            try {
+                f.tok.waitForCompletion(left.coerceAtLeast(1L))
+                pubSent.incrementAndGet()
+            } catch (t: org.eclipse.paho.client.mqttv3.MqttException) {
+                if (t.reasonCode == org.eclipse.paho.client.mqttv3.MqttException.REASON_CODE_CLIENT_TIMEOUT.toInt()) {
+                    pubSlow.incrementAndGet(); pubProblem("no ack within ${PUB_WAIT_MS / 1000} s for ${f.topic} (still in flight)")
+                } else { pubFailed.incrementAndGet(); pubProblem("publish failed (${t.reasonCode} ${t.message}) - ${f.topic}") }
+            }
+        }
+    }
+
     private fun publishLoop() {
         while (true) {
-            val e: PendingPub
+            var next: PendingPub? = null
             synchronized(pubLock) {
-                while (pubQueue.isEmpty()) {
-                    try { pubLock.wait() } catch (ie: InterruptedException) { return }
+                // Block only when nothing is queued AND nothing is in flight; otherwise settle the in-flight ones first.
+                if (pubInFlight.isEmpty()) {
+                    while (pubQueue.isEmpty()) {
+                        try { pubLock.wait() } catch (ie: InterruptedException) { return }
+                    }
                 }
-                e = pubQueue.removeFirst()
-                if (e.retained && pubRetained[e.topic] === e) pubRetained.remove(e.topic)
+                if (pubQueue.isNotEmpty()) {
+                    val e = pubQueue.removeFirst()
+                    if (e.retained && pubRetained[e.topic] === e) pubRetained.remove(e.topic)
+                    next = e
+                }
             }
+            val e = next
+            if (e == null) { runCatching { settleInFlight(0) }; continue }
             runCatching { sendQueued(e) }.onFailure { pubFailed.incrementAndGet(); pubProblem("send crashed: ${it.message}") }
         }
     }
@@ -6235,7 +6515,10 @@ class BridgeService : Service() {
                 return
             }
             try {
+                val window = prefs?.toggle("burst_pipeline") == true
+                if (window) settleInFlight(PUB_WINDOW - 1) else settleInFlight(0)
                 val tok = c.getTopic(e.topic).publish(MqttMessage(e.payload).also { it.qos = e.qos; it.isRetained = e.retained })
+                if (window) { pubInFlight.addLast(InFlight(tok, e.topic, android.os.SystemClock.elapsedRealtime())); return }
                 try {
                     tok.waitForCompletion(PUB_WAIT_MS)
                     pubSent.incrementAndGet()
