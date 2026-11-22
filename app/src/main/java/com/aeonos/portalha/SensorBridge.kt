@@ -198,8 +198,15 @@ class SensorBridge(
     @Volatile private var prefs: Prefs? = null
 
     /** Re-send every sensor's last value (the MQTT state burst); off the caller's thread. */
+    // fleet (2026-11-21, review b4-09, Fabio: yes): Tilt X/Y/Z, Light R/G/B and Last Tap are not published unless the
+    // toggle raw_sensors is on (no automation, card or watcher used them). The accelerometer still runs: double knock.
+    @Volatile var rawSensors = false
+
     fun republish() {
-        handler.post { listOf(lightGate, rgbGate, accelGate, tempGate).forEach { runCatching { it.resend() } } }
+        handler.post {
+            (if (rawSensors) listOf(lightGate, rgbGate, accelGate, tempGate) else listOf(lightGate, tempGate))
+                .forEach { runCatching { it.resend() } }
+        }
     }
 
     fun start(prefs: Prefs) {
@@ -266,14 +273,14 @@ class SensorBridge(
         for (i in 0..2) if (!event.values.getOrElse(i) { 0f }.isFinite()) return
         rgbSamples.addLast(RgbSample(SystemClock.elapsedRealtime(), FloatArray(3) { event.values.getOrElse(it) { 0f } }))
         while (rgbSamples.size > RGB_MAX_SAMPLES) rgbSamples.removeFirst()
-        rgbGate.offer()
+        if (rawSensors) rgbGate.offer()
         // On-change sensor: when the readings stop, re-check once the window holds only the last
         // one, so the end value of a step is published even though no new event arrives.
         handler.removeCallbacks(rgbFlush)
         handler.postDelayed(rgbFlush, RGB_WINDOW_MS + 200L)
     }
 
-    private val rgbFlush = Runnable { rgbGate.offer(settled = true) }
+    private val rgbFlush = Runnable { if (rawSensors) rgbGate.offer(settled = true) }
 
     private fun handleAccel(event: SensorEvent, p: Prefs) {
         val x = event.values[0]
@@ -292,7 +299,7 @@ class SensorBridge(
         val force = sqrt((lx * lx + ly * ly + lz * lz).toDouble()).toFloat()
 
         val now = System.currentTimeMillis()
-        accelGate.offer()
+        if (rawSensors) accelGate.offer()
 
         // Threshold is read live from prefs so HA slider and app slider take effect
         // immediately; tapScale lowers it on the less-sensitive Portal+ 2nd gen.
@@ -307,11 +314,13 @@ class SensorBridge(
                 else -> if (isCipher) { if (lz > 0) "up" else "down" } else { if (lz > 0) "front" else "back" }
             }
             Log.i(TAG, "tap: $dir  force=%.1f  threshold=%.1f (scale=%.2f)".format(force, threshold, tapScale))
-            onPublish(HaDiscovery.tapStateTopic(p.deviceId), dir, 1)
-            handler.removeCallbacksAndMessages("tap_reset")
-            handler.postAtTime({
-                onPublish(HaDiscovery.tapStateTopic(p.deviceId), "none", 0)
-            }, "tap_reset", SystemClock.uptimeMillis() + TAP_RESET_MS)
+            if (rawSensors) {
+                onPublish(HaDiscovery.tapStateTopic(p.deviceId), dir, 1)
+                handler.removeCallbacksAndMessages("tap_reset")
+                handler.postAtTime({
+                    onPublish(HaDiscovery.tapStateTopic(p.deviceId), "none", 0)
+                }, "tap_reset", SystemClock.uptimeMillis() + TAP_RESET_MS)
+            }
         }
 
         // Same force, same (live) threshold as the tap above - the Tap Sensitivity number tunes

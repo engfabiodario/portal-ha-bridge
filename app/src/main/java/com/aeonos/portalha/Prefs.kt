@@ -83,6 +83,16 @@ class Prefs(private val context: Context) {
         return null
     }
     fun restartTimes(kind: String): String = sp.getString("restart_times_$kind", "") ?: ""
+
+    // fleet (2026-11-21, review a3-02, Fabio: yes): RTSP login (Basic) on the camera stream. Empty = no login (old
+    // behaviour). Set over MQTT portal/<id>/config/rtsp_auth/set; the laptop's go2rtc / Frigate use the same pair
+    // from C:\homelab\.env. The password never appears in a log line or a status reply.
+    var rtspUser: String
+        get() = sp.getString("rtsp_user", "") ?: ""
+        set(v) = sp.edit().putString("rtsp_user", v).apply()
+    var rtspPassword: String
+        get() = sp.getString("rtsp_password", "") ?: ""
+        set(v) = sp.edit().putString("rtsp_password", v).apply()
     fun setToggle(name: String, on: Boolean) = sp.edit().putBoolean("toggle_$name", on).apply()
 
     // fleet (2026-11-15): WebView.onPause() while the dashboard is not seen (screen off / photos / stopped). Default on.

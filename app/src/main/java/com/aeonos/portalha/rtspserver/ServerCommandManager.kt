@@ -56,6 +56,9 @@ class ServerCommandManager: CommandsManager() {
         }
       }
       Method.SETUP -> {
+        // fleet (2026-11-21, review a3-02): with a login set, SETUP and PLAY need it too (DESCRIBE alone could be
+        // skipped by a client that guesses the track ids).
+        if (needAuth() && !authOk(request)) { Log.e(TAG, "basic auth error (SETUP)"); return createError(401, cSeq) }
         val track = getTrack(request)
         if (track != null) {
           protocol = getProtocol(request, track)
@@ -74,12 +77,15 @@ class ServerCommandManager: CommandsManager() {
           createError(500, cSeq)
         }
       }
-      Method.PLAY -> createPlay(cSeq)
+      Method.PLAY -> if (needAuth() && !authOk(request)) { Log.e(TAG, "basic auth error (PLAY)"); createError(401, cSeq) } else createPlay(cSeq)
       Method.PAUSE -> createPause(cSeq)
       Method.TEARDOWN -> createTeardown(cSeq)
       else -> createError(400, cSeq)
     }
   }
+
+  private fun authOk(request: String): Boolean =
+    Base64.encode("$user:$password".toByteArray()).trim() == getAuth(request).trim()
 
   private fun needAuth(): Boolean {
     return !user.isNullOrEmpty() && !password.isNullOrEmpty()

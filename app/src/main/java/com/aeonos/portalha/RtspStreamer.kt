@@ -52,6 +52,10 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     // (about once a second; -1 = none since the last start) - published in the control status / bridge memory attrs.
     @Volatile var encoderFps = -1
         private set
+    /** RTSP login for the next start()/restart() (review a3-02). */
+    @Volatile var authUser = ""
+    @Volatile var authPassword = ""
+    val authOn: Boolean get() = authUser.isNotEmpty() && authPassword.isNotEmpty()
     // fleet (2026-11-21, review b3-02): why the last start() failed (step + exception text), kept until a start works.
     // A Portal 10" logcat rolls over within a minute, so this is the only lasting record. "" = the last start worked.
     @Volatile var lastStartFailure = ""
@@ -145,6 +149,9 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             // (fd4f:...), so every client that can't route IPv6 (Frigate's laptop after it moved to
             // Ethernet, 2026-10-01) hung at SETUP: all Portal cameras at 0 fps. IPv4 only.
             s.getStreamClient().forceIpType(IpType.IPv4)
+            // fleet (2026-11-21, review a3-02): RTSP login (Basic) when set; empty = open stream (old behaviour).
+            val u = authUser; val pw = authPassword
+            if (u.isNotEmpty() && pw.isNotEmpty()) s.rtspServer.setAuth(u, pw)
             stream = s
             lastFrameElapsed = 0L
             startedElapsed = android.os.SystemClock.elapsedRealtime()

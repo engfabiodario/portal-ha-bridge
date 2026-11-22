@@ -1039,6 +1039,45 @@ class BridgeService : Service() {
     // Reply (not retained) on portal/<id>/config/camera_encoder/status. Ranges: fps 5..30, bitrate 250000..6000000,
     // iframe_s 1..10. 'vbr' is stored but RootEncoder 2.4.6 configures CBR whenever the codec supports it: the reply
     // names the effective mode.
+    // fleet (2026-11-21, review a3-02): RTSP login. Payload JSON {"user":"..","password":".."} | "off" | "status".
+    // Reply on .../rtsp_auth/status: 'rtspauth: on user=<u>' / 'off' (never the password). One stream restart on change.
+    private fun rtspAuthTopic(deviceId: String) = "portal/$deviceId/config/rtsp_auth/set"
+    private fun rtspAuthStatusTopic(deviceId: String) = "portal/$deviceId/config/rtsp_auth/status"
+    private fun rtspAuthLine(p: Prefs, note: String) =
+        "rtspauth: ${if (p.rtspUser.isNotEmpty() && p.rtspPassword.isNotEmpty()) "on user=${p.rtspUser}" else "off"} " +
+            "running=${rtspStreamer?.let { if (it.authOn) "login" else "open" } ?: "none"}${if (note.isNotEmpty()) " | $note" else ""}"
+
+    private fun handleRtspAuthCommand(payload: String, p: Prefs) {
+        val cmd = payload.trim()
+        var note = ""; var changed = false
+        when {
+            cmd.equals("status", true) || cmd.isEmpty() -> {}
+            cmd.equals("off", true) -> { changed = p.rtspUser.isNotEmpty() || p.rtspPassword.isNotEmpty(); p.rtspUser = ""; p.rtspPassword = ""; note = "login removed" }
+            cmd.startsWith("{") -> {
+                val o = runCatching { org.json.JSONObject(cmd) }.getOrNull()
+                val u = o?.optString("user", "")?.trim() ?: ""; val pw = o?.optString("password", "") ?: ""
+                if (u.isEmpty() || pw.length < 12 || u.contains(':')) note = "refused: needs user (no ':') + password (12+ chars)"
+                else { changed = u != p.rtspUser || pw != p.rtspPassword; p.rtspUser = u; p.rtspPassword = pw; note = if (changed) "login set" else "unchanged" }
+            }
+            else -> note = "refused: JSON {user,password} | off | status"
+        }
+        if (changed) {
+            commandExecutor.submit {
+                rtspStreamer?.let {
+                    it.authUser = p.rtspUser; it.authPassword = p.rtspPassword
+                    if (it.isStreaming) restartStream(it, "rtsp login changed")
+                }
+                val line = rtspAuthLine(p, "$note (stream restarted once)")
+                Log.i(TAG, line)
+                publishRaw(rtspAuthStatusTopic(p.deviceId), line, 0, retained = false)
+            }
+        } else {
+            val line = rtspAuthLine(p, note)
+            Log.i(TAG, line)
+            publishRaw(rtspAuthStatusTopic(p.deviceId), line, 0, retained = false)
+        }
+    }
+
     private fun cameraEncoderTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/set"
     private fun cameraEncoderStatusTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/status"
     private fun encFps(p: Prefs) = p.streamFps.coerceIn(5, 30)
@@ -1287,6 +1326,7 @@ class BridgeService : Service() {
         ScreenControl.enableAccessibility(this)
         sensorBridge = SensorBridge(this, ::publishRaw) { lastTouchElapsedMs }.also { it.start(p) }
         sensorBridge?.knockBlocker = { when { desktopMode -> "desktop mode"; inCall || ringing -> "a call"; else -> null } }
+        sensorBridge?.rawSensors = p.toggle("raw_sensors")
         soundMonitor = SoundMonitor(this) { level ->
             lastSoundLevel = level
             prefs?.let { p ->
@@ -2665,7 +2705,7 @@ class BridgeService : Service() {
     //  modern_frontend: (2026-11-21, speed B2 PILOT, default off) the dashboard WebView says Chrome/132 so HA serves its
     //                   modern frontend build (Chromium 131 gets the legacy ES5 one); applied at once with one page reload.
     private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe",
-        "intercom_off", "modern_frontend")
+        "intercom_off", "modern_frontend", "raw_sensors")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2677,6 +2717,10 @@ class BridgeService : Service() {
         p.setToggle(name, v == "on")
         if (name == "top_swipe") wakeHandler.post { applyTopSwipe() }
         if (name == "modern_frontend") DashboardActivity.applyUserAgentNow()
+        if (name == "raw_sensors") {
+            sensorBridge?.rawSensors = v == "on"
+            commandExecutor.submit { runCatching { mqtt?.let { if (it.isConnected) publishDiscovery(it, p) } } }
+        }
         val note = when (name) {
             "intercom_off" -> " (applies at the next service start: restart_service)"
             "fast_reconnect" -> " (no effect since 2026-11-20: the network wake is always on)"
@@ -2854,6 +2898,7 @@ class BridgeService : Service() {
                 // on /sdcard that the Fleet Agent serves); cap other payloads at 300 chars.
                 val shown = when {
                     topic == HaDiscovery.haTokenCommandTopic(p.deviceId) -> "<redacted, ${payload.length} chars>"
+                    topic == rtspAuthTopic(p.deviceId) -> "<redacted, ${payload.length} chars>"
                     payload.length > 300 -> payload.take(300) + "... (${payload.length} chars)"
                     else -> payload
                 }
@@ -2961,6 +3006,7 @@ class BridgeService : Service() {
             HaDiscovery.youtubeCommandTopic(p.deviceId),
             cameraViewTopic(p.deviceId),
             cameraEncoderTopic(p.deviceId),
+            rtspAuthTopic(p.deviceId),
             displayDensityTopic(p.deviceId),
             HaDiscovery.desktopCommandTopic(p.deviceId),
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId),
@@ -3220,13 +3266,17 @@ class BridgeService : Service() {
         pub(HaDiscovery.desktopSensorDiscoveryTopic(p.deviceId), HaDiscovery.desktopSensorConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopMinutesDiscoveryTopic(p.deviceId), HaDiscovery.desktopMinutesConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.lightDiscoveryTopic(p.deviceId), HaDiscovery.lightConfigPayload(p.deviceId, p.deviceName))
+        // fleet (2026-11-21, review b4-09): Tilt X/Y/Z, Light R/G/B and Last Tap only with the toggle raw_sensors (default
+        // off = their discovery topics are cleared, HA removes the 7 entities).
+        val raw = p.toggle("raw_sensors")
         for (axis in listOf("x", "y", "z"))
-            pub(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis), HaDiscovery.accelConfigPayload(p.deviceId, p.deviceName, axis))
+            if (raw) pub(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis), HaDiscovery.accelConfigPayload(p.deviceId, p.deviceName, axis))
+            else clear(HaDiscovery.accelDiscoveryTopic(p.deviceId, axis))
 
         // RGB and temperature are hardware-dependent: Portal has the RGB sensor,
         // Portal+ has ambient temperature instead. Publish only what exists;
         // clear the other so HA doesn't show a dead entity.
-        if (sensorBridge?.hasRgb == true) {
+        if (sensorBridge?.hasRgb == true && raw) {
             for (ch in listOf("r", "g", "b"))
                 pub(HaDiscovery.rgbDiscoveryTopic(p.deviceId, ch), HaDiscovery.rgbConfigPayload(p.deviceId, p.deviceName, ch))
         } else {
@@ -3241,7 +3291,8 @@ class BridgeService : Service() {
             clear(HaDiscovery.tempOffsetDiscoveryTopic(p.deviceId))
         }
 
-        pub(HaDiscovery.tapDiscoveryTopic(p.deviceId), HaDiscovery.tapConfigPayload(p.deviceId, p.deviceName))
+        if (raw) pub(HaDiscovery.tapDiscoveryTopic(p.deviceId), HaDiscovery.tapConfigPayload(p.deviceId, p.deviceName))
+        else clear(HaDiscovery.tapDiscoveryTopic(p.deviceId))
         pub(HaDiscovery.sensitivityDiscoveryTopic(p.deviceId), HaDiscovery.sensitivityConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.knockDiscoveryTopic(p.deviceId), HaDiscovery.knockConfigPayload(p.deviceId, p.deviceName))
         // The Sound Level sensor only exists when we hold the mic; in coexist mode the
@@ -3401,6 +3452,7 @@ class BridgeService : Service() {
             HaDiscovery.youtubeCommandTopic(p.deviceId)           -> handleYoutubeCommand(payload)
             cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
             cameraEncoderTopic(p.deviceId)                        -> handleCameraEncoderCommand(payload, p)
+            rtspAuthTopic(p.deviceId)                             -> handleRtspAuthCommand(payload, p)
             displayDensityTopic(p.deviceId)                       -> handleDisplayDensityCommand(payload, p)
             HaDiscovery.desktopCommandTopic(p.deviceId)           -> handleDesktopCommand(payload)
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId)    -> handleDesktopMinutesCommand(payload, p)
@@ -3629,7 +3681,7 @@ class BridgeService : Service() {
     private fun publishCapabilities(p: Prefs) {
         val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
-            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\"]," +
+            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
         publishRaw(capabilitiesTopic(p.deviceId), json, 1, retained = true)
     }
@@ -4101,6 +4153,7 @@ class BridgeService : Service() {
                 r.cameraId = p.streamCameraId
                 r.sizeOverride = parseStreamSize(p.streamSize)
                 r.fpsCap = p.streamFpsCap
+                r.authUser = p.rtspUser; r.authPassword = p.rtspPassword
                 com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush = p.rtspBatchFlush
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
