@@ -105,6 +105,7 @@ class FleetServerClient(
         @Volatile @JvmStatic var fitMss = false
         private const val TCP_MAXSEG = 2               // linux/tcp.h
         private const val LIB_MAX_PACKET = 1472
+        private const val FALLBACK_MSS = 1448
 
         /**
          * fleet (2026-11-22, review b3-11): a client whose oldest queued packet is older than this drops to the next key
@@ -406,9 +407,12 @@ class FleetServerClient(
     private fun fitPacketToMss(vp: BasePacket) {
         runCatching {
             val fd = Socket::class.java.getMethod("getFileDescriptor\$").invoke(socket) as java.io.FileDescriptor
-            // Os.getsockoptInt is @hide (greylisted - fine with the fleet's hidden_api_policy): by reflection.
-            val mss = Os::class.java.getMethod("getsockoptInt", java.io.FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                .invoke(null, fd, OsConstants.IPPROTO_TCP, TCP_MAXSEG) as Int
+            // Os.getsockoptInt is @hide (greylisted - fine with the fleet's hidden_api_policy): by reflection. Android 11
+            // (Echo Show) has no such method: then a safe 1448 (= MSS 1460 without / 1448 with TCP timestamps) is assumed.
+            val mss = runCatching {
+                Os::class.java.getMethod("getsockoptInt", java.io.FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .invoke(null, fd, OsConstants.IPPROTO_TCP, TCP_MAXSEG) as Int
+            }.getOrElse { FALLBACK_MSS }
             if (mss < 536 || mss - 4 >= LIB_MAX_PACKET) {
                 Log.i(TAG, "rtsp: client $label mss=$mss - video packets left at $LIB_MAX_PACKET B")
                 return
