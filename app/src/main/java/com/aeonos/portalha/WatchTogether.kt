@@ -104,7 +104,9 @@ class WatchTogether(private val host: Host) {
         val list = o.optJSONArray("portals") ?: JSONArray()
         val members = (0 until list.length()).map { list.optString(it) }
         if (host.slug !in members) {
-            if (active) end("another session started without this Portal", close = false)
+            // fleet (2026-11-22, x9-03 live gate): the YouTube screen belongs to the session - close it too (Dining Room
+            // stayed on YouTube after a newer session without it started; closed by hand).
+            if (active) end("another session started without this Portal", close = true)
             return
         }
         val v = o.optString("video").trim()
@@ -166,7 +168,13 @@ class WatchTogether(private val host: Host) {
     fun onMember(topic: String, payload: String) {
         val slug = topic.removePrefix(MEMBERS_PREFIX)
         if (!Regex("^portal_[a-z0-9_]+$").matches(slug)) return
-        if (payload.isBlank()) { known.remove(slug); return }
+        if (payload.isBlank()) {
+            known.remove(slug)
+            // fleet (2026-11-22, x9-03): our session's leader withdrew (its Bridge stopped) - nobody drives the group
+            // any more: leave and close the screen instead of staying on YouTube.
+            if (active && !isLeader && slug == leader) end("the leader $slug left", close = true)
+            return
+        }
         known[slug] = runCatching { JSONObject(payload).optString("name") }.getOrNull()?.ifBlank { null } ?: displayName(slug)
     }
 
