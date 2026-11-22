@@ -828,10 +828,15 @@ class BridgeService : Service() {
     // Of those, the ones that are a real screen other than the dashboard (settings, the cast
     // receiver, the update prompt) - the keep-alive never parks over one of them.
     @Volatile private var otherScreensResumed = 0
+    @Volatile private var otherScreenSinceMs = 0L
     private val ourActivityWatch = object : android.app.Application.ActivityLifecycleCallbacks {
         override fun onActivityResumed(a: android.app.Activity) {
             ourActivitiesResumed++
-            if (a !is DashboardActivity && a !is AvaKeepAliveActivity && a !is TvAppActivity) otherScreensResumed++
+            if (a !is DashboardActivity && a !is AvaKeepAliveActivity && a !is TvAppActivity) {
+                // fleet (2026-11-22 pm): when a screen came up - the idle close counts from here too (b5-08 fix).
+                if (otherScreensResumed == 0) otherScreenSinceMs = SystemClock.elapsedRealtime()
+                otherScreensResumed++
+            }
             // Settings screens and the like have no touch hook of their own; the dashboard and the
             // cast screen do (dispatchTouchEvent), so they're left alone.
             if (a !is DashboardActivity && a !is TvAppActivity) runCatching { noteTouchesOn(a.window) }
@@ -5576,8 +5581,11 @@ class BridgeService : Service() {
     // park. 5 min without a touch (and no setup pause / desktop / call) -> the dashboard comes back to the front.
     private fun closeIdleBridgeScreen() {
         if (otherScreensResumed <= 0 || desktopMode || inCall || ringing || keepAlive?.isPaused() == true) return
-        val idle = SystemClock.elapsedRealtime() - lastTouchElapsedMs
-        if (lastTouchElapsedMs != 0L && idle < 5 * 60_000L) return
+        // fleet (2026-11-22 pm): idle = since the last touch OR since the screen came up, whichever is later. It counted
+        // from the last touch only, so a screen opened without a touch (adb / Setup-Portal's am start, HA config_screen)
+        // after > 5 min without one - or with no touch since boot - was closed again within ~10 s (Echo Show test).
+        val idle = SystemClock.elapsedRealtime() - maxOf(lastTouchElapsedMs, otherScreenSinceMs)
+        if (idle < 5 * 60_000L) return
         Log.i(TAG, "dashboard: a Bridge screen was left open ${idle / 1000} s without a touch - dashboard back to the front")
         wakeHandler.post { bringDashboardToFront() }
     }
