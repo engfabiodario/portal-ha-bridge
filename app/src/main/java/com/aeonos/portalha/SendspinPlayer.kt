@@ -411,11 +411,20 @@ class SendspinPlayer(
 
         // PCM only: the Portal has no spare headroom for decoding, and on a LAN the bandwidth
         // is irrelevant. Artwork is requested at a size that suits the now-playing overlay.
+        // fleet (2026-11-22, review b6-09, PILOT): control/set sendspin_codec:flac offers FLAC first (lossless, ~half the
+        // air time), PCM stays listed as the fallback. Default (unset / pcm) = PCM only, as before. Applies at restart_service.
+        val codecPref = context.getSharedPreferences("portal_ha", Context.MODE_PRIVATE).getString("sendspin_codec", "pcm") ?: "pcm"
+        val pcmFormats = listOf(
+            AudioFormat(codec = "pcm", channels = 2, sampleRate = 44100, bitDepth = 16),
+            AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
+        )
+        val formats = if (codecPref == "flac") listOf(
+            AudioFormat(codec = "flac", channels = 2, sampleRate = 44100, bitDepth = 16),
+            AudioFormat(codec = "flac", channels = 2, sampleRate = 48000, bitDepth = 16),
+        ) + pcmFormats else pcmFormats
+        Log.i(TAG, "sendspin: offering ${formats.joinToString { "${it.codec}/${it.sampleRate}" }}")
         val prefs = ClientPreferences(
-            supportedFormats = listOf(
-                AudioFormat(codec = "pcm", channels = 2, sampleRate = 44100, bitDepth = 16),
-                AudioFormat(codec = "pcm", channels = 2, sampleRate = 48000, bitDepth = 16),
-            ),
+            supportedFormats = formats,
             artworkChannels = if (artwork) listOf(ArtworkChannel(source = "album", format = "jpeg")) else emptyList(),
             // NOT "set_static_delay": Music Assistant 2.10.5 (aiosendspin 10.0.0) rejects the whole
             // client/hello as malformed when it is listed (2026-10-10 pilot: endless reconnect loop,

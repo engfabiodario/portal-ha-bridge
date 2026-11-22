@@ -122,8 +122,14 @@ class SendspinAudioPlayer(
         // one); a mid-session format change drops the old-format leftovers.
         if (hadTrack) buffer.flush()
         this.format = format
-        if (!format.codec.equals("pcm", ignoreCase = true)) {
-            Log.w(TAG, "sendspin: server chose codec '${format.codec}' but only PCM is supported")
+        // fleet (2026-11-22, review b6-09, PILOT per Portal: control/set sendspin_codec:flac): FLAC frames are decoded here
+        // (MediaCodec audio/flac, codec_header = fLaC + STREAMINFO as csd-0) into the same PCM path, each decoded block
+        // keeping its chunk's server timestamp (= the decoder's presentation time), so the closed-loop sync is unchanged.
+        releaseDecoder()
+        if (format.codec.equals("flac", ignoreCase = true)) {
+            if (!openFlacDecoder(format)) return
+        } else if (!format.codec.equals("pcm", ignoreCase = true)) {
+            Log.w(TAG, "sendspin: server chose codec '${format.codec}' but only PCM / FLAC are supported")
             return
         }
         val channelMask = if (format.channels >= 2)
@@ -198,8 +204,82 @@ class SendspinAudioPlayer(
         buffer.flush()
         if (running) flushRequested = true else {
             runCatching { track?.pause(); track?.flush() }
+            flushDecoder()
             resetAlignment()
         }
+    }
+
+    // ── FLAC (review b6-09 pilot) ─────────────────────────────────────────────
+    private var decoder: android.media.MediaCodec? = null
+    private val decoded = ArrayDeque<AudioChunk>()
+    private val decInfo = android.media.MediaCodec.BufferInfo()
+    private var decErrors = 0
+
+    private fun openFlacDecoder(f: StreamFormat): Boolean = runCatching {
+        val hdr = f.codecHeader?.let { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }
+        val mf = android.media.MediaFormat.createAudioFormat("audio/flac", f.sampleRate, if (f.channels >= 2) 2 else 1)
+        if (hdr != null && hdr.isNotEmpty()) mf.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(hdr))
+        val d = android.media.MediaCodec.createDecoderByType("audio/flac")
+        d.configure(mf, null, null, 0)
+        d.start()
+        decoder = d
+        Log.i(TAG, "sendspin: FLAC decoder ${d.name} (header ${hdr?.size ?: 0} B)")
+        true
+    }.getOrElse {
+        Log.w(TAG, "sendspin: FLAC decoder failed (${it.javaClass.simpleName}: ${it.message}) - no audio for this stream")
+        releaseDecoder(); false
+    }
+
+    private fun flushDecoder() {
+        decoded.clear()
+        runCatching { decoder?.flush() }
+    }
+
+    private fun releaseDecoder() {
+        decoded.clear()
+        decoder?.let { d -> runCatching { d.stop() }; runCatching { d.release() } }
+        decoder = null
+    }
+
+    /** One encoded chunk in; every PCM block the decoder has ready out (into [decoded], server timestamps kept). */
+    private fun decode(c: AudioChunk) {
+        val d = decoder ?: return
+        try {
+            val inIdx = d.dequeueInputBuffer(20_000L)
+            if (inIdx >= 0) {
+                val ib = d.getInputBuffer(inIdx)!!
+                ib.clear(); ib.put(c.data)
+                d.queueInputBuffer(inIdx, 0, c.data.size, c.serverTimestampMicros, 0)
+            } else { dropped++; return }
+            var wait = 20_000L
+            while (true) {
+                val o = d.dequeueOutputBuffer(decInfo, wait)
+                wait = 0L
+                if (o >= 0) {
+                    if (decInfo.size > 0) {
+                        val ob = d.getOutputBuffer(o)!!
+                        ob.position(decInfo.offset); ob.limit(decInfo.offset + decInfo.size)
+                        val pcm = ByteArray(decInfo.size); ob.get(pcm)
+                        decoded.addLast(AudioChunk(decInfo.presentationTimeUs, pcm))
+                    }
+                    d.releaseOutputBuffer(o, false)
+                } else if (o == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    Log.i(TAG, "sendspin: FLAC output ${d.outputFormat}")
+                } else break
+            }
+        } catch (e: Exception) {
+            dropped++
+            if (decErrors++ < 5) Log.w(TAG, "sendspin: FLAC decode error ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /** The next PCM chunk: straight from the buffer (PCM) or through the decoder (FLAC). */
+    private fun nextPcmChunk(): AudioChunk? {
+        if (decoder == null) return buffer.poll(ClockSync.localMicros() + LOOKAHEAD_US)
+        decoded.removeFirstOrNull()?.let { return it }
+        val raw = buffer.poll(ClockSync.localMicros() + LOOKAHEAD_US) ?: return null
+        decode(raw)
+        return decoded.removeFirstOrNull()
     }
 
     override fun stop() {
@@ -309,9 +389,10 @@ class SendspinAudioPlayer(
             if (flushRequested) {
                 flushRequested = false
                 runCatching { t.pause(); t.flush(); t.play() }
+                flushDecoder()
                 resetAlignment()
             }
-            val chunk = pending ?: buffer.poll(ClockSync.localMicros() + LOOKAHEAD_US)
+            val chunk = pending ?: nextPcmChunk()
             if (chunk == null) {                       // nothing queued yet / stream stalled
                 if (!idleLogged && written == 0L &&
                     System.currentTimeMillis() - lastReport > 5_000) {
@@ -442,6 +523,7 @@ class SendspinAudioPlayer(
     }
 
     private fun releaseTrack() {
+        releaseDecoder()
         runCatching { track?.pause(); track?.flush(); track?.stop() }
         runCatching { track?.release() }
         track = null

@@ -3794,7 +3794,7 @@ class BridgeService : Service() {
 
     private fun publishCapabilities(p: Prefs) {
         val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"reload\",\"sendspin_buffer_kb\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"," +
-            "\"rtsp_status\",\"rtsp_max_age_ms\",\"music_status\",\"settings_unlock\"]," +
+            "\"rtsp_status\",\"rtsp_max_age_ms\",\"music_status\",\"settings_unlock\",\"sendspin_codec\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
             "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\",\"photo_hold\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
@@ -3906,6 +3906,13 @@ class BridgeService : Service() {
                 val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
                 if (v != null && (v == 0 || v in 500..10_000)) { sp.edit().putInt("rtsp_max_age_ms", v).apply(); applyRtspClientPrefs(p) }
                 say("rtsp_max_age_ms=${sp.getInt("rtsp_max_age_ms", 0)} (0 = off; 500..10000; live for every client)")
+            }
+            cmd.startsWith("sendspin_codec") -> {
+                // fleet (2026-11-22, review b6-09 PILOT): flac | pcm (default); applies at the next restart_service.
+                val v = cmd.substringAfter(':', "").trim()
+                val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
+                if (v == "flac" || v == "pcm") sp.edit().putString("sendspin_codec", v).apply()
+                say("sendspin_codec=${sp.getString("sendspin_codec", "pcm")} (applies at the next restart_service)")
             }
             cmd == "music_status" -> say(sendspinPlayer?.let { it.statusLine() + " | " + it.linkAttributesJson() } ?: "music off (synced speaker off)")
             cmd.startsWith("settings_unlock") -> {
