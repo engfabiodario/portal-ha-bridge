@@ -3790,11 +3790,14 @@ class BridgeService : Service() {
     // restart they cause: restart_service 3 an hour, restart_process 2 a day.
     private val RESTART_PROCESS_ALARM_RC = 0x50524f43
 
+    /** review b3-11: the backlog age limit is 2 s by default since 2026-11-22 (fleet, Fabio: apply today); 0 = off. */
+    private val RTSP_MAX_AGE_DEFAULT = 2_000
+
     /** review b3-08 / b3-11: per-client RTSP options from the prefs (packets sized to the MSS, backlog age limit). */
     private fun applyRtspClientPrefs(p: Prefs) {
         com.aeonos.portalha.rtspserver.FleetServerClient.fitMss = p.toggle("rtp_fit_mss")
         com.aeonos.portalha.rtspserver.FleetServerClient.maxAgeMs =
-            getSharedPreferences("portal_ha", MODE_PRIVATE).getInt("rtsp_max_age_ms", 0).toLong()
+            getSharedPreferences("portal_ha", MODE_PRIVATE).getInt("rtsp_max_age_ms", RTSP_MAX_AGE_DEFAULT).toLong()
     }
 
     private fun publishCapabilities(p: Prefs) {
@@ -3910,7 +3913,7 @@ class BridgeService : Service() {
                 val v = cmd.substringAfter(':', "").trim().toIntOrNull()
                 val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
                 if (v != null && (v == 0 || v in 500..10_000)) { sp.edit().putInt("rtsp_max_age_ms", v).apply(); applyRtspClientPrefs(p) }
-                say("rtsp_max_age_ms=${sp.getInt("rtsp_max_age_ms", 0)} (0 = off; 500..10000; live for every client)")
+                say("rtsp_max_age_ms=${sp.getInt("rtsp_max_age_ms", RTSP_MAX_AGE_DEFAULT)} (0 = off; 500..10000; default $RTSP_MAX_AGE_DEFAULT; live for every client)")
             }
             cmd.startsWith("sendspin_codec") -> {
                 // fleet (2026-11-22, review b6-09 PILOT): flac | pcm (default); applies at the next restart_service.

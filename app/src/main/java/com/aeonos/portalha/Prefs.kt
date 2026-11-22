@@ -16,7 +16,8 @@ data class IntercomButton(
     val y: Int = -1
 )
 
-private val DEFAULT_ON_TOGGLES = setOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check")
+// rtp_fit_mss default ON since 2026-11-22 (review b3-08 fleet, Fabio: apply today)
+private val DEFAULT_ON_TOGGLES = setOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "rtp_fit_mss")
 
 class Prefs(private val context: Context) {
     private val sp = context.getSharedPreferences("portal_ha", Context.MODE_PRIVATE)
