@@ -1290,6 +1290,7 @@ class BridgeService : Service() {
     private val timeoutRunnable = object : Runnable {
         override fun run() {
             checkScreenTimeout()
+            runCatching { closeIdleBridgeScreen() }
             runCatching { reconcileWebPause("tick") }
             runCatching { checkCommandThread() }
             runCatching { checkScreensaver() }.onFailure { Log.w(TAG, "screensaver check: ${it.message}") }
@@ -1549,6 +1550,7 @@ class BridgeService : Service() {
         // back (Office 19:19: no resumed activity, no camera, RTSP not listening until it was
         // started by hand), so do what the boot path does - our own DashboardActivity only.
         if (intent == null || intent.action == ACTION_REVIVE) scheduleRestartFront()
+        if (!cameraRestoreScheduled) { cameraRestoreScheduled = true; scheduleCameraRestoreOnStart() }
         if (intent?.action == ACTION_BOOTED) {
             val p = prefs ?: Prefs(this).also { prefs = it }
             if (p.startOnBoot) {
@@ -2871,6 +2873,12 @@ class BridgeService : Service() {
         runCatching { t.join(MQTT_OFFLINE_PUBLISH_WAIT_MS) }
     }
 
+    private fun retainedCommandTopic(topic: String): Boolean {
+        val id = prefs?.deviceId ?: return false
+        if (!topic.startsWith("portal/$id/")) return topic == "portal/navigate" || topic == "portal/dismiss_screensaver"
+        return topic.endsWith("/set") || topic.endsWith("/command") || topic.endsWith("/navigate")
+    }
+
     private fun connectAndRun() {
         val p = prefs ?: Prefs(this).also { prefs = it }
         val client = MqttClient(p.brokerUri, "portalha-${p.deviceId.take(8)}", MemoryPersistence())
@@ -2893,6 +2901,14 @@ class BridgeService : Service() {
                 // decoded or run on the command executor — route it straight to
                 // the manager from the raw bytes. handleRawMessage is non-blocking.
                 if (intercom?.handleRawMessage(topic, msg.payload) == true) return
+                // fleet (2026-11-22, review b4-03): a command that arrives RETAINED (none of ours is sent that way) would run
+                // again after every reconnect (a retained restart_service = a loop). Dropped and cleared; state-like topics
+                // that are retained on purpose (watch members, HA birth, the fleet's own availability) pass.
+                if (msg.isRetained && retainedCommandTopic(topic)) {
+                    Log.w(TAG, "mqtt: retained command on $topic ignored and cleared")
+                    runCatching { mqtt?.publish(topic, ByteArray(0), 1, true) }
+                    return
+                }
                 val payload = msg.toString().trim()
                 // fleet (2026-11-15): never log the HA token (it went to logcat - and from there into the crash/exit dumps
                 // on /sdcard that the Fleet Agent serves); cap other payloads at 300 chars.
@@ -3469,13 +3485,17 @@ class BridgeService : Service() {
             inCall -> "a call is on"
             ringing -> "a call is ringing"
             anyPlaybackUsage(AudioAttributes.USAGE_ALARM) -> "an alarm is ringing"
-            TvAppActivity.isShowing() -> "a cast is showing"
             intercom?.isTalking() == true || intercom?.busySpeakerName() != null -> "the intercom is in use"
             twoWayChannelOpen -> "a two-way voice channel is open"
             micYieldedForWake -> "a wake hand-off is running"
-            navPath.isNotEmpty() -> "a navigate page is showing"
             otherScreensResumed > 0 -> "a Bridge screen is open"
             desktopMode -> "desktop mode (the launcher is in front on purpose)"
+            else -> null
+        }
+        // fleet (2026-11-22, review b4-05): these only hold the dashboard reload; a navigate page counts 30 min at most.
+        override fun screenBusyReason(): String? = when {
+            TvAppActivity.isShowing() -> "a cast / YouTube is showing"
+            navPath.isNotEmpty() && SystemClock.elapsedRealtime() - navSinceMs < 30 * 60_000L -> "a navigate page is showing"
             else -> null
         }
 
@@ -3679,7 +3699,7 @@ class BridgeService : Service() {
     private val RESTART_PROCESS_ALARM_RC = 0x50524f43
 
     private fun publishCapabilities(p: Prefs) {
-        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
+        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"reload\",\"sendspin_buffer_kb\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
             "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
@@ -3693,7 +3713,7 @@ class BridgeService : Service() {
             "mqtt connect_fails=${mqttConnectFailures.get()} connect_timeouts=${mqttConnectTimeouts.get()} republish_folded=${republishSkipped.get()} | " +
             "rtsp restart_fails=${rtspRestartFails.get()} start_fails=${rtspStreamer?.startFailures ?: 0} last_start_failure='${rtspStreamer?.lastStartFailure ?: ""}' " +
             "enc_fps=${rtspStreamer?.encoderFps ?: -1} | restarts service='${prefs?.restartTimes("service") ?: ""}' process='${prefs?.restartTimes("process") ?: ""}' | " +
-            "${prefs?.let { togglesLine(it) } ?: ""}"
+            "page_probe='${DashboardActivity.lastPageProbe}' | ${prefs?.let { togglesLine(it) } ?: ""}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
@@ -3770,6 +3790,17 @@ class BridgeService : Service() {
                         android.os.Process.killProcess(android.os.Process.myPid())
                     }, 800L)
                 }, 1_200L)
+            }
+            cmd == "reload" -> {
+                // fleet (2026-11-22, review b5-05): one full load of the kiosk's page; waits while a navigate page shows.
+                if (navPath.isNotEmpty()) { say("reload refused - a navigate page is showing ($navPath)"); return }
+                say(if (DashboardActivity.reloadOnce()) "reload: loading the dashboard page once" else "reload: no dashboard")
+            }
+            cmd.startsWith("sendspin_buffer_kb") -> {
+                val v = cmd.substringAfter(':', "").trim().toIntOrNull()
+                val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
+                if (v != null && (v == 0 || v in 64..4096)) sp.edit().putInt("sendspin_buffer_kb", v).apply()
+                say("sendspin_buffer_kb=${sp.getInt("sendspin_buffer_kb", 0)} (0 = library default 256; applies at the next restart_service)")
             }
             cmd == "toggles" -> say(togglesLine(p))
             cmd.startsWith("toggle:") -> say(applyToggle(cmd.substringAfter("toggle:"), p))
@@ -5424,6 +5455,27 @@ class BridgeService : Service() {
         }
     }
 
+    // fleet (2026-11-22, review b5-08): a Bridge settings screen left open on a wall blocks photos, self-heal and the Ava
+    // park. 5 min without a touch (and no setup pause / desktop / call) -> the dashboard comes back to the front.
+    private fun closeIdleBridgeScreen() {
+        if (otherScreensResumed <= 0 || desktopMode || inCall || ringing || keepAlive?.isPaused() == true) return
+        val idle = SystemClock.elapsedRealtime() - lastTouchElapsedMs
+        if (lastTouchElapsedMs != 0L && idle < 5 * 60_000L) return
+        Log.i(TAG, "dashboard: a Bridge screen was left open ${idle / 1000} s without a touch - dashboard back to the front")
+        wakeHandler.post { bringDashboardToFront() }
+    }
+
+    // fleet (2026-11-22, review b2-09 rest): the camera restore no longer waits for the broker (unreachable = no stream
+    // for minutes after a service start with the dashboard already open). 12 s after the start, if still not streaming.
+    private fun scheduleCameraRestoreOnStart() {
+        wakeHandler.postDelayed({
+            val p = prefs ?: return@postDelayed
+            if (destroyed || !(p.cameraServiceEnabled && p.cameraOn && p.streamEnabled) || rtspStreamer?.isStreaming == true) return@postDelayed
+            Log.i(TAG, "camera: not streaming 12 s after the service start - restoring it (broker not needed)")
+            commandExecutor.submit { runCatching { applyCameraState(p) } }
+        }, 12_000L)
+    }
+
     private fun scheduleRestartFront() {
         val p = prefs ?: Prefs(this).also { prefs = it }
         if (!p.startOnBoot) {
@@ -6023,6 +6075,8 @@ class BridgeService : Service() {
     // ── Navigate: put any HA page on this Portal, then come back ───────────────────
     // The page a navigate is showing ("" = home). Published as the Navigate entity's state.
     @Volatile private var navPath = ""
+    @Volatile private var navSinceMs = 0L
+    @Volatile private var cameraRestoreScheduled = false
     private val navReturn = Runnable { returnFromNavigate(timed = true) }
 
     /** A parsed navigate payload. [path] "" = go home. [seconds] 0 = stay until told otherwise. */
@@ -6093,6 +6147,7 @@ class BridgeService : Service() {
         if (url.isEmpty()) { Log.w(TAG, "navigate: no Home Assistant URL set"); return }
         Log.i(TAG, "navigate: $url (seconds=${req.seconds}, dismiss=${req.dismiss})")
         navPath = req.path
+        navSinceMs = SystemClock.elapsedRealtime()
         publishNavigateState(p)
         wakeHandler.post {
             wakeHandler.removeCallbacks(navReturn)

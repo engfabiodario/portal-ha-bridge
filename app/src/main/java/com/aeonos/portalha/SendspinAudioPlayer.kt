@@ -284,6 +284,8 @@ class SendspinAudioPlayer(
     // ── feeder ────────────────────────────────────────────────────────────────
 
     private fun feedLoop() {
+        // fleet (2026-11-22, review b6-10): audio priority for the feeder (a busy Portal+ starved it). Buffer size unchanged.
+        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO) }
         var lastReport = System.currentTimeMillis()
         var idleLogged = false
         while (running) {

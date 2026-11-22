@@ -91,6 +91,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     interface Host {
         /** Why a check must not run now (call, cast, alarm, intercom, settings screen...), or null. */
         fun busyReason(): String?
+        /** fleet (2026-11-22, review b4-05): something on screen (navigate page < 30 min, YouTube / cast) - only the
+         *  dashboard reload waits; stream, RTSP clients and keep-alive keep healing behind it. null = none. */
+        fun screenBusyReason(): String? = null
         /** null = the app has no broker configured (n/a). */
         fun mqttConnected(): Boolean?
         /** ms since the live MQTT session last RECEIVED anything (PINGRESP, PUBACK, a message); null = unknown / no session. */
@@ -303,7 +306,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         judge(Check.MQTT, evalMqtt(), skipActionWhy = linkWhy)
         judge(Check.STREAM, evalStream())
         judge(Check.RTSPCLIENTS, evalRtspClients())
-        judge(Check.WEBVIEW, evalWebview(), skipActionWhy = linkWhy)
+        judge(Check.WEBVIEW, evalWebview(), skipActionWhy = linkWhy ?: runCatching { host.screenBusyReason() }.getOrNull()?.let { "busy: $it" })
         judge(Check.KEEPALIVE, evalKeepAlive())
 
         updateState(why)

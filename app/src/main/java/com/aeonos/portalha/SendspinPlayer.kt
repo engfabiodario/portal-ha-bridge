@@ -317,6 +317,10 @@ class SendspinPlayer(
             // client/hello as malformed when it is listed (2026-10-10 pilot: endless reconnect loop,
             // player unavailable). The static-delay handler stays for a server that accepts it.
             playerSupportedCommands = listOf("volume", "mute"),
+            // fleet (2026-11-22, review b6-02, PILOT): player buffer in KB from control/set 'sendspin_buffer_kb:<n>'
+            // (0 = the library default 256 KB = 1.5 s PCM). Applies at the next Sendspin start (restart_service).
+            playerBufferCapacity = context.getSharedPreferences("portal_ha", Context.MODE_PRIVATE)
+                .getInt("sendspin_buffer_kb", 0).let { kb -> if (kb in 64..4096) kb * 1024 else 256 * 1024 },
             supportedOptionalRoles = if (artwork)
                 setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER)
             else setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.CONTROLLER),

@@ -117,10 +117,27 @@ class DashboardActivity : AppCompatActivity() {
         @Volatile private var coveredByService = false
         @Volatile private var coveredWhy = ""
         fun setCovered(covered: Boolean, why: String) {
+            val was = coveredByService
             if (covered != coveredByService) { coveredByService = covered; coveredWhy = why }
             val act = instance ?: return
-            act.runOnUiThread { act.applyWebPause() }
+            act.runOnUiThread {
+                act.applyWebPause()
+                // fleet (2026-11-22, review b5-06): photos came up while the wall was left on another page (no navigate
+                // running) -> back to its own page under the photos (soft navigate, no reload when it is HA).
+                if (covered && !was && why.contains("photo") && navUrl == null) act.homeIfAway("photos up")
+            }
         }
+
+        /** fleet (2026-11-22, review b5-05): control/set 'reload' - one full load of the page the kiosk should be on. */
+        fun reloadOnce(): Boolean {
+            val act = instance ?: return false
+            act.runOnUiThread { act.loadDashboard() }
+            return true
+        }
+
+        /** fleet (2026-11-22, review b5-03 / b4-10, REPORT ONLY): the last page probe (HA loaded / connected / path). */
+        @Volatile var lastPageProbe = "none yet"
+            private set
         fun webPauseStatus(): String = "webview: paused=${instance?.webPaused ?: false} covered=$coveredByService ('$coveredWhy') " +
             "stopped=${instance?.stoppedNow ?: false} loading=${instance?.loadingActive ?: false} modern_ua=${instance?.modernUa ?: false}"
 
@@ -226,6 +243,7 @@ class DashboardActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_DEFAULT
         }
         applyUserAgent()   // speed B2 pilot (toggle modern_frontend, default off)
+        retryHandler.removeCallbacks(pageProbe); retryHandler.postDelayed(pageProbe, 60_000L)
 
         // Speak HA's frontend "external app" protocol so the dashboard treats us as a native
         // wrapper (native settings entry + working voice button + no-logout auth). CAUTION: once
@@ -769,6 +787,32 @@ class DashboardActivity : AppCompatActivity() {
     private var loadRetryN = 0
     private var mainFrameErrored = false
     private val retryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    // fleet (2026-11-22, review b5-06): the page is not the kiosk's home (a link / Back / an old navigate left it elsewhere).
+    private fun homeIfAway(why: String) {
+        if (!::webView.isInitialized) return
+        val home = homeUrl(); if (home.isEmpty()) return
+        val cur = (webView.url ?: "").substringBefore('?').substringBefore('#').trimEnd('/')
+        if (cur.isEmpty() || cur == home.substringBefore('?').trimEnd('/')) return
+        android.util.Log.i("PortalHA", "dashboard: $why - page was $cur, back to the home page")
+        showTarget()
+    }
+
+    // fleet (2026-11-22, review b5-03 / b4-10): REPORT ONLY, every 5 min - what the page really is (no action taken).
+    private val pageProbe = object : Runnable {
+        override fun run() {
+            if (::webView.isInitialized && !isFinishing) runCatching {
+                webView.evaluateJavascript("(function(){try{var h=document.querySelector('home-assistant');" +
+                    "var c=h&&h.hass&&h.hass.connection;return JSON.stringify({ha:!!h,hass:!!(h&&h.hass)," +
+                    "connected:!!(c&&c.connected),path:location.pathname,ver:(h&&h.hass&&h.hass.config&&h.hass.config.version)||''});}" +
+                    "catch(e){return 'error '+e;}})()") { r ->
+                    lastPageProbe = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " +
+                        (r ?: "null").replace("\\\"", "'").take(200)
+                }
+            }
+            retryHandler.postDelayed(this, 5 * 60_000L)
+        }
+    }
+
     private fun retryJitterMs(): Long {
         val id = runCatching { android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) }
             .getOrNull() ?: packageName
@@ -823,6 +867,7 @@ class DashboardActivity : AppCompatActivity() {
     override fun onDestroy() {
         retryHandler.removeCallbacks(loadRetry)
         retryHandler.removeCallbacks(jitterRetry)
+        retryHandler.removeCallbacks(pageProbe)
         runCatching { unregisterReceiver(clearCacheReceiver) }
         if (instance === this) instance = null
         // fleet (2026-11-15, toggle webview_destroy, default off): a destroyed dashboard (renderer-gone recreate(), kiosk

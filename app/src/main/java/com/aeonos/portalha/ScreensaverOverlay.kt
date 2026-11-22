@@ -53,6 +53,12 @@ class ScreensaverOverlay(private val context: Context) {
 
     @Volatile private var root: FrameLayout? = null
     private var web: WebView? = null
+    @Volatile private var pageBadThisLoad = false
+    private fun markBad(view: WebView) {
+        pageBadThisLoad = true
+        if (!pageBad) { pageBad = true; main.post { if (visible) { root?.alpha = 0f } } }
+        main.removeCallbacks(badRetry); main.postDelayed(badRetry, 30_000L)
+    }
     private var onExit: (() -> Unit)? = null
     @Volatile private var visible = false
     // The window's params, kept so a concealed (prestaged) frame can be made untouchable.
@@ -107,8 +113,28 @@ class ScreensaverOverlay(private val context: Context) {
      * it boots.
      */
     fun show(url: String, exit: () -> Unit) {
-        if (isStaged) { setVisible(true); return }
+        if (isStaged) {
+            // fleet (2026-11-22, review b5-02 / s4-11): a staged page whose load failed is never revealed (it would be a
+            // browser error page); reload it and reveal when it loaded - the dashboard stays meanwhile.
+            if (pageBad) { pendingReveal = true; retryBadPage("show"); return }
+            setVisible(true); return
+        }
         create(url, exit, showNow = true)
+    }
+
+    @Volatile private var pageBad = false
+    @Volatile private var pendingReveal = false
+    private var badRetries = 0
+    private val badRetry = Runnable { retryBadPage("timer") }
+    private fun retryBadPage(why: String) {
+        main.post {
+            val w = web ?: return@post
+            main.removeCallbacks(badRetry)
+            android.util.Log.i(TAG, "screensaver: reloading the photo page after a failed load ($why, retry ${badRetries + 1})")
+            runCatching { w.onResume(); w.reload() }
+            badRetries++
+            main.postDelayed(badRetry, (30_000L shl (badRetries - 1).coerceIn(0, 4)).coerceAtMost(5 * 60_000L))
+        }
     }
 
     /**
@@ -136,6 +162,8 @@ class ScreensaverOverlay(private val context: Context) {
             // No fade when concealing: that only happens behind a dark screen, where an
             // animation would just be work nobody can see.
             if (want) v.animate().alpha(1f).setDuration(FADE_MS).start() else v.alpha = 0f
+            // fleet (2026-11-22, review b5-01): no drawing / compositing for a concealed photo page (JS keeps running).
+            runCatching { if (want) web?.onResume() else web?.onPause() }
             android.util.Log.i(TAG, "screensaver: ${if (want) "revealed (prestaged)" else "concealed"}")
             applyBrightness()
         }
@@ -190,7 +218,26 @@ class ScreensaverOverlay(private val context: Context) {
                 // onRenderProcessGone makes Android KILL THE WHOLE APP: camera, MQTT and the dashboard
                 // were gone and only the launcher was left. Drop the overlay instead; it is rebuilt on
                 // the next show.
+                pageBad = false; pendingReveal = false; badRetries = 0
                 wv.webViewClient = object : WebViewClient() {
+                    override fun onReceivedError(view: WebView, req: android.webkit.WebResourceRequest, err: android.webkit.WebResourceError) {
+                        if (!req.isForMainFrame) return
+                        android.util.Log.w(TAG, "screensaver: photo page failed to load (${err.errorCode} ${err.description}) - kept hidden, retrying")
+                        markBad(view)
+                    }
+                    override fun onReceivedHttpError(view: WebView, req: android.webkit.WebResourceRequest, resp: android.webkit.WebResourceResponse) {
+                        if (!req.isForMainFrame) return
+                        android.util.Log.w(TAG, "screensaver: photo page HTTP ${resp.statusCode} - kept hidden, retrying")
+                        markBad(view)
+                    }
+                    override fun onPageFinished(view: WebView, url: String) {
+                        if (pageBadThisLoad) { pageBadThisLoad = false; return }
+                        if (pageBad) {
+                            pageBad = false; badRetries = 0; main.removeCallbacks(badRetry)
+                            android.util.Log.i(TAG, "screensaver: photo page loaded again")
+                            if (pendingReveal) { pendingReveal = false; setVisible(true) }
+                        }
+                    }
                     override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                         android.util.Log.w(TAG, "screensaver: WebView renderer gone (crash=${detail.didCrash()}) - overlay dropped, app kept alive")
                         main.post { dropAfterRendererGone(view) }
