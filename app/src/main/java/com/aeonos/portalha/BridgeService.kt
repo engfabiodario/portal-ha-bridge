@@ -1207,7 +1207,9 @@ class BridgeService : Service() {
     private val isCipher = android.os.Build.DEVICE.equals("cipher", true)
     // Fleet 2026-11-16: the Echo Show 8 (crown) camera is fixed too - the accelerometer path set its stream to 90 deg on
     // some starts and 0 on others (11-16: both Shows sideways after a reinstall). Fixed = streamRotation only (Shows: 90).
-    private val isFixedCamera = isCipher || android.os.Build.DEVICE.equals("crown", true)
+    // Fleet 2026-11-21: the Portal TV (ripley) too - it stands still on the TV; the accelerometer committed auto=90 on top
+    // of its streamRotation 90 after the 21:39 install (stream 180 = picture sideways, Frigate ffmpeg reconnect loop).
+    private val isFixedCamera = isCipher || android.os.Build.DEVICE.equals("crown", true) || android.os.Build.DEVICE.equals("ripley", true)
     private val orientationApply = Runnable { commitDeviceOrientation() }
     // Fleet (aloha): stream rotation = streamRotation (landscape base) + the DISPLAY rotation.
     // The Portal+ camera sits in the pivoting screen, so a portrait screen (display rotation 1)
