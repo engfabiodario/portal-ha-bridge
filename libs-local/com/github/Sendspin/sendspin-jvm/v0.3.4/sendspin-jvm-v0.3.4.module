@@ -1,0 +1,107 @@
+{
+  "formatVersion" : "1.1",
+  "component" : {
+    "group" : "com.github.Sendspin",
+    "module" : "sendspin-jvm",
+    "version" : "v0.3.4",
+    "attributes" : {
+      "org.gradle.status" : "release"
+    }
+  },
+  "createdBy" : {
+    "gradle" : {
+      "version" : "9.4.1"
+    }
+  },
+  "variants" : [ {
+    "name" : "apiElements",
+    "attributes" : {
+      "org.gradle.category" : "library",
+      "org.gradle.dependency.bundling" : "external",
+      "org.gradle.jvm.environment" : "standard-jvm",
+      "org.gradle.jvm.version" : "17",
+      "org.gradle.libraryelements" : "jar",
+      "org.gradle.usage" : "java-api",
+      "org.jetbrains.kotlin.platform.type" : "jvm"
+    },
+    "dependencies" : [ {
+      "group" : "org.java-websocket",
+      "module" : "Java-WebSocket",
+      "version" : {
+        "requires" : "1.5.7"
+      }
+    }, {
+      "group" : "org.jetbrains.kotlin",
+      "module" : "kotlin-stdlib",
+      "version" : {
+        "requires" : "2.0.0"
+      }
+    } ],
+    "files" : [ {
+      "name" : "sendspin-jvm-v0.3.4.jar",
+      "url" : "sendspin-jvm-v0.3.4.jar",
+      "size" : 361385,
+      "sha512" : "d9c13311533ad5014be0190860ee1331fa1040d109eb3cf274ec806e8d56be81dadbf346f727c8e3886ab7b787698dcef6e2631627d0733d7d74d9e644287a27",
+      "sha256" : "587fe4036efd5c1f1ea4128ce63b582ca8c4569f75ea679ee86e63e2737b40de",
+      "sha1" : "c367812db884f25f4566bbc90b2e05003b510f9d",
+      "md5" : "5501806de73b849369a78a6a0ce47582"
+    } ]
+  }, {
+    "name" : "runtimeElements",
+    "attributes" : {
+      "org.gradle.category" : "library",
+      "org.gradle.dependency.bundling" : "external",
+      "org.gradle.jvm.environment" : "standard-jvm",
+      "org.gradle.jvm.version" : "17",
+      "org.gradle.libraryelements" : "jar",
+      "org.gradle.usage" : "java-runtime",
+      "org.jetbrains.kotlin.platform.type" : "jvm"
+    },
+    "dependencies" : [ {
+      "group" : "com.squareup.okhttp3",
+      "module" : "okhttp",
+      "version" : {
+        "requires" : "4.12.0"
+      }
+    }, {
+      "group" : "com.squareup.moshi",
+      "module" : "moshi-kotlin",
+      "version" : {
+        "requires" : "1.15.1"
+      }
+    }, {
+      "group" : "org.jetbrains.kotlinx",
+      "module" : "kotlinx-coroutines-core",
+      "version" : {
+        "requires" : "1.8.1"
+      }
+    }, {
+      "group" : "org.json",
+      "module" : "json",
+      "version" : {
+        "requires" : "20240303"
+      }
+    }, {
+      "group" : "org.java-websocket",
+      "module" : "Java-WebSocket",
+      "version" : {
+        "requires" : "1.5.7"
+      }
+    }, {
+      "group" : "org.jetbrains.kotlin",
+      "module" : "kotlin-stdlib",
+      "version" : {
+        "requires" : "2.0.0"
+      }
+    } ],
+    "files" : [ {
+      "name" : "sendspin-jvm-v0.3.4.jar",
+      "url" : "sendspin-jvm-v0.3.4.jar",
+      "size" : 361385,
+      "sha512" : "d9c13311533ad5014be0190860ee1331fa1040d109eb3cf274ec806e8d56be81dadbf346f727c8e3886ab7b787698dcef6e2631627d0733d7d74d9e644287a27",
+      "sha256" : "587fe4036efd5c1f1ea4128ce63b582ca8c4569f75ea679ee86e63e2737b40de",
+      "sha1" : "c367812db884f25f4566bbc90b2e05003b510f9d",
+      "md5" : "5501806de73b849369a78a6a0ce47582"
+    } ]
+  } ]
+}

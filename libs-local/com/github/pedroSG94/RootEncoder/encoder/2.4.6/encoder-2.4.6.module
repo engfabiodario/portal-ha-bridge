@@ -1,0 +1,89 @@
+{
+  "formatVersion" : "1.1",
+  "createdBy" : {
+    "gradle" : {
+      "version" : "8.7"
+    }
+  },
+  "component" : {
+    "group" : "com.github.pedroSG94",
+    "module" : "RootEncoder",
+    "version" : "2.4.6",
+    "attributes" : {
+      "org.gradle.status" : "release"
+    }
+  },
+  "variants" : [ {
+    "name" : "releaseVariantReleaseApiPublication",
+    "attributes" : {
+      "org.gradle.category" : "library",
+      "org.gradle.dependency.bundling" : "external",
+      "org.gradle.libraryelements" : "aar",
+      "org.gradle.usage" : "java-api"
+    },
+    "dependencies" : [ {
+      "group" : "androidx.annotation",
+      "module" : "annotation",
+      "version" : {
+        "requires" : "1.8.0"
+      }
+    }, {
+      "group" : "com.github.pedroSG94.RootEncoder",
+      "module" : "common",
+      "version" : {
+        "requires" : "2.4.6"
+      }
+    }, {
+      "group" : "org.jetbrains.kotlin",
+      "module" : "kotlin-stdlib",
+      "version" : {
+        "requires" : "2.0.0"
+      }
+    } ],
+    "files" : [ {
+      "name" : "encoder-2.4.6.aar",
+      "url" : "encoder-2.4.6.aar",
+      "size" : 276360,
+      "sha512" : "bfb9aa7f08b14f6310488b4d0cdeb0b05919ddf09cdb72f49819f81144ce1cfd8457a299cd7f488d887d182e9b0b7d6e67d05b0437f0af6404fb76ee5f02b8b8",
+      "sha256" : "3c2685a1c822f3e7429d0142cce2d929a4caee7e370a17d3ab995daf95a1680d",
+      "sha1" : "b8438a16a406170c166ca25eda575971a1b5d9da",
+      "md5" : "849998677e436afe7d553c024dd2a08e"
+    } ]
+  }, {
+    "name" : "releaseVariantReleaseRuntimePublication",
+    "attributes" : {
+      "org.gradle.category" : "library",
+      "org.gradle.dependency.bundling" : "external",
+      "org.gradle.libraryelements" : "aar",
+      "org.gradle.usage" : "java-runtime"
+    },
+    "dependencies" : [ {
+      "group" : "androidx.annotation",
+      "module" : "annotation",
+      "version" : {
+        "requires" : "1.8.0"
+      }
+    }, {
+      "group" : "com.github.pedroSG94.RootEncoder",
+      "module" : "common",
+      "version" : {
+        "requires" : "2.4.6"
+      }
+    }, {
+      "group" : "org.jetbrains.kotlin",
+      "module" : "kotlin-stdlib",
+      "version" : {
+        "requires" : "2.0.0"
+      }
+    } ],
+    "files" : [ {
+      "name" : "encoder-2.4.6.aar",
+      "url" : "encoder-2.4.6.aar",
+      "size" : 276360,
+      "sha512" : "bfb9aa7f08b14f6310488b4d0cdeb0b05919ddf09cdb72f49819f81144ce1cfd8457a299cd7f488d887d182e9b0b7d6e67d05b0437f0af6404fb76ee5f02b8b8",
+      "sha256" : "3c2685a1c822f3e7429d0142cce2d929a4caee7e370a17d3ab995daf95a1680d",
+      "sha1" : "b8438a16a406170c166ca25eda575971a1b5d9da",
+      "md5" : "849998677e436afe7d553c024dd2a08e"
+    } ]
+  } ]
+}

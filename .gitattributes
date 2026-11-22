@@ -1,2 +1,4 @@
 # Shell scripts must stay LF — macOS/Linux bash chokes on CRLF
 *.sh text eol=lf
+libs-local/** -text
+gradle/verification-metadata.xml -text
