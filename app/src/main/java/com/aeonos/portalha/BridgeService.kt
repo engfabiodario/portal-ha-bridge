@@ -1078,6 +1078,20 @@ class BridgeService : Service() {
         }
     }
 
+    // fleet (2026-11-22, Main / speed agent): portal/<id>/photos/hold, payload = seconds (1..300) or 0/off. While it runs the
+    // photo screensaver does not start (idle timer, wake-to-photos); HA refreshes it every 30 s while the wall's camera
+    // counts a person / dog, so it ends by itself ~90 s after the last refresh. Not retained. Already-shown photos stay.
+    @Volatile private var photoHoldUntilMs = 0L
+    private fun photoHoldTopic(deviceId: String) = "portal/$deviceId/photos/hold"
+    private fun handlePhotoHold(payload: String) {
+        val v = payload.trim().lowercase()
+        val s = if (v == "off") 0 else v.toIntOrNull()?.coerceIn(0, 300) ?: return
+        val before = photoHoldUntilMs
+        photoHoldUntilMs = if (s == 0) 0L else System.currentTimeMillis() + s * 1000L
+        if ((before > System.currentTimeMillis()) != (photoHoldUntilMs > System.currentTimeMillis()))
+            Log.i(TAG, "screensaver: photo hold ${if (s == 0) "ended" else "for $s s (someone in view)"}")
+    }
+
     private fun cameraEncoderTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/set"
     private fun cameraEncoderStatusTopic(deviceId: String) = "portal/$deviceId/config/camera_encoder/status"
     private fun encFps(p: Prefs) = p.streamFps.coerceIn(5, 30)
@@ -1766,7 +1780,7 @@ class BridgeService : Service() {
                         // camera pop-up, a navigate), and the wake that request caused must not
                         // put the photos straight back over it. A prestaged frame then stays
                         // concealed (and untouchable) until the slideshow timer brings it up.
-                        val held = System.currentTimeMillis() < screensaverHoldUntilMs
+                        val held = System.currentTimeMillis() < maxOf(screensaverHoldUntilMs, photoHoldUntilMs)
                         prefs?.let { pp ->
                             if (pp.screensaverEnabled && pp.screensaverOnWake &&
                                 pp.screensaverUrl.isNotBlank() && !userLeftDashboard) {
@@ -3023,6 +3037,7 @@ class BridgeService : Service() {
             cameraViewTopic(p.deviceId),
             cameraEncoderTopic(p.deviceId),
             rtspAuthTopic(p.deviceId),
+            photoHoldTopic(p.deviceId),
             displayDensityTopic(p.deviceId),
             HaDiscovery.desktopCommandTopic(p.deviceId),
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId),
@@ -3469,6 +3484,7 @@ class BridgeService : Service() {
             cameraViewTopic(p.deviceId)                           -> handleCameraViewCommand(payload, p)
             cameraEncoderTopic(p.deviceId)                        -> handleCameraEncoderCommand(payload, p)
             rtspAuthTopic(p.deviceId)                             -> handleRtspAuthCommand(payload, p)
+            photoHoldTopic(p.deviceId)                            -> handlePhotoHold(payload)
             displayDensityTopic(p.deviceId)                       -> handleDisplayDensityCommand(payload, p)
             HaDiscovery.desktopCommandTopic(p.deviceId)           -> handleDesktopCommand(payload)
             HaDiscovery.desktopMinutesCommandTopic(p.deviceId)    -> handleDesktopMinutesCommand(payload, p)
@@ -3713,7 +3729,7 @@ class BridgeService : Service() {
     private fun publishCapabilities(p: Prefs) {
         val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"reload\",\"sendspin_buffer_kb\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
-            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\"]," +
+            "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\",\"photo_hold\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
         publishRaw(capabilitiesTopic(p.deviceId), json, 1, retained = true)
     }
@@ -6026,6 +6042,8 @@ class BridgeService : Service() {
         if (screensaver.isShowing) return
         // Held off by a recent dismiss — someone is looking at the dashboard on purpose.
         if (System.currentTimeMillis() < screensaverHoldUntilMs) return
+        // fleet (2026-11-22): HA's person/dog hold (portal/<id>/photos/hold) - someone is in view, no photos.
+        if (System.currentTimeMillis() < photoHoldUntilMs) return
         // With presence off there's no better signal, so the idle timer alone drives it.
         if (p.screensaverPresenceOnly && p.presenceEnabled && lastPublishedPresence != true) return
         if (System.currentTimeMillis() - lastInteractionMs < p.screensaverIdleSecs * 1000L) return
