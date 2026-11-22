@@ -48,6 +48,20 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
         private set
     @Volatile var startedElapsed = 0L
         private set
+    // fleet (2026-11-21, review b3-07 step 1, report only): the encoder's own fps number from RootEncoder's FpsListener
+    // (about once a second; -1 = none since the last start) - published in the control status / bridge memory attrs.
+    @Volatile var encoderFps = -1
+        private set
+    // fleet (2026-11-21, review b3-02): why the last start() failed (step + exception text), kept until a start works.
+    // A Portal 10" logcat rolls over within a minute, so this is the only lasting record. "" = the last start worked.
+    @Volatile var lastStartFailure = ""
+        private set
+    @Volatile var startFailures = 0
+        private set
+    private fun noteStartFailure(what: String) {
+        startFailures++
+        lastStartFailure = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " + what.take(160)
+    }
 
     // Both Portal+ models ("aloha" 1st-gen, "cipher" 2nd-gen) have a front camera
     // whose usable cam (Camera 0) reports only 1280x720 + 4:3 sizes but whose true
@@ -134,7 +148,8 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
             stream = s
             lastFrameElapsed = 0L
             startedElapsed = android.os.SystemClock.elapsedRealtime()
-            s.setFpsListener { lastFrameElapsed = android.os.SystemClock.elapsedRealtime() }
+            encoderFps = -1
+            s.setFpsListener { f -> encoderFps = f; lastFrameElapsed = android.os.SystemClock.elapsedRealtime() }
             // Pass the LANDSCAPE capture dims + rotation; prepareVideo swaps the
             // ENCODER size itself for 90/270 (don't pre-swap — that double-swaps).
             // NOTE: portrait still letterboxes because the Portal front cam can only
@@ -222,14 +237,26 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
                         .onFailure { Log.w(TAG, "camera $cameraId: open failed (${it.message}); staying on Camera 0") }
                 }
                 Log.i(TAG, "RTSP streaming on ${url()} ${encW}x${encH} ${encoderLine()} mode=$EFFECTIVE_MODE rot=$rot squash=$squashedFrontCam camera=${if (fullSensor) cameraId else "0"} (audio=$withAudio)")
+                lastStartFailure = ""
                 true
             } else {
                 Log.w(TAG, "RTSP prepare failed (video=$videoOk audio=$audioOk)")
+                noteStartFailure("prepare failed (video=$videoOk audio=$audioOk)")
                 runCatching { s.stopStream() }
+                // fleet (2026-11-21, review b3-03): release() frees the encoders stopStream() re-prepares and the
+                // camera source; dropping the object left them for the garbage collector.
+                runCatching { s.release() }.onFailure { Log.w(TAG, "RTSP release after a failed prepare: ${it.message}") }
                 stream = null
                 false
             }
-        }.getOrElse { Log.w(TAG, "RTSP start error: ${it.message}", it); stream = null; false }
+        }.getOrElse {
+            Log.w(TAG, "RTSP start error: ${it.message}", it)
+            noteStartFailure("start error ${it.javaClass.simpleName}: ${it.message}")
+            val s = stream
+            stream = null
+            if (s != null) runCatching { s.stopStream() }.also { runCatching { s.release() } }
+            false
+        }
     }
 
     // Apply a new rotation by tearing the stream down and starting fresh with the
@@ -267,7 +294,12 @@ class RtspStreamer(private val context: Context, private val port: Int = 8554) :
     fun stop() {
         isStreaming = false
         micTap = null
-        runCatching { stream?.stopStream() }
+        val s = stream
+        runCatching { s?.stopStream() }
+        // fleet (2026-11-21, review b3-03): stopStream() ends by preparing the encoders AGAIN (RootEncoder 2.4.6);
+        // release() stops the sources and frees those codecs + the camera surface. Without it every restart left a
+        // configured OMX encoder + AAC encoder waiting for the garbage collector.
+        if (s != null) runCatching { s.release() }.onFailure { Log.w(TAG, "RTSP release: ${it.message}") }
         stream = null
         Log.i(TAG, "RTSP streaming stopped")
     }

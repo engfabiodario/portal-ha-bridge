@@ -257,7 +257,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     // dashboard in front = exact zeros in Ava's own audio buffer, Ava visible = real audio), and it
     // has freeform windows. It resumes one app only, so the parked window pauses the dashboard while
     // it stays visible: DashboardActivity treats "visible" as in front there (see its onPause).
-    val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+    // fleet (2026-11-21, review b4-13): Android 9 and 10 only - Meta's audio policy (Portal+, Portal 10", Portal TV) is the
+    // only reason the keep-alive exists. The Echo Shows (Android 11) get no switch and never write the freeform globals.
+    val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q
 
     /** Seconds left of a timed pause (0 = not paused). */
     private fun pauseLeftSec(): Long {
@@ -298,6 +300,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         main.post { ensureCoverWindows() }
         main.postDelayed(tick, START_DELAY_MS)
         main.postDelayed(coverTick, START_DELAY_MS)
+        registerPackageWatch()
         schedulePauseEnd()
         Log.i(TAG, "keepalive: service up (enabled=$enabled, switch=${if (on) "on" else "off"}, " +
             "paused=${pauseLeftSec()}s, package=$pkg)")
@@ -307,6 +310,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         started = false
         main.removeCallbacks(tick); main.removeCallbacks(coverTick); main.removeCallbacks(attemptRunnable)
         main.removeCallbacks(pauseEnd); main.removeCallbacksAndMessages(burstToken)
+        main.removeCallbacks(hostRetry); main.removeCallbacks(postParkCheck)
+        unregisterPackageWatch()
         stopLogReader()
         main.post {
             removeCoverWindows()
@@ -464,6 +469,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
 
     private fun attempt(reason: String, forced: Boolean = false) {
         if (!supported || !enabled || !started) return
+        if (avaReplacing) { skip("assistant $pkg is being updated - parking after the install"); return }
         if (!resolve()) { skip("assistant $pkg not installed"); return }
         ensureLogReader()
         if (freeformOk == false) { skip("freeform windowing is not active on this boot (reboot once after enabling it)"); return }
@@ -527,6 +533,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             .onFailure { Log.w(TAG, "keepalive: park failed: ${it.message}") }.isSuccess
         if (!ok) return
         parkedThisRun = true
+        // fleet (2026-11-21, review b4-01): bringing back a task whose top is still OUR activity (the assistant above it
+        // died: an update, a crash) does not resume it again - nothing would start the assistant. Look 2 s later.
+        if (!fresh) { main.removeCallbacks(postParkCheck); main.postDelayed(postParkCheck, 2_000L) }
         val now = SystemClock.elapsedRealtime()
         lastParkMs = now; parkTimes.addLast(now); parkCount++
         Log.i(TAG, "keepalive: park #$parkCount ($reason${if (fresh) ", fresh task" else ""}) fg=$avaFg state=$avaAppState " +
@@ -536,6 +545,7 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
 
     /** Our activity is on top of our task: check freeform, then put the assistant above it. */
     private fun hostResumed(act: Activity) {
+        hostRef = java.lang.ref.WeakReference(act)
         val freeform = act.isInMultiWindowMode
         if (freeformOk != freeform) {
             val loc = IntArray(2); runCatching { act.window.decorView.getLocationOnScreen(loc) }
@@ -552,7 +562,9 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
         val last = innerStarts.lastOrNull() ?: 0L
         if (innerStarts.size >= INNER_MAX_PER_10MIN || (last != 0L && now - last < INNER_MIN_GAP_MS)) {
             skip("the assistant keeps leaving our window (${innerStarts.size} starts in 10 min) - waiting")
-            main.postDelayed({ request("assistant restart retry", 0L, force = true) }, 60_000L)
+            // fleet (2026-11-21, review b4-01): retry from our own activity (a re-park only re-fronts this task, whose
+            // top is already us - onResume never runs again and the assistant stayed out until the switch went off/on).
+            main.removeCallbacks(hostRetry); main.postDelayed(hostRetry, 60_000L)
             return
         }
         innerStarts.addLast(now); innerCount++
@@ -561,7 +573,86 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
             act.startActivity(Intent().setComponent(cmp).addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION))
             @Suppress("DEPRECATION") act.overridePendingTransition(0, 0)
             Log.i(TAG, "keepalive: started ${cmp.flattenToShortString()} in the parked window (#$innerCount)")
-        }.onFailure { Log.w(TAG, "keepalive: could not start ${cmp.flattenToShortString()}: ${it.message}") }
+        }.onFailure {
+            Log.w(TAG, "keepalive: could not start ${cmp.flattenToShortString()}: ${it.message} - retrying in 30 s")
+            main.removeCallbacks(hostRetry); main.postDelayed(hostRetry, 30_000L)
+        }
+    }
+
+    // -- Assistant back in our window (fleet 2026-11-21, review b4-01) --
+    @Volatile private var hostRef: java.lang.ref.WeakReference<Activity>? = null
+    @Volatile private var avaReplacing = false
+    private var pkgReceiver: android.content.BroadcastReceiver? = null
+
+    /** Our host activity when it is alive and on top of our task with no assistant above it, else null. */
+    private fun hostOnTopAlone(): Activity? {
+        val a = hostRef?.get() ?: return null
+        if (a.isFinishing || a.isDestroyed) return null
+        val top = runCatching {
+            ctx.getSystemService(ActivityManager::class.java).appTasks.firstNotNullOfOrNull { t ->
+                val info = runCatching { t.taskInfo }.getOrNull()
+                if (info == null || info.baseIntent.component?.className != AvaKeepAliveActivity::class.java.name) null
+                else (info.topActivity?.className ?: "")
+            }
+        }.getOrNull() ?: return null
+        return if (top == AvaKeepAliveActivity::class.java.name) a else null
+    }
+
+    /** The assistant is not above our activity: start it from there (same rate gates), else a normal forced park. */
+    private val hostRetry = Runnable {
+        if (supported && enabled && started) {
+            val a = hostOnTopAlone()
+            if (a != null) { Log.i(TAG, "keepalive: assistant missing above our parked activity - starting it again"); hostResumed(a) }
+            else request("assistant restart retry", 0L, force = true)
+        }
+    }
+
+    private val postParkCheck = Runnable {
+        if (supported && enabled && started && !avaReplacing) {
+            val a = hostOnTopAlone()
+            if (a != null) {
+                Log.i(TAG, "keepalive: re-parked task has no assistant on top - starting it from our activity")
+                hostResumed(a)
+            }
+        }
+    }
+
+    private fun registerPackageWatch() {
+        if (pkgReceiver != null) return
+        val r = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                val p = i.data?.schemeSpecificPart ?: return
+                if (p != pkg) return
+                val replacing = i.getBooleanExtra(Intent.EXTRA_REPLACING, false)
+                when (i.action) {
+                    Intent.ACTION_PACKAGE_REMOVED -> {
+                        avaReplacing = replacing
+                        Log.i(TAG, "keepalive: $p ${if (replacing) "being replaced (update) - parking on hold" else "removed"}")
+                    }
+                    Intent.ACTION_PACKAGE_ADDED, Intent.ACTION_PACKAGE_REPLACED -> {
+                        if (i.action == Intent.ACTION_PACKAGE_ADDED && replacing) return   // REPLACED follows
+                        avaReplacing = false
+                        // Fresh uid / component (uninstall + install = new uid); the log reader restarts with it.
+                        component = null; avaUid = -1; avaFg = -1; avaAppState = -1
+                        stopLogReader()
+                        innerStarts.clear(); backoffMs = 0L; backoffUntil = 0L
+                        Log.i(TAG, "keepalive: $p installed/updated - parking it again")
+                        main.removeCallbacks(hostRetry); main.postDelayed(hostRetry, 3_000L)
+                    }
+                }
+            }
+        }
+        val f = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REPLACED); addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+        }
+        runCatching { ctx.registerReceiver(r, f); pkgReceiver = r }
+            .onFailure { Log.w(TAG, "keepalive: package watch not registered: ${it.message}") }
+    }
+
+    private fun unregisterPackageWatch() {
+        pkgReceiver?.let { r -> runCatching { ctx.unregisterReceiver(r) } }
+        pkgReceiver = null
     }
 
     // ── SelfHeal ─────────────────────────────────────────────────────────────────
@@ -582,6 +673,8 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
                 runCatching { t.taskInfo.baseIntent.component?.className }.getOrNull() == AvaKeepAliveActivity::class.java.name
             }
         }.getOrDefault(true)
+        // fleet (2026-11-21, review b4-01): our task with only OUR activity in it is not 'parked' (the assistant is gone).
+        if (task && hostOnTopAlone() != null) return false
         return task && avaFg != 0 && avaAppState != 0
     }
 
@@ -681,8 +774,12 @@ class AvaKeepAlive(private val ctx: Context, private val host: Host) {
     }
 
     private fun safetyCheck() {
-        if (!enabled || !resolve()) return
+        if (!enabled || avaReplacing || !resolve()) return
         ensureLogReader()
+        // fleet (2026-11-21, review b4-01): the assistant visible and hearing for a minute = its start count starts over.
+        val lastInner = innerStarts.lastOrNull()
+        if (lastInner != null && avaFg == 1 && avaAppState != 0 && SystemClock.elapsedRealtime() - lastInner > 60_000L) innerStarts.clear()
+        if (hostOnTopAlone() != null) { main.removeCallbacks(hostRetry); main.post(hostRetry); return }
         val why = when {
             lastParkMs == 0L -> "start"
             avaAppState == 0 -> "silenced (check)"

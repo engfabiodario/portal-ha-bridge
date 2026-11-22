@@ -501,7 +501,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         Log.i(TAG, "${c.id}: $line")
     }
 
-    private fun maxPerHour(c: Check) = if (c == Check.STREAM) STREAM_MAX_PER_HOUR else MAX_PER_HOUR
+    // fleet (2026-11-21, review b4-02): Wi-Fi 12 an hour (was the shared 6: spent after 24 min of an outage, then ~37 min
+    // with no attempt at all - 11-15 traces). Its own 1/2/4/8-min backoff keeps it to one attempt per 8 min.
+    private fun maxPerHour(c: Check) = when (c) { Check.STREAM -> STREAM_MAX_PER_HOUR; Check.WIFI -> WIFI_MAX_PER_HOUR; else -> MAX_PER_HOUR }
 
     private fun act(c: Check, s: CheckState, reason: String, busy: String? = null) {
         val now = SystemClock.elapsedRealtime()
@@ -713,6 +715,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** Stream restarts: 1, 2, 4, 8, 8 ... min apart (audit bridge-code.1: the hourly cap of 6 left a cause that cleared
          *  mid-hour unretried for up to 51 min). */
         private const val STREAM_MAX_PER_HOUR = 10
+        private const val WIFI_MAX_PER_HOUR = 12
         /** Host.streamFrameAgeMs(): a (re)start is still coming up (not judged; see 'wait'). */
         const val STREAM_JUST_STARTED = -1L
         private const val HOUR_MS = 60 * 60_000L

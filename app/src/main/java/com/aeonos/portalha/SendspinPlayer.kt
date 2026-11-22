@@ -48,6 +48,14 @@ private fun JsonOptional<String>.merge(previous: String): String = when (this) {
  *
  * We take the client-initiated path: browse mDNS for a Sendspin server and connect to it.
  */
+private class PrefsSettingsStore(ctx: Context) : com.sendspin.protocol.ClientSettingsStore {
+    private val sp = ctx.getSharedPreferences("sendspin_settings", Context.MODE_PRIVATE)
+    override fun getInt(key: String, default: Int): Int = sp.getInt(key, default)
+    override fun putInt(key: String, value: Int) { sp.edit().putInt(key, value).apply() }
+    override fun getString(key: String, default: String?): String? = sp.getString(key, default)
+    override fun putString(key: String, value: String) { sp.edit().putString(key, value).apply() }
+}
+
 class SendspinPlayer(
     private val context: Context,
     private val deviceName: () -> String,
@@ -60,6 +68,8 @@ class SendspinPlayer(
     // no ARTWORK role in the hello, so Music Assistant sends no JPEG per track to this Portal.
     private val wantArtwork: () -> Boolean = { true },
 ) {
+    private val settingsStore: com.sendspin.protocol.ClientSettingsStore by lazy { PrefsSettingsStore(context) }
+
     private companion object { const val TAG = "PortalHA" }
 
     private var scope: CoroutineScope? = null
@@ -324,6 +334,9 @@ class SendspinPlayer(
             audioPlayerFactory = { buffer, clock ->
                 SendspinAudioPlayer(buffer, clock).also { ap -> audioPlayer = ap; ap.onActive = { on -> idle?.onStream(on) } }
             },
+            // fleet (2026-11-21, review b6-03): the library keeps the volume / mute Music Assistant set in this store and
+            // restores + reports it at the next start. Without one (NoOp) every Bridge restart / install said 100 %.
+            settingsStore = settingsStore,
         )
         client = c
         idle = IdleThrottle(c, s)

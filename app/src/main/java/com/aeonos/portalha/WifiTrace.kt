@@ -99,12 +99,68 @@ object WifiTrace {
     @Volatile private var running = false
     @Volatile private var process: Process? = null
     private var thread: Thread? = null
+    // fleet (2026-11-21, review b4-12): reader generation. restart_service = stop + start in the same process: the old
+    // reader woke from its 60 s sleep with running=true again and a SECOND reader wrote / rotated the same file.
+    @Volatile private var gen = 0
+
+    // fleet (2026-11-21, review b4-04): Meta's routine chatter (87 % of a 1 MB trace = 4 h on 11-19) is counted, not
+    // written: the 5 healthy DGW stream-group shapes, every CollectPingData line of a ping with 0 % loss, and repeated
+    // NUD_FAILED lines per neighbour. A ping with loss, any other DGW line and the first NUD_FAILED per neighbour per
+    // 10 min are written in full; a summary line every 10 min.
+    private val DGW_ROUTINE = Regex("DGW\\s*: .*(DGW is now connected|DGW for serviceId=\\S+ is now connected|processing request with connection state|" +
+        "Request is not queued for serviceId|notify StreamGroup error: TransientError|notify sgt \\(\\S+\\) error TransientError)")
+    private val PING_LOSS = Regex("CollectPingData: \\d+ packets transmitted, \\d+ received, (\\d+)% packet loss")
+    private val PING_RTT = Regex("CollectPingData: rtt min/avg/max/mdev = [0-9.]+/([0-9.]+)/")
+    private val NUD = Regex("NUD_FAILED.*?((?:\\d{1,3}\\.){3}\\d{1,3}|[0-9a-fA-F:]{6,})")
+    private const val ROUTINE_SUMMARY_MS = 10 * 60_000L
+    private var rtDgw = 0
+    private var rtPing = 0
+    private var rtPingRuns = 0
+    private var rtRttMax = 0.0
+    private var rtNud = 0
+    private var rtSinceMs = 0L
+    private val nudSeen = HashMap<String, Long>()
+
+    /** True = a routine line, counted instead of written. */
+    private fun routine(line: String, now: Long): Boolean {
+        if (rtSinceMs == 0L) rtSinceMs = now
+        if (line.contains("DGW")) {
+            if (DGW_ROUTINE.containsMatchIn(line)) { rtDgw++; return true }
+            return false
+        }
+        if (line.contains("CollectPingData")) {
+            PING_LOSS.find(line)?.let { m -> return if ((m.groupValues[1].toIntOrNull() ?: 0) == 0) { rtPing++; rtPingRuns++; true } else false }
+            PING_RTT.find(line)?.let { m -> m.groupValues[1].toDoubleOrNull()?.let { if (it > rtRttMax) rtRttMax = it } }
+            rtPing++
+            return true
+        }
+        if (line.contains("NUD_FAILED")) {
+            val key = NUD.find(line)?.groupValues?.get(1) ?: "?"
+            val last = nudSeen[key]
+            if (last != null && now - last < ROUTINE_SUMMARY_MS) { rtNud++; return true }
+            nudSeen[key] = now
+            return false
+        }
+        return false
+    }
+
+    /** The 10-minute summary line of the routine lines not written, or null. */
+    private fun routineSummary(now: Long): String? {
+        if (rtSinceMs == 0L || now - rtSinceMs < ROUTINE_SUMMARY_MS) return null
+        val s = if (rtDgw + rtPing + rtNud == 0) null
+            else "---- routine since ${java.util.Date(rtSinceMs)}: DGW $rtDgw line(s), CollectPingData $rtPing line(s) " +
+                "($rtPingRuns ping(s) at 0 % loss, worst avg rtt ${"%.1f".format(java.util.Locale.US, rtRttMax)} ms), NUD_FAILED repeats $rtNud - not written\n"
+        rtDgw = 0; rtPing = 0; rtPingRuns = 0; rtRttMax = 0.0; rtNud = 0; rtSinceMs = now
+        if (nudSeen.size > 64) nudSeen.clear()
+        return s
+    }
 
     fun start(ctx: Context) {
-        if (running) return
+        if (running && thread?.isAlive == true) return
         appCtx = ctx.applicationContext
         val base = ctx.getExternalFilesDir(null) ?: return
         val dir = File(base, "wifi").apply { mkdirs() }
+        val myGen = ++gen
         running = true
         // The first 30 min of this process (audit bridge-code.6).
         runCatching {
@@ -114,16 +170,17 @@ object WifiTrace {
             startUntil = now + START_SNAP_MS
             dir.listFiles { x -> x.name.startsWith("start-") }?.sortedBy { it.name }?.dropLast(SNAP_KEEP)?.forEach { it.delete() }
         }
-        thread = Thread({ loop(dir) }, "portal-ha-wifitrace").also { it.isDaemon = true; it.start() }
+        thread = Thread({ loop(dir, myGen) }, "portal-ha-wifitrace").also { it.isDaemon = true; it.start() }
     }
 
     fun stop() {
         running = false
+        gen++
         runCatching { process?.destroy() }
         process = null
     }
 
-    private fun loop(dir: File) {
+    private fun loop(dir: File, myGen: Int) {
         var first = true
         // The id from earlier traces (a Portal connected since boot logs no connect line until it drops).
         if (lastNetId < 0) runCatching {
@@ -132,7 +189,7 @@ object WifiTrace {
             }
             Log.i(TAG, "wifi trace: network id from earlier traces: $lastNetId")
         }
-        while (running) {
+        while (running && myGen == gen) {
             // fleet (2026-11-15): the process + file are closed in finally - an exception (write error, storage gone)
             // left the logcat child running (blocked on a full pipe) and the FileWriter open, one more of each per minute.
             var pRef: Process? = null
@@ -151,12 +208,14 @@ object WifiTrace {
                 var nextWindowCheck = System.currentTimeMillis() + 60_000L
                 var rewindow = false
                 p.inputStream.bufferedReader().use { r ->
-                    while (running) {
+                    while (running && myGen == gen) {
                         val line = r.readLine() ?: break
                         if (line.startsWith("--------- beginning of")) continue
                         AP.find(line)?.let { m -> lastApSuffix = m.groupValues[1].lowercase().takeLast(8) }
                         startSnapshot(line)
                         val tNow = System.currentTimeMillis()
+                        routineSummary(tNow)?.let { sum -> out.write(sum); size += sum.length }
+                        if (routine(line, tNow)) continue
                         if (line.contains("NetworkMonitor/")) {
                             if (NM_HEALTHY.containsMatchIn(line)) {
                                 if (nmSuppressed == 0) nmSuppressedSinceMs = tNow
@@ -198,8 +257,9 @@ object WifiTrace {
                 runCatching { outRef?.close() }
                 runCatching { pRef?.destroy() }
             }
-            if (running) runCatching { Thread.sleep(60_000L) }
+            if (running && myGen == gen) runCatching { Thread.sleep(60_000L) }
         }
+        if (myGen != gen) Log.i(TAG, "wifi trace: old reader (generation $myGen) ended")
     }
 
     private fun startSnapshot(line: String) {

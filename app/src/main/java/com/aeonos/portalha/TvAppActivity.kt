@@ -541,9 +541,23 @@ class TvAppActivity : Activity() {
             "dr:q?q.droppedVideoFrames:-1,tf:q?q.totalVideoFrames:-1,mu:v?(v.muted?1:0):-1,vol:v?Math.round(v.volume*100):-1," +
             "id:m?m[1]:''});})()"
 
+    // fleet (2026-11-21, review b5-11): polls sent with no answer yet. The next poll used to be posted only from inside
+    // the JS callback - a page that stopped answering stopped the idle-exit timer and could hold a wall for good.
+    private var pollsUnanswered = 0
     private val pollRunnable = object : Runnable {
         override fun run() {
+            if (isFinishing || isDestroyed) return
+            if (pollsUnanswered >= 3) {
+                Log.w(TAG, "youtube: page not answering ($pollsUnanswered polls) - back to the dashboard")
+                pollsUnanswered = 0
+                exitToDashboard("page not answering")
+                return
+            }
+            pollsUnanswered++
+            handler.removeCallbacks(this)
+            handler.postDelayed(this, POLL_MS)
             webView.evaluateJavascript(pollJs) { result ->
+                pollsUnanswered = 0
                 val now = System.currentTimeMillis()
                 val o = runCatching {
                     val s = org.json.JSONTokener(result ?: "").nextValue() as? String ?: return@runCatching null
@@ -572,9 +586,9 @@ class TvAppActivity : Activity() {
                     now - lastPlayingMs > STANDALONE_IDLE_EXIT_MS && now - lastTouchMs > STANDALONE_IDLE_EXIT_MS
                 else now - lastPlayingMs > CAST_IDLE_EXIT_MS
                 when {
-                    remoteGone -> exitToDashboard("phone disconnected")
-                    idle -> exitToDashboard("idle")
-                    else -> handler.postDelayed(this, POLL_MS)
+                    remoteGone -> { handler.removeCallbacks(this); exitToDashboard("phone disconnected") }
+                    idle -> { handler.removeCallbacks(this); exitToDashboard("idle") }
+                    else -> {}   // the next poll is already posted (above)
                 }
             }
         }

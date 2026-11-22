@@ -1266,6 +1266,15 @@ class BridgeService : Service() {
         // RTSP guard so the guard still swallows its library exception without it being recorded.
         CrashRecorder.install(this)
         CrashRecorder.onServiceStart(this)
+        // fleet (2026-11-21, review b2-05): a restart_process backup alarm still pending = Android's sticky restart was first.
+        runCatching {
+            PendingIntent.getForegroundService(this, RESTART_PROCESS_ALARM_RC,
+                Intent(this, BridgeService::class.java).setAction(ACTION_REVIVE),
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE)?.let { pi ->
+                getSystemService(AlarmManager::class.java)?.cancel(pi); pi.cancel()
+                Log.i(TAG, "restart: restart_process backup alarm cancelled (the service is back)")
+            }
+        }
         WifiTrace.start(this)   // fleet 2026-10-23: Wi-Fi stack log lines -> files/wifi/wifi-trace.txt (Fleet Agent readable)
         installRtspCrashGuard()
         createChannel()
@@ -1275,6 +1284,7 @@ class BridgeService : Service() {
         val p = Prefs(this).also { prefs = it }
         ScreenControl.enableAccessibility(this)
         sensorBridge = SensorBridge(this, ::publishRaw) { lastTouchElapsedMs }.also { it.start(p) }
+        sensorBridge?.knockBlocker = { when { desktopMode -> "desktop mode"; inCall || ringing -> "a call"; else -> null } }
         soundMonitor = SoundMonitor(this) { level ->
             lastSoundLevel = level
             prefs?.let { p ->
@@ -1569,6 +1579,12 @@ class BridgeService : Service() {
         // to the stopped executors, and every timer still queued on the main-thread handler (dashboardReturn re-posts
         // itself every 90 s, a pending dead-stream retry) is dropped. Posts made further down still run.
         destroyed = true
+        // fleet (2026-11-21, review b2-09): a navigate page / desktop mode must not outlive this instance - the new one
+        // starts with navPath empty and desktopMode off, so nothing would send the wall home or end the desktop
+        // (launcher in front, screen wake lock + static userLeftDashboard blocking the camera revive).
+        runCatching { if (navPath.isNotEmpty()) { Log.i(TAG, "navigate: service stopping - back home from $navPath"); navPath = ""; DashboardActivity.navigate(null) } }
+        runCatching { if (desktopMode) endDesktopNow("service stopping") }
+        runCatching { releaseDesktopScreen() }
         wakeHandler.removeCallbacksAndMessages(null)
         serviceAlive = false
         running.set(false)
@@ -3039,11 +3055,13 @@ class BridgeService : Service() {
         publishVolumeMuteState(p)
         publishBrightnessState(p)
         publishDisplayStates(p)
-        // Presence is on-change only; a value that never reached the broker goes now (see recomputePresence).
-        if (p.presenceEnabled && (presenceUnsent || lastPublishedPresence == null)) {
+        // Presence is on-change only. fleet (2026-11-21, review b2-04): ALWAYS re-sent with the burst, like every other
+        // retained state - 'sent' only means queued, and a value queued on a half-dead session was lost with it.
+        if (p.presenceEnabled) {
             lastPublishedPresence?.let { cur ->
+                val was = presenceUnsent
                 presenceUnsent = !publishRawSent(HaDiscovery.presenceStateTopic(p.deviceId), if (cur) "ON" else "OFF", 1, retained = true)
-                Log.i(TAG, "presence: re-sent ${if (cur) "ON" else "OFF"} on connect" + if (presenceUnsent) " - failed again" else "")
+                if (was || presenceUnsent) Log.i(TAG, "presence: re-sent ${if (cur) "ON" else "OFF"} on connect" + if (presenceUnsent) " - failed again" else "")
             } ?: recomputePresence(p)
         }
         publishRaw(HaDiscovery.ipStateTopic(p.deviceId), localIp() ?: "unknown", 1, retained = true)
@@ -3599,10 +3617,12 @@ class BridgeService : Service() {
     private fun controlTopic(id: String) = "portal/$id/control/set"
     private fun controlStatusTopic(id: String) = "portal/$id/control/status_line"
     private fun capabilitiesTopic(id: String) = "portal/$id/capabilities"
-    private val serviceRestarts = ArrayDeque<Long>()
+    // fleet (2026-11-21, review b2-05 / b4-03): the restart limits live in Prefs (Prefs.takeRestartSlot) so they survive the
+    // restart they cause: restart_service 3 an hour, restart_process 2 a day.
+    private val RESTART_PROCESS_ALARM_RC = 0x50524f43
 
     private fun publishCapabilities(p: Prefs) {
-        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
+        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
             "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
@@ -3614,7 +3634,9 @@ class BridgeService : Service() {
             "${pubStatus()} | wifiPerfLock pref=${prefs?.wifiPerfLock} held=${wifiPerfLock?.isHeld == true} | webview failedFor=${DashboardActivity.loadFailedForMs() / 1000}s | " +
             "${DashboardActivity.webPauseStatus()} | dial=${dialServer != null} | ${cmdBusyLine()} | " +
             "mqtt connect_fails=${mqttConnectFailures.get()} connect_timeouts=${mqttConnectTimeouts.get()} republish_folded=${republishSkipped.get()} | " +
-            "rtsp restart_fails=${rtspRestartFails.get()} | ${prefs?.let { togglesLine(it) } ?: ""}"
+            "rtsp restart_fails=${rtspRestartFails.get()} start_fails=${rtspStreamer?.startFailures ?: 0} last_start_failure='${rtspStreamer?.lastStartFailure ?: ""}' " +
+            "enc_fps=${rtspStreamer?.encoderFps ?: -1} | restarts service='${prefs?.restartTimes("service") ?: ""}' process='${prefs?.restartTimes("process") ?: ""}' | " +
+            "${prefs?.let { togglesLine(it) } ?: ""}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
@@ -3650,12 +3672,7 @@ class BridgeService : Service() {
                     else -> null
                 }
                 if (busy != null) { say("restart_service refused - $busy"); return }
-                val now = android.os.SystemClock.elapsedRealtime()
-                synchronized(serviceRestarts) {
-                    while (serviceRestarts.isNotEmpty() && now - serviceRestarts.first() > 3_600_000L) serviceRestarts.removeFirst()
-                    if (serviceRestarts.size >= 3) { say("restart_service refused - 3 in the last hour"); return }
-                    serviceRestarts.addLast(now)
-                }
+                p.takeRestartSlot("service", 3, 3_600_000L)?.let { say("restart_service refused - $it"); return }
                 say("restart_service: stopping + starting the Bridge service (same process; the camera revive brings the dashboard back if needed)")
                 val app = applicationContext
                 Handler(Looper.getMainLooper()).postDelayed({
@@ -3664,6 +3681,38 @@ class BridgeService : Service() {
                         app.startForegroundService(Intent(app, BridgeService::class.java).setAction(ACTION_REVIVE))
                     }.onFailure { Log.w(TAG, "control: restart_service failed: ${it.message}") }
                 }, 1_500L)
+            }
+            cmd == "restart_process" -> {
+                // fleet (2026-11-21, review b2-05 / b3-02 / b4-08; Fabio: yes, pilot first): end OUR process (never a
+                // force-stop: alarms + the sticky restart survive). Android restarts the sticky service (~1 s) and an alarm
+                // at +10 s starts it as a backup; the process-death path (scheduleRestartFront + camera revive) brings the
+                // dashboard and the camera back, with the screen left dark. Same refusals as restart_service; 2 a day.
+                val busy = when {
+                    inCall || ringing -> "a call"
+                    TvAppActivity.isShowing() -> "a cast is showing"
+                    intercom?.isTalking() == true -> "the intercom is in use"
+                    keepAlive?.isPaused() == true -> "the Ava keep-alive is paused (a setup is running)"
+                    else -> null
+                }
+                if (busy != null) { say("restart_process refused - $busy"); return }
+                p.takeRestartSlot("process", 2, 24 * 3_600_000L)?.let { say("restart_process refused - $it"); return }
+                say("restart_process: ending the Bridge process in 2 s (pid ${android.os.Process.myPid()}); Android restarts the service, the camera revive brings the dashboard back")
+                val app = applicationContext
+                runCatching {
+                    val pi = PendingIntent.getForegroundService(app, RESTART_PROCESS_ALARM_RC,
+                        Intent(app, BridgeService::class.java).setAction(ACTION_REVIVE),
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                    app.getSystemService(AlarmManager::class.java)
+                        ?.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, android.os.SystemClock.elapsedRealtime() + 10_000L, pi)
+                }.onFailure { Log.w(TAG, "control: restart_process backup alarm failed: ${it.message}") }
+                CrashRecorder.markRequestedExit(app, "restart_process via MQTT control/set")
+                Handler(Looper.getMainLooper()).postDelayed({
+                    runCatching { publishOfflineBeforeStop() }
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        Log.w(TAG, "control: restart_process - ending pid ${android.os.Process.myPid()} now")
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    }, 800L)
+                }, 1_200L)
             }
             cmd == "toggles" -> say(togglesLine(p))
             cmd.startsWith("toggle:") -> say(applyToggle(cmd.substringAfter("toggle:"), p))
@@ -4698,6 +4747,14 @@ class BridgeService : Service() {
         val p = prefs ?: return
         val id = p.wakePhrase.trim().lowercase().substringAfterLast(' ').ifEmpty { "jarvis" }
         val pkg = p.wakeAssistantPackage
+        // fleet (2026-11-21, review b2-10 / b5-09): coexist (Ava owns the mic) or no assistant installed = nothing to hand
+        // off to: no yield, no wake cover, no muted music, no blocked self-heal / keep-alive for 120 s.
+        val coexistOn = p.coexistVoiceAssistant && !p.wakeWordEnabled && !p.alexaWakeEnabled
+        val installed = runCatching { packageManager.getPackageInfo(pkg, 0); true }.getOrDefault(false)
+        if (coexistOn || !installed) {
+            Log.i(TAG, "wake: assist/wake hand-off ignored (${if (coexistOn) "coexist with Ava" else "$pkg not installed"})")
+            return
+        }
         fun broadcastAndYield() {
             runCatching {
                 sendBroadcast(Intent("com.portal.wake.action.WAKE")

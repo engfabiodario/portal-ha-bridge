@@ -16,6 +16,8 @@ data class IntercomButton(
     val y: Int = -1
 )
 
+private val DEFAULT_ON_TOGGLES = setOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check")
+
 class Prefs(private val context: Context) {
     private val sp = context.getSharedPreferences("portal_ha", Context.MODE_PRIVATE)
 
@@ -65,7 +67,22 @@ class Prefs(private val context: Context) {
     // YouTube phone-cast receiver (DialServer). fleet (2026-11-15): off by default on every model (DEBUG_CONFIG dialEnabled).
     // fleet (2026-11-15, reliability pass): opt-in behaviour toggles, ALL default false (= the old behaviour). Switched with
     // MQTT portal/<id>/control/set 'toggle:<name>:on|off' ('toggles' lists them) or DEBUG_CONFIG --es toggle <name>:on|off.
-    fun toggle(name: String): Boolean = sp.getBoolean("toggle_$name", false)
+    // fleet (2026-11-21, review b4-07): the five soaked speed-ups default ON (Coffee Area since 11-16, fleet 11-21); a
+    // stored 'off' (MQTT toggle:<name>:off) still wins. batch_flush / fps_cap / the rest stay default off.
+    fun toggle(name: String): Boolean = sp.getBoolean("toggle_$name", name in DEFAULT_ON_TOGGLES)
+
+    // fleet (2026-11-21, review b2-05 / b4-03): remote restart limits that survive the restart they cause
+    // (the old 3-an-hour counter lived in the service instance and was empty again after every restart_service).
+    // Wall-clock ms, oldest first; [windowMs] drops old entries. Returns null = allowed (and recorded), else the refusal.
+    @Synchronized fun takeRestartSlot(kind: String, max: Int, windowMs: Long, nowMs: Long = System.currentTimeMillis()): String? {
+        val key = "restart_times_$kind"
+        val kept = (sp.getString(key, "") ?: "").split(',').mapNotNull { it.trim().toLongOrNull() }
+            .filter { it in (nowMs - windowMs)..(nowMs + 60_000L) }
+        if (kept.size >= max) return "$max in the last ${windowMs / 3_600_000L} h"
+        sp.edit().putString(key, (kept + nowMs).joinToString(",")).commit()
+        return null
+    }
+    fun restartTimes(kind: String): String = sp.getString("restart_times_$kind", "") ?: ""
     fun setToggle(name: String, on: Boolean) = sp.edit().putBoolean("toggle_$name", on).apply()
 
     // fleet (2026-11-15): WebView.onPause() while the dashboard is not seen (screen off / photos / stopped). Default on.

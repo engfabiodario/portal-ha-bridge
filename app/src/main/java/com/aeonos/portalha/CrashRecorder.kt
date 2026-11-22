@@ -40,6 +40,7 @@ object CrashRecorder {
     private const val HEARTBEAT_MS = 60_000L
     private const val EXIT_DUMP_LINES = 500
     private const val EXIT_KEEP = 7
+    private const val REQUESTED_EXIT = "requested-exit.txt"
 
     private fun bootId(): String =
         runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim().take(36) }.getOrDefault("?")
@@ -111,6 +112,18 @@ object CrashRecorder {
                 sameBoot && er != null -> "; same boot, ${(android.os.SystemClock.elapsedRealtime() - er) / 1000} s after its last heartbeat (uptime then ${er / 1000} s)"
                 else -> "; the Portal REBOOTED since (or lost power)"
             }
+            // fleet (2026-11-21, review b2-05): a restart_process leaves requested-exit.txt just before it ends the process.
+            val req = File(d, REQUESTED_EXIT)
+            if (req.exists()) {
+                val why = runCatching { req.readText().trim() }.getOrDefault("?")
+                val fresh = req.lastModified() >= ts - 120_000L
+                runCatching { req.delete() }
+                if (fresh) {
+                    val line = "previous run ended on request ($why) at ${stamp(ts)} (pid ${kv["pid"] ?: "?"})$boot"
+                    runCatching { File(d, "previous-exit.txt").writeText("recorded=${stamp(System.currentTimeMillis())}\n$line\n") }
+                    return@runCatching line
+                }
+            }
             if (kv["clean"] == "true") return@runCatching "previous run ended cleanly at ${stamp(ts)}$boot"
             val updated = runCatching {
                 ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime
@@ -174,6 +187,13 @@ object CrashRecorder {
             d.listFiles { x -> x.name.startsWith("$prefix-") }?.sortedBy { it.name }?.dropLast(EXIT_KEEP)?.forEach { it.delete() }
             Log.i(TAG, "note: ${f.name}")
         }.onFailure { Log.w(TAG, "note $prefix failed: ${it.message}") }
+    }
+
+    /** fleet (2026-11-21, review b2-05): restart_process is about to end this process on purpose (the next start reads it). */
+    fun markRequestedExit(ctx: Context, why: String) {
+        val d = crashDir(ctx) ?: return
+        runCatching { File(d, REQUESTED_EXIT).writeText("$why; ${stamp(System.currentTimeMillis())} pid=${Process.myPid()}\n") }
+        writeHeartbeat(clean = false)
     }
 
     /** Service destroyed normally: mark the run as ended cleanly. */

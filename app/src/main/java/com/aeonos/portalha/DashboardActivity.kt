@@ -135,9 +135,13 @@ class DashboardActivity : AppCompatActivity() {
             val act = instance ?: return
             act.runOnUiThread {
                 if (act.loadFailedAtMs == 0L || !act::webView.isInitialized) return@runOnUiThread
-                android.util.Log.i("PortalHA", "webview: retrying the failed page now ($why)")
+                // fleet (2026-11-21, review b5-04): a per-device delay (0-45 s): MQTT connect / HA's birth arrive on every
+                // wall in the same second, and 17 walls loading together hung HA's web / API for ~6 min (10-05).
+                val j = act.retryJitterMs()
+                android.util.Log.i("PortalHA", "webview: retrying the failed page in ${j / 1000} s ($why)")
                 act.retryHandler.removeCallbacks(act.loadRetry)
-                act.loadDashboard()
+                act.retryHandler.removeCallbacks(act.jitterRetry)
+                act.retryHandler.postDelayed(act.jitterRetry, j)
             }
         }
 
@@ -626,10 +630,20 @@ class DashboardActivity : AppCompatActivity() {
             // changes both re-enter this, and re-clearing there would just add latency.
             // Cost is one re-download of the HA frontend per launch, over the LAN, and this
             // app is long-running — launches are rare.
+            // fleet (2026-11-21, review b5-04): only on the first start after a Bridge install/update (the fleet has no
+            // ImmichFrame; HA's frontend files are content-hashed). A power cut no longer makes every wall download
+            // the whole HA frontend again at the same moment. DEBUG_CLEAR_WEB_CACHE still clears it by hand.
             if (!webCacheCleared) {
                 webCacheCleared = true
-                android.util.Log.i("PortalHA", "webview: cleared HTTP cache for a fresh start")
-                webView.clearCache(true)
+                val installed = runCatching { packageManager.getPackageInfo(packageName, 0).lastUpdateTime }.getOrDefault(0L)
+                val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
+                if (sp.getLong("web_cache_cleared_for_install", -1L) != installed) {
+                    sp.edit().putLong("web_cache_cleared_for_install", installed).apply()
+                    android.util.Log.i("PortalHA", "webview: cleared HTTP cache (first start of this install)")
+                    webView.clearCache(true)
+                } else {
+                    android.util.Log.i("PortalHA", "webview: HTTP cache kept (same install as the last clear)")
+                }
             }
             webView.loadUrl(navUrl ?: url)
         }
@@ -713,6 +727,19 @@ class DashboardActivity : AppCompatActivity() {
     private var loadRetryN = 0
     private var mainFrameErrored = false
     private val retryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun retryJitterMs(): Long {
+        val id = runCatching { android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) }
+            .getOrNull() ?: packageName
+        return (id.hashCode().toLong() and 0x7fffffffL) % 45_000L
+    }
+
+    private val jitterRetry = Runnable {
+        if (loadFailedAtMs != 0L && ::webView.isInitialized && !isFinishing) {
+            android.util.Log.i("PortalHA", "webview: retrying the failed page now (staggered)")
+            loadDashboard()
+        }
+    }
+
     private val loadRetry = Runnable {
         if (loadFailedAtMs == 0L || !::webView.isInitialized) return@Runnable
         loadRetryN++
@@ -752,6 +779,7 @@ class DashboardActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         retryHandler.removeCallbacks(loadRetry)
+        retryHandler.removeCallbacks(jitterRetry)
         runCatching { unregisterReceiver(clearCacheReceiver) }
         if (instance === this) instance = null
         // fleet (2026-11-15, toggle webview_destroy, default off): a destroyed dashboard (renderer-gone recreate(), kiosk

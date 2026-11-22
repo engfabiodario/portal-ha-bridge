@@ -322,11 +322,19 @@ class SensorBridge(
     }
 
     // Runs touchGuardMs after the second knock, on the sensor thread like everything else here.
+    // fleet (2026-11-21, review x10-03): a reason to drop a double knock that our touch guard cannot see (taps on the
+    // launcher in desktop mode, on a call screen). null = no blocker. Set by BridgeService.
+    @Volatile var knockBlocker: (() -> String?)? = null
+
     private fun confirmKnock(c: KnockDetector.Candidate) {
         val p = prefs ?: return
         val touch = lastTouchAt()
         if (!knocks.confirm(c, touch)) {
             Log.i(TAG, "knock: double knock ignored - screen touched ${touch - c.firstMs}ms from its first knock")
+            return
+        }
+        runCatching { knockBlocker?.invoke() }.getOrNull()?.let { why ->
+            Log.i(TAG, "knock: ignored - $why")
             return
         }
         Log.i(TAG, "knock: DOUBLE (gap ${c.gapMs}ms)")

@@ -48,7 +48,9 @@ class FleetCameraSource(context: Context) : VideoSource() {
     }
 
     override fun stop() {
-        if (isRunning()) camera.closeCamera()
+        // fleet (2026-11-21, review b3-03): always close. A refused open (cover / background 'Open failed: 3') leaves
+        // isRunning false but the library's 'Camera2ApiManager Id = 0' thread alive; closeCamera() is null-safe.
+        runCatching { camera.closeCamera() }.onFailure { Log.w("PortalHA", "camera: close failed: ${it.message}") }
     }
 
     override fun release() {

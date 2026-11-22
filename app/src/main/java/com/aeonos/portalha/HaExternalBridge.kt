@@ -81,7 +81,9 @@ class HaExternalBridge(
             // The only command we advertise that expects a reply.
             "config/get" -> reply(id, JSONObject()
                 .put("hasSettingsScreen", true)
-                .put("hasAssist", true)
+                // fleet (2026-11-21, review b2-10 / b5-09): no assistant hand-off target in the fleet (voice = Ava, coexist):
+                // false = HA opens its own Assist dialog instead of a dead hand-off that muted the room's music 2 min.
+                .put("hasAssist", !prefs.coexistVoiceAssistant && (prefs.wakeWordEnabled || prefs.alexaWakeEnabled))
                 .put("appVersion", BuildConfig.VERSION_NAME))
 
             // Fire-and-forget from the frontend — act, DON'T reply (a reply to a non-awaited

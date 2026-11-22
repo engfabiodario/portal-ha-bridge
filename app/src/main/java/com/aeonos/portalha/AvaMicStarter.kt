@@ -39,6 +39,8 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
         val needed: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
         private val refusedRe = Regex("""can not have [a-z/]*microphone[a-z/]* access: service ${Regex.escape(PKG)}/""")
         private val failedRe = Regex("""MicrophoneInput.*Failed to (initialize|create) AudioRecord""")
+        // fleet (2026-11-21, review b4-11): MUTE sent, UNMUTE not yet - survives a service restart (same process).
+        @Volatile private var unmuteOwed = false
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -54,6 +56,7 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
         if (!needed || started) return
         if (runCatching { ctx.packageManager.getPackageInfo(PKG, 0) }.isFailure) { Log.i(TAG, "avamic: $PKG not installed - off"); return }
         started = true
+        if (unmuteOwed) { send("ACTION_UNMUTE_MIC"); unmuteOwed = false; Log.i(TAG, "avamic: unmute owed by the previous run - sent") }
         logThread = Thread({ readLoop() }, "portal-ha-avamic-log").also { it.isDaemon = true; it.start() }
         Log.i(TAG, "avamic: on (Android ${Build.VERSION.RELEASE}: a background-started assistant service gets no microphone)")
     }
@@ -64,6 +67,8 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
         runCatching { logProc?.destroy() }
         logProc = null
         main.removeCallbacksAndMessages(null)
+        // fleet (2026-11-21, review b4-11): a restart between MUTE (+2.5 s) and UNMUTE (+4.5 s) left Ava muted for good.
+        if (unmuteOwed) { send("ACTION_UNMUTE_MIC"); unmuteOwed = false; Log.i(TAG, "avamic: stopping mid-cycle - unmute sent") }
     }
 
     /** The dashboard came to the front: do what waited for it. */
@@ -83,7 +88,14 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
         if (lastFixMs != 0L && now - lastFixMs < MIN_GAP_MS) {
             main.postDelayed({ fix(why) }, MIN_GAP_MS - (now - lastFixMs) + 500L); return
         }
-        if (recent.size >= MAX_PER_HOUR) { Log.w(TAG, "avamic: $why - $MAX_PER_HOUR fixes this hour, holding"); return }
+        if (recent.size >= MAX_PER_HOUR) {
+            // fleet (2026-11-21, review b4-11): later failure lines are dropped while pendingCycle is set, so retry by
+            // itself the moment the oldest fix leaves the hour window (was: only a dashboard resume, rare on a Show).
+            val wait = (3_600_000L - (now - recent.first())).coerceAtLeast(0L) + 1_000L
+            Log.w(TAG, "avamic: $why - $MAX_PER_HOUR fixes this hour, holding (retry in ${wait / 1000} s)")
+            main.postDelayed({ fix(why) }, wait)
+            return
+        }
         lastFixMs = now; recent.addLast(now)
         pendingStart = false; pendingCycle = false
         try {
@@ -93,8 +105,8 @@ class AvaMicStarter(private val ctx: Context, private val dashboardInFront: () -
             Log.w(TAG, "avamic: start failed ($why): ${e.message}"); return
         }
         if (!cycle) return
-        main.postDelayed({ send("ACTION_MUTE_MIC") }, 2_500L)
-        main.postDelayed({ send("ACTION_UNMUTE_MIC"); Log.i(TAG, "avamic: mic cycled - Ava reopens its AudioRecord") }, 4_500L)
+        main.postDelayed({ unmuteOwed = true; send("ACTION_MUTE_MIC") }, 2_500L)
+        main.postDelayed({ send("ACTION_UNMUTE_MIC"); unmuteOwed = false; Log.i(TAG, "avamic: mic cycled - Ava reopens its AudioRecord") }, 4_500L)
     }
 
     private fun send(action: String) {
