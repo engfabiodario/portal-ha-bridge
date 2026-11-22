@@ -122,7 +122,13 @@ class DashboardActivity : AppCompatActivity() {
             act.runOnUiThread { act.applyWebPause() }
         }
         fun webPauseStatus(): String = "webview: paused=${instance?.webPaused ?: false} covered=$coveredByService ('$coveredWhy') " +
-            "stopped=${instance?.stoppedNow ?: false}"
+            "stopped=${instance?.stoppedNow ?: false} loading=${instance?.loadingActive ?: false} modern_ua=${instance?.modernUa ?: false}"
+
+        /** fleet (2026-11-21, speed B2 pilot): toggle modern_frontend changed - apply the user agent and reload once. */
+        fun applyUserAgentNow() {
+            val act = instance ?: return
+            act.runOnUiThread { if (act.applyUserAgent()) act.loadDashboard() }
+        }
 
         /** fleet (2026-11-09, audit bridge-code.8): ms the page has been on the 'Failed to load' placeholder (0 = loaded). */
         fun loadFailedForMs(): Long {
@@ -219,6 +225,7 @@ class DashboardActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_DEFAULT
         }
+        applyUserAgent()   // speed B2 pilot (toggle modern_frontend, default off)
 
         // Speak HA's frontend "external app" protocol so the dashboard treats us as a native
         // wrapper (native settings entry + working voice button + no-logout auth). CAUTION: once
@@ -265,10 +272,12 @@ class DashboardActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                if (url.startsWith("http")) mainFrameErrored = false
+                if (url.startsWith("http")) { mainFrameErrored = false; markLoading("page started") }
                 view.evaluateJavascript(alwaysVisibleJs(), null)
             }
             override fun onPageFinished(view: WebView, url: String) {
+                // fleet (2026-11-21, speed B1): keep it running 20 s more so HA's frontend can start and paint once.
+                if (loadingActive) { retryHandler.removeCallbacks(loadSettle); retryHandler.postDelayed(loadSettle, 20_000L) }
                 if (url.startsWith("http") && !mainFrameErrored && loadFailedAtMs != 0L) {
                     android.util.Log.i("PortalHA", "webview: page loaded again after ${(System.currentTimeMillis() - loadFailedAtMs) / 1000} s on the placeholder ($loadRetryN retries)")
                     loadFailedAtMs = 0L; loadRetryN = 0
@@ -394,15 +403,48 @@ class DashboardActivity : AppCompatActivity() {
         applyWebPause()
     }
 
+    // fleet (2026-11-21, speed B1 - the slowest wake, proven): a page (re)load that reached a covered wall (photos up,
+    // screen off: the 04:40 nightly reload, every dashboard push) was held by the paused WebView until the next wake,
+    // which then took 5.6 s (Bar) / 9.6 s (Downstairs Hallway) instead of 0.75 s. While a load runs the WebView stays
+    // resumed - from the load start until 20 s after onPageFinished (at most 60 s) - then it is paused again.
+    private var loadingActive = false
+    private val loadSettle = Runnable { if (loadingActive) { loadingActive = false; applyWebPause() } }
+    private fun markLoading(why: String) {
+        if (!::webView.isInitialized) return
+        retryHandler.removeCallbacks(loadSettle)
+        retryHandler.postDelayed(loadSettle, 60_000L)
+        if (loadingActive) return
+        loadingActive = true
+        if (webPaused) android.util.Log.i("PortalHA", "webview: resumed (loading: $why)")
+        applyWebPause()
+    }
+    /** webView.loadUrl with the WebView awake for the load (B1). */
+    private fun loadUrlAwake(url: String) { markLoading("load"); webView.loadUrl(url) }
+
+    // fleet (2026-11-21, speed B2 PILOT, toggle modern_frontend, default OFF): the WebView is Chromium 131 and HA 2026.11
+    // serves its modern (ES2021+) build only from Chrome 132 on - the legacy ES5 build is ~13 % more JS and loads
+    // 1.5-2 s slower. With the toggle on only the Chrome major in the user agent says 132. Returns true when it changed.
+    private var modernUa = false
+    private fun applyUserAgent(): Boolean {
+        if (!::webView.isInitialized) return false
+        val want = runCatching { prefs.toggle("modern_frontend") }.getOrDefault(false)
+        if (want == modernUa) return false
+        val def = WebSettings.getDefaultUserAgent(this)
+        webView.settings.userAgentString = if (want) def.replace(Regex("Chrome/131\\."), "Chrome/132.") else def
+        modernUa = want
+        android.util.Log.i("PortalHA", "webview: user agent ${if (want) "Chrome/132 (modern_frontend pilot)" else "default"}: ${webView.settings.userAgentString}")
+        return true
+    }
+
     private fun applyWebPause() {
         if (!::webView.isInitialized) return
         val enabled = runCatching { Prefs(this).webviewPauseHidden }.getOrDefault(true)
-        val want = enabled && (coveredByService || stoppedNow)
+        val want = enabled && (coveredByService || stoppedNow) && !loadingActive
         if (want == webPaused) return
         webPaused = want
         runCatching { if (want) webView.onPause() else webView.onResume() }
             .onFailure { android.util.Log.w("PortalHA", "webview: ${if (want) "pause" else "resume"} failed: ${it.message}") }
-        android.util.Log.i("PortalHA", "webview: ${if (want) "paused (" + (if (coveredByService) coveredWhy else "activity stopped") + ")" else "resumed"}")
+        android.util.Log.i("PortalHA", "webview: ${if (want) "paused (" + (if (coveredByService) coveredWhy else "activity stopped") + ")" else if (loadingActive) "resumed (a page load is running)" else "resumed"}")
     }
 
     override fun onStop() {
@@ -645,7 +687,7 @@ class DashboardActivity : AppCompatActivity() {
                     android.util.Log.i("PortalHA", "webview: HTTP cache kept (same install as the last clear)")
                 }
             }
-            webView.loadUrl(navUrl ?: url)
+            loadUrlAwake(navUrl ?: url)
         }
     }
 
@@ -671,12 +713,12 @@ class DashboardActivity : AppCompatActivity() {
         val current = webView.url ?: ""
         val soft = (nav != null || prefs.dashboardPath.isNotEmpty()) &&
             DashboardUrls.sameOrigin(current, origin) && DashboardUrls.sameOrigin(target, origin)
-        if (!soft) { webView.loadUrl(target); return }
+        if (!soft) { loadUrlAwake(target); return }
         val path = target.substring(origin.length).ifEmpty { "/" }
         webView.evaluateJavascript(spaNavigateJs(path)) { r ->
             if (r?.trim() != "1") {
                 android.util.Log.i("PortalHA", "navigate: not an HA page here - loading $target")
-                webView.loadUrl(target)
+                loadUrlAwake(target)
             }
         }
     }
@@ -773,6 +815,7 @@ class DashboardActivity : AppCompatActivity() {
         override fun onReceive(c: android.content.Context?, i: Intent?) {
             android.util.Log.i("PortalHA", "webview: clearing HTTP cache + reloading")
             webView.clearCache(true)
+            markLoading("cache cleared")
             webView.reload()
         }
     }

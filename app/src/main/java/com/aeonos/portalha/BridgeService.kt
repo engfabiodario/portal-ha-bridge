@@ -2660,8 +2660,10 @@ class BridgeService : Service() {
     //                   receiver are not created. Applies at the next service start (control/set restart_service).
     //  fast_reconnect : since 2026-11-20 (review b1-03) the network wake is ALWAYS on; the toggle is kept so old commands
     //                   still answer, it no longer changes anything.
+    //  modern_frontend: (2026-11-21, speed B2 PILOT, default off) the dashboard WebView says Chrome/132 so HA serves its
+    //                   modern frontend build (Chromium 131 gets the legacy ES5 one); applied at once with one page reload.
     private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe",
-        "intercom_off")
+        "intercom_off", "modern_frontend")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2672,6 +2674,7 @@ class BridgeService : Service() {
         if (v != "on" && v != "off") return "toggle $name: use on|off"
         p.setToggle(name, v == "on")
         if (name == "top_swipe") wakeHandler.post { applyTopSwipe() }
+        if (name == "modern_frontend") DashboardActivity.applyUserAgentNow()
         val note = when (name) {
             "intercom_off" -> " (applies at the next service start: restart_service)"
             "fast_reconnect" -> " (no effect since 2026-11-20: the network wake is always on)"
