@@ -3573,6 +3573,18 @@ class BridgeService : Service() {
                 "ap=..${WifiTrace.lastApSuffix.ifEmpty { "?" }} associated=${i.supplicantState == android.net.wifi.SupplicantState.COMPLETED}"
         }.getOrDefault("")
 
+        override fun rtspListenerOk(): Boolean? {
+            if (rtspStreamer?.isStreaming != true) return null
+            return runCatching {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress("127.0.0.1", 8554), 2_000); s.soTimeout = 2_000
+                    s.getOutputStream().write("OPTIONS rtsp://127.0.0.1:8554/ RTSP/1.0\r\nCSeq: 1\r\n\r\n".toByteArray())
+                    val buf = ByteArray(64); val n = s.getInputStream().read(buf)
+                    n > 0 && String(buf, 0, n).startsWith("RTSP/1.0")
+                }
+            }.getOrDefault(false)
+        }
+
         override fun rtspClientsReceiving(): Boolean? {
             val r = rtspStreamer ?: return null
             if (!r.isStreaming) return null
@@ -3800,7 +3812,7 @@ class BridgeService : Service() {
                 val v = cmd.substringAfter(':', "").trim().toIntOrNull()
                 val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
                 if (v != null && (v == 0 || v in 64..4096)) sp.edit().putInt("sendspin_buffer_kb", v).apply()
-                say("sendspin_buffer_kb=${sp.getInt("sendspin_buffer_kb", 0)} (0 = library default 256; applies at the next restart_service)")
+                say("sendspin_buffer_kb=${sp.getInt("sendspin_buffer_kb", 0)} (0 = fleet default 1024; applies at the next restart_service)")
             }
             cmd == "toggles" -> say(togglesLine(p))
             cmd.startsWith("toggle:") -> say(applyToggle(cmd.substringAfter("toggle:"), p))

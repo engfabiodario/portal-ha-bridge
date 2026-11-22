@@ -320,7 +320,7 @@ class SendspinPlayer(
             // fleet (2026-11-22, review b6-02, PILOT): player buffer in KB from control/set 'sendspin_buffer_kb:<n>'
             // (0 = the library default 256 KB = 1.5 s PCM). Applies at the next Sendspin start (restart_service).
             playerBufferCapacity = context.getSharedPreferences("portal_ha", Context.MODE_PRIVATE)
-                .getInt("sendspin_buffer_kb", 0).let { kb -> if (kb in 64..4096) kb * 1024 else 256 * 1024 },
+                .getInt("sendspin_buffer_kb", 0).let { kb -> if (kb in 64..4096) kb * 1024 else 1024 * 1024 },   // fleet default 1 MB (6 s) since 11-22 (Dining Room pilot: 0 underruns, sync 1.4 ms)
             supportedOptionalRoles = if (artwork)
                 setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.ARTWORK, OptionalRole.CONTROLLER)
             else setOf(OptionalRole.PLAYER, OptionalRole.METADATA, OptionalRole.CONTROLLER),

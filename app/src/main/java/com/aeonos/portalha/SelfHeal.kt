@@ -94,6 +94,8 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** fleet (2026-11-22, review b4-05): something on screen (navigate page < 30 min, YouTube / cast) - only the
          *  dashboard reload waits; stream, RTSP clients and keep-alive keep healing behind it. null = none. */
         fun screenBusyReason(): String? = null
+        /** review b3-05: null = n/a (not streaming), true = OPTIONS answered on 127.0.0.1:8554, false = no answer. */
+        fun rtspListenerOk(): Boolean? = null
         /** null = the app has no broker configured (n/a). */
         fun mqttConnected(): Boolean?
         /** ms since the live MQTT session last RECEIVED anything (PINGRESP, PUBACK, a message); null = unknown / no session. */
@@ -449,7 +451,11 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             val issue = runCatching { host.streamCameraIssue() }.getOrNull()
             return if (issue != null) "bad: $issue" else "wait: stream just started"
         }
-        return if (age <= STREAM_STALE_MS) "ok" else "bad: no camera frames for ${if (age == Long.MAX_VALUE) "ever" else "${age / 1000}s"}"
+        if (age > STREAM_STALE_MS) return "bad: no camera frames for ${if (age == Long.MAX_VALUE) "ever" else "${age / 1000}s"}"
+        // fleet (2026-11-22, review b3-05): frames alone read 'ok' while nobody can connect (listener gone). One local
+        // RTSP OPTIONS to 127.0.0.1:8554 (no Wi-Fi traffic; OPTIONS needs no login); no answer in 2 s = bad.
+        if (runCatching { host.rtspListenerOk() }.getOrNull() == false) return "bad: RTSP listener not answering on :8554"
+        return "ok"
     }
 
     private fun evalRtspClients(): String {
