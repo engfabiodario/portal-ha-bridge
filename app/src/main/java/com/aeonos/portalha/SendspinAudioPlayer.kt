@@ -48,15 +48,27 @@ class SendspinAudioPlayer(
     private val clock: ClockSync,
 ) : AudioPlayer {
 
-    private companion object {
-        const val TAG = "PortalHA"
-        const val HARD_US = 25_000L            // beyond this: trim / pad at once
-        const val SOFT_US = 1_500L             // dead band of the gentle correction
-        const val LOOKAHEAD_US = 10_000_000L   // we take chunks long before they are due
-        const val MAX_PAD_US = 400_000L        // pad at most this much silence per pass ...
-        const val SILENCE_PIECE_FRAMES = 1024  // ... in small blocking writes (stop stays responsive)
-        const val HW_ALPHA = 0.05              // EMA weight of a new hardware-latency sample
-        const val ERR_ALPHA = 0.2              // EMA weight of a new sync-error sample
+    companion object {
+        private const val TAG = "PortalHA"
+        private const val HARD_US = 25_000L            // beyond this: trim / pad at once
+        private const val SOFT_US = 1_500L             // dead band of the gentle correction
+        private const val LOOKAHEAD_US = 10_000_000L   // we take chunks long before they are due
+        private const val MAX_PAD_US = 400_000L        // pad at most this much silence per pass ...
+        private const val SILENCE_PIECE_FRAMES = 1024  // ... in small blocking writes (stop stays responsive)
+        private const val HW_ALPHA = 0.05              // EMA weight of a new hardware-latency sample
+        private const val ERR_ALPHA = 0.2              // EMA weight of a new sync-error sample
+
+        // fleet (2026-11-22, review b6-06): process-wide totals for sensor.<slug>_music_link (the library builds a new
+        // player per session; these survive it). Written by the feeder thread only.
+        @Volatile @JvmStatic var totUnderruns = 0L
+        @Volatile @JvmStatic var totTrims = 0L
+        @Volatile @JvmStatic var totPads = 0L
+        @Volatile @JvmStatic var totSoft = 0L
+        @Volatile @JvmStatic var lastErrMs = 0.0
+        @Volatile @JvmStatic var avgErrMs = 0.0
+        @Volatile @JvmStatic var outMs = 0L
+        @Volatile @JvmStatic var hwMs = 0L
+        @Volatile @JvmStatic var lastReportWallMs = 0L
     }
 
     private var track: AudioTrack? = null
@@ -97,6 +109,7 @@ class SendspinAudioPlayer(
         // A track change / seek re-issues stream/start with the SAME format: keep the AudioTrack,
         // drop what is queued (it belongs to the old timeline) and re-align on the next chunk.
         if (format == this.format && track != null) {
+            runCatching { onStreamBegin?.invoke() }
             flush()
             Log.i(TAG, "sendspin: stream restarted, same format - buffer flushed, re-aligning")
             return
@@ -165,11 +178,14 @@ class SendspinAudioPlayer(
 
     /** fleet (2026-11-15): stream/start (true) and stream/end (false) - SendspinPlayer's idle-chatter throttle. */
     @Volatile var onActive: ((Boolean) -> Unit)? = null
+    /** fleet (2026-11-22, review b6-08): every stream start, also a track change / seek on a running stream (same format). */
+    @Volatile var onStreamBegin: (() -> Unit)? = null
 
     override fun start() {
         val t = track ?: run { Log.w(TAG, "sendspin: start with no track"); return }
         if (running) return
         runCatching { onActive?.invoke(true) }   // clock sync back to the library's own cadence BEFORE the first chunk
+        runCatching { onStreamBegin?.invoke() }
         running = true
         written = 0
         runCatching { t.play() }.onFailure { Log.w(TAG, "sendspin: play failed: ${it.message}") }
@@ -310,7 +326,7 @@ class SendspinAudioPlayer(
             // The track ran dry (stream stall, Wi-Fi gap): whatever comes next is re-aligned at once.
             val urc = runCatching { t.underrunCount }.getOrDefault(0)
             if (urc != lastUnderrunCount) {
-                if (aligned && urc > lastUnderrunCount) { aligned = false; underruns++ }
+                if (aligned && urc > lastUnderrunCount) { aligned = false; underruns++; totUnderruns++ }
                 lastUnderrunCount = urc
             }
             val err = nextOutUs(t, now) - scheduledUs(chunk, now)   // > 0: late, < 0: early
@@ -331,7 +347,7 @@ class SendspinAudioPlayer(
                 // Early: fill the gap with silence, at most MAX_PAD_US per pass (a chunk that is
                 // seconds ahead is simply waited for while the silence plays out).
                 val padUs = (-hardErr).coerceAtMost(MAX_PAD_US)
-                if (writeSilence(t, usToFrames(padUs))) { pads++; paddedUs += padUs }
+                if (writeSilence(t, usToFrames(padUs))) { pads++; totPads++; paddedUs += padUs }
                 errSmoothUs = 0.0
                 aligned = true
                 continue
@@ -339,7 +355,7 @@ class SendspinAudioPlayer(
             var data = chunk.data
             if (hardErr > HARD_US) {
                 val dropFrames = usToFrames(hardErr)
-                trims++; trimmedUs += hardErr
+                trims++; totTrims++; trimmedUs += hardErr
                 errSmoothUs = 0.0
                 if (dropFrames >= chunkFrames) {        // whole chunk is already past
                     pending = null
@@ -351,7 +367,7 @@ class SendspinAudioPlayer(
                 // Gentle catch-up: 1 frame per 25 ms chunk ~ 0.09 %, up to 3 frames when further off.
                 val k = ((abs(errSmoothUs) / 5_000.0).toInt() + 1).coerceAtMost(3)
                 data = resample16(data, if (errSmoothUs > 0) -k else k)
-                soft++
+                soft++; totSoft++
             }
             aligned = true
             pending = null
@@ -372,6 +388,8 @@ class SendspinAudioPlayer(
                     "out=${framesToUs(bufferedFrames(t)) / 1000}ms static=${buffer.staticDelayMicros / 1000}ms " +
                     "trims=$trims(${trimmedUs / 1000}ms) pads=$pads(${paddedUs / 1000}ms) soft=$soft underruns=$underruns")
                 lastReport = ms
+                lastErrMs = err / 1000.0; avgErrMs = errSmoothUs / 1000.0
+                outMs = framesToUs(bufferedFrames(t)) / 1000; hwMs = hwLatencyUs / 1000; lastReportWallMs = ms
                 trims = 0; pads = 0; soft = 0; underruns = 0; trimmedUs = 0; paddedUs = 0
             }
         }

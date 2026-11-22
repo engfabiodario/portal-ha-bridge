@@ -1373,6 +1373,7 @@ class BridgeService : Service() {
                     // configured intercom level — which drags our music UP with it, since it's on
                     // the same stream. Mute the music for the announcement (and pause DLNA, which
                     // is standalone so has nothing to stay in step with).
+                    intercomReceiving = true
                     sendspinPlayer?.muteForSystem(true)
                     dlnaRenderer?.pauseForSystem()
                     if (twoWayChannelOpen) { twoWayOrb?.setLive(true); lastTwoWayActivityMs = System.currentTimeMillis() }
@@ -1383,6 +1384,7 @@ class BridgeService : Service() {
                     else ro.setLevel(lvl)
                 }
                 it.onReceiveEnd = {
+                    intercomReceiving = false
                     sendspinPlayer?.muteForSystem(false)
                     dlnaRenderer?.resumeAfterSystem()
                     if (!twoWayChannelOpen) ro.hide()
@@ -1476,6 +1478,7 @@ class BridgeService : Service() {
         avaMic = AvaMicStarter(this) { dashboardForeground }.also { it.start() }
         selfHeal = SelfHeal(this, selfHealHost).also { it.start(p.selfHeal) }
         bridgeMemory = BridgeMemory(this) { state, attrs -> publishBridgeMemory(state, attrs) }.also { it.start() }
+        wakeHandler.postDelayed(musicLinkTick, 30_000L)   // review b6-06 / b6-08
         smartCamera = SmartCamera(this).takeIf { it.available() }?.also { sc ->
             sc.mode = p.smartCamera; sc.cropX = p.smartCameraX; sc.cropY = p.smartCameraY; sc.cropScale = p.smartCameraScale
             sc.start()   // "auto" = no connection (the tick only acts in wide/fixed)
@@ -1947,8 +1950,41 @@ class BridgeService : Service() {
                 wantArtwork = { prefs?.nowPlayingOverlayEnabled == true }).apply {
             onTrack = { t -> onSendspinTrack(t) }
             onArtwork = { bytes -> nowPlayingOverlay?.setArtwork(bytes) }
+            // review b6-06: a link change is published a few seconds later (debounced), the tick catches the rest.
+            onLinkChange = { wakeHandler.removeCallbacks(musicLinkSoon); wakeHandler.postDelayed(musicLinkSoon, 3_000L) }
             start()
         }
+        wakeHandler.post { publishMusicLink(force = true) }
+    }
+
+    // ── Music link sensor + mute watchdog (fleet 2026-11-22, review b6-06 / b6-08) ──────────────────────────────────
+    // sensor.<slug>_music_link: off / idle / connecting / streaming / down, attributes = drops, sync error, underruns,
+    // trims, pads, buffer, rtt / clock offset, codec, mute + focus. Published on a change (3 s debounce, the 60 s tick
+    // for playing <-> idle) and every 10 min; with every connect burst. The tick also runs the music mute watchdog.
+    @Volatile private var intercomReceiving = false
+    private var musicLinkLast = ""
+    private var musicLinkLastMs = 0L
+    private val musicLinkSoon = Runnable { publishMusicLink(force = false) }
+    private val musicLinkTick = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            runCatching { sendspinPlayer?.muteWatchdog(busy = inCall || ringing || systemAudioActive || callOwnsScreen || intercomReceiving) }
+            runCatching { publishMusicLink(force = false) }
+            wakeHandler.postDelayed(this, 60_000L)
+        }
+    }
+
+    private fun publishMusicLink(force: Boolean) {
+        val p = prefs ?: return
+        val sp = sendspinPlayer
+        val state = if (!p.sendspinEnabled || sp == null) "off" else sp.linkClass()
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!force && state == musicLinkLast && now - musicLinkLastMs < SelfHeal.HEARTBEAT_MS) return
+        val attrs = sp?.linkAttributesJson() ?: "{}"
+        if (!publishRawSent(HaDiscovery.musicLinkAttributesTopic(p.deviceId), attrs, 1, retained = true)) return
+        publishRaw(HaDiscovery.musicLinkStateTopic(p.deviceId), state, 1, retained = true)
+        if (state != musicLinkLast) Log.i(TAG, "music: link $musicLinkLast -> $state")
+        musicLinkLast = state; musicLinkLastMs = now
     }
 
     /**
@@ -2439,6 +2475,12 @@ class BridgeService : Service() {
                     publishAvaKeepAliveState(p)
                     Log.i(TAG, "config: ava keep-alive ${if (on) "ON" else "OFF"}")
                 }
+                //   --ei settingsUnlockMinutes N               review x10-02: settings screens unlocked N min (0 = lock again)
+                if (intent.hasExtra("settingsUnlockMinutes")) {
+                    @Suppress("DEPRECATION")
+                    val n = when (val v = intent.extras?.get("settingsUnlockMinutes")) { is Number -> v.toInt(); is String -> v.trim().toIntOrNull() ?: 0; else -> 0 }
+                    SettingsLock.unlock(this@BridgeService, n)
+                }
                 if (intent.hasExtra("keepAlivePauseMinutes")) {
                     @Suppress("DEPRECATION")
                     val n = when (val v = intent.extras?.get("keepAlivePauseMinutes")) {
@@ -2721,7 +2763,7 @@ class BridgeService : Service() {
     //  modern_frontend: (2026-11-21, speed B2 PILOT, default off) the dashboard WebView says Chrome/132 so HA serves its
     //                   modern frontend build (Chromium 131 gets the legacy ES5 one); applied at once with one page reload.
     private val TOGGLES = listOf("fast_reconnect", "fast_lane", "webview_destroy", "burst_pipeline", "mqtt_stale_check", "top_swipe",
-        "intercom_off", "modern_frontend", "raw_sensors")
+        "intercom_off", "modern_frontend", "raw_sensors", "rtp_fit_mss")
     private fun toggleOn(name: String) = prefs?.toggle(name) == true
     private fun togglesLine(p: Prefs) = "toggles: " + TOGGLES.joinToString(" ") { "$it=${if (p.toggle(it)) "on" else "off"}" }
     /** "<name>:on|off" -> applied line, or an error. */
@@ -2733,6 +2775,7 @@ class BridgeService : Service() {
         p.setToggle(name, v == "on")
         if (name == "top_swipe") wakeHandler.post { applyTopSwipe() }
         if (name == "modern_frontend") DashboardActivity.applyUserAgentNow()
+        if (name == "rtp_fit_mss") applyRtspClientPrefs(p)   // new clients (a restart_stream applies it to Frigate's)
         if (name == "raw_sensors") {
             sensorBridge?.rawSensors = v == "on"
             commandExecutor.submit { runCatching { mqtt?.let { if (it.isConnected) publishDiscovery(it, p) } } }
@@ -3273,6 +3316,7 @@ class BridgeService : Service() {
     /** The states that used to ride along with the discovery burst. */
     private fun publishDiscoveryStates(p: Prefs) {
         bridgeMemory?.republish()
+        wakeHandler.post { runCatching { publishMusicLink(force = true) } }
         publishDlnaState(p)
         if (keepAlive?.supported == true) publishAvaKeepAliveState(p)
         publishSelfHealSwitchState(p)
@@ -3292,6 +3336,7 @@ class BridgeService : Service() {
         pub(HaDiscovery.ipDiscoveryTopic(p.deviceId), HaDiscovery.ipConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.wifiSignalDiscoveryTopic(p.deviceId), HaDiscovery.wifiSignalConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.bridgeMemoryDiscoveryTopic(p.deviceId), HaDiscovery.bridgeMemoryConfigPayload(p.deviceId, p.deviceName))
+        pub(HaDiscovery.musicLinkDiscoveryTopic(p.deviceId), HaDiscovery.musicLinkConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopShowDiscoveryTopic(p.deviceId), HaDiscovery.desktopShowConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopBackDiscoveryTopic(p.deviceId), HaDiscovery.desktopBackConfigPayload(p.deviceId, p.deviceName))
         pub(HaDiscovery.desktopSensorDiscoveryTopic(p.deviceId), HaDiscovery.desktopSensorConfigPayload(p.deviceId, p.deviceName))
@@ -3637,6 +3682,20 @@ class BridgeService : Service() {
             return "asked the keep-alive to re-park Ava"
         }
 
+        // fleet (2026-11-22, review b6-06): music link - null = n/a (synced speaker off, no player, MQTT down).
+        override fun musicDownMs(): Long? {
+            val p = prefs ?: return null
+            if (!p.sendspinEnabled) return null
+            if (mqtt?.isConnected != true) return null
+            return sendspinPlayer?.downForMs()
+        }
+
+        override fun musicRestart(): String {
+            if (sendspinPlayer == null) return ""
+            wakeHandler.post { if (!destroyed) restartSendspin() }
+            return "restarted the music client (Sendspin)"
+        }
+
         override fun publish(state: String, attributesJson: String): Boolean {
             val p = prefs ?: return false
             // Through the publisher queue (audit bridge-code.3): the self-heal thread no longer waits on a PUBACK.
@@ -3726,8 +3785,16 @@ class BridgeService : Service() {
     // restart they cause: restart_service 3 an hour, restart_process 2 a day.
     private val RESTART_PROCESS_ALARM_RC = 0x50524f43
 
+    /** review b3-08 / b3-11: per-client RTSP options from the prefs (packets sized to the MSS, backlog age limit). */
+    private fun applyRtspClientPrefs(p: Prefs) {
+        com.aeonos.portalha.rtspserver.FleetServerClient.fitMss = p.toggle("rtp_fit_mss")
+        com.aeonos.portalha.rtspserver.FleetServerClient.maxAgeMs =
+            getSharedPreferences("portal_ha", MODE_PRIVATE).getInt("rtsp_max_age_ms", 0).toLong()
+    }
+
     private fun publishCapabilities(p: Prefs) {
-        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"reload\",\"sendspin_buffer_kb\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"]," +
+        val json = "{\"control\":[\"restart_stream\",\"restart_service\",\"restart_process\",\"reload\",\"sendspin_buffer_kb\",\"wifi_perf_lock\",\"toggle\",\"toggles\",\"status\"," +
+            "\"rtsp_status\",\"rtsp_max_age_ms\",\"music_status\",\"settings_unlock\"]," +
             "\"selfheal\":[\"ON\",\"OFF\",\"status\",\"tick\",\"test\",\"helper\",\"strict\"]," +
             "\"features\":[\"camera_revive\",\"mqtt_publisher\",\"exit_dump\",\"webview_retry\",\"net_diet\",\"camera_encoder\",\"rtsp_auth\",\"photo_hold\"]," +
             "\"version\":\"${BuildConfig.VERSION_NAME}\",\"since\":\"2026-11-09\"}"
@@ -3741,7 +3808,8 @@ class BridgeService : Service() {
             "mqtt connect_fails=${mqttConnectFailures.get()} connect_timeouts=${mqttConnectTimeouts.get()} republish_folded=${republishSkipped.get()} | " +
             "rtsp restart_fails=${rtspRestartFails.get()} start_fails=${rtspStreamer?.startFailures ?: 0} last_start_failure='${rtspStreamer?.lastStartFailure ?: ""}' " +
             "enc_fps=${rtspStreamer?.encoderFps ?: -1} | restarts service='${prefs?.restartTimes("service") ?: ""}' process='${prefs?.restartTimes("process") ?: ""}' | " +
-            "page_probe='${DashboardActivity.lastPageProbe}' | ${prefs?.let { togglesLine(it) } ?: ""}"
+            "page_probe='${DashboardActivity.lastPageProbe}' | ${sendspinPlayer?.statusLine() ?: "music off"} | " +
+            "${SettingsLock.status(this)} | ${prefs?.let { togglesLine(it) } ?: ""}"
 
     private fun handleControlCommand(payload: String, p: Prefs) {
         val cmd = payload.trim().lowercase()
@@ -3831,6 +3899,19 @@ class BridgeService : Service() {
                 say("sendspin_buffer_kb=${sp.getInt("sendspin_buffer_kb", 0)} (0 = fleet default 1024; applies at the next restart_service)")
             }
             cmd == "toggles" -> say(togglesLine(p))
+            // fleet (2026-11-22, review b3-11 / b3-08 / b6-06 / x10-02)
+            cmd == "rtsp_status" -> say(rtspStreamer?.rtspStatus() ?: "rtsp: status streamer not created")
+            cmd.startsWith("rtsp_max_age_ms") -> {
+                val v = cmd.substringAfter(':', "").trim().toIntOrNull()
+                val sp = getSharedPreferences("portal_ha", MODE_PRIVATE)
+                if (v != null && (v == 0 || v in 500..10_000)) { sp.edit().putInt("rtsp_max_age_ms", v).apply(); applyRtspClientPrefs(p) }
+                say("rtsp_max_age_ms=${sp.getInt("rtsp_max_age_ms", 0)} (0 = off; 500..10000; live for every client)")
+            }
+            cmd == "music_status" -> say(sendspinPlayer?.let { it.statusLine() + " | " + it.linkAttributesJson() } ?: "music off (synced speaker off)")
+            cmd.startsWith("settings_unlock") -> {
+                val v = cmd.substringAfter(':', "").trim().toIntOrNull() ?: SettingsLock.UNLOCK_MIN_DEFAULT
+                say(SettingsLock.unlock(this, v))
+            }
             cmd.startsWith("toggle:") -> say(applyToggle(cmd.substringAfter("toggle:"), p))
             cmd.startsWith("wifi_perf_lock") -> {
                 val v = cmd.substringAfter(':', "").trim()
@@ -4214,6 +4295,7 @@ class BridgeService : Service() {
                 r.fpsCap = p.streamFpsCap
                 r.authUser = p.rtspUser; r.authPassword = p.rtspPassword
                 com.aeonos.portalha.rtspserver.FleetServerClient.batchFlush = p.rtspBatchFlush
+                applyRtspClientPrefs(p)   // review b3-08 / b3-11
                 if (!r.isStreaming) {
                     // withAudio taps SoundMonitor's capture (MicTapSource) — the
                     // stream itself never opens the mic, so calls/Alexa/wake word

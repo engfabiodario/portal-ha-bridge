@@ -208,6 +208,8 @@ class FleetRtspServer(
         val now = SystemClock.elapsedRealtime()
         val list = synchronized(clients) { clients.map { it.describe(now) } }
         return "rtsp: status clients=${list.size}/$MAX_CLIENTS evictions=$evictions lastEviction='$lastEviction'" +
+            " fit_mss=${FleetServerClient.fitMss} max_age_ms=${FleetServerClient.maxAgeMs} age_drops=${FleetServerClient.ageDropsTotal}" +
+            " age_by_hour='${FleetServerClient.ageHistory()}'" +
             (if (list.isEmpty()) "" else " | " + list.joinToString(" | "))
     }
 

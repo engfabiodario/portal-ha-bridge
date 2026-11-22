@@ -119,13 +119,17 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         /** null = n/a (keep-alive off, paused, blocked, unsupported); true = parked; false = not parked. */
         fun keepAliveParked(): Boolean?
         fun keepAliveRepark(): String
+        /** fleet (2026-11-22, review b6-06): ms the music link (Sendspin) has not been connected; 0 = connected; null = n/a. */
+        fun musicDownMs(): Long? = null
+        /** Restart the music client; "" = nothing done. */
+        fun musicRestart(): String = ""
         /** true = handed to the broker (false: no MQTT session - the next tick tries again). */
         fun publish(state: String, attributesJson: String): Boolean
         /** lan check: TCP targets (host to port), the MQTT broker first when one is configured. Empty = n/a. */
         fun lanTargets(): List<Pair<String, Int>> = emptyList()
     }
 
-    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), RTSPCLIENTS("rtspclients"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi"), LAN("lan") }
+    enum class Check(val id: String) { MQTT("mqtt"), STREAM("stream"), RTSPCLIENTS("rtspclients"), WEBVIEW("webview"), KEEPALIVE("keepalive"), WIFI("wifi"), LAN("lan"), MUSIC("music") }
 
     private class CheckState {
         var last = "unknown"     // ok / bad: <why> / n/a: <why>
@@ -310,6 +314,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         judge(Check.RTSPCLIENTS, evalRtspClients())
         judge(Check.WEBVIEW, evalWebview(), skipActionWhy = linkWhy ?: runCatching { host.screenBusyReason() }.getOrNull()?.let { "busy: $it" })
         judge(Check.KEEPALIVE, evalKeepAlive())
+        judge(Check.MUSIC, evalMusic(), skipActionWhy = linkWhy)
 
         updateState(why)
         publish()
@@ -351,7 +356,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     }
 
     private fun updateState(why: String) {
-        val worst = checks.values.maxOf { it.bad }
+        // review b6-06: the music link never makes the Bridge 'failing' (Music Assistant down / restarting is not a Portal
+        // fault) - it has its own sensor (music_link); self-heal only restarts the music client.
+        val worst = checks.filterKeys { it != Check.MUSIC }.values.maxOf { it.bad }
         // Android 10 has no API to bring an associated-but-dead Wi-Fi link back: say so at once.
         val lanStuck = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             checks.getValue(Check.LAN).bad >= BAD_TICKS_FOR_ACTION
@@ -482,6 +489,13 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
         false -> "bad: keep-alive on but Ava not parked"
     }
 
+    /** review b6-06: the synced speaker is on, MQTT is up, and the Sendspin link has not been connected for 2 min. */
+    private fun evalMusic(): String {
+        if (faked(Check.MUSIC)) return "bad: test (selfHealTest music)"
+        val down = runCatching { host.musicDownMs() }.getOrNull() ?: return "n/a: music off / MQTT down"
+        return if (down >= MUSIC_DOWN_MS) "bad: music link down ${down / 1000} s" else "ok"
+    }
+
     private fun judge(c: Check, result: String, skipActionWhy: String? = null, busy: String? = null) {
         val s = checks.getValue(c)
         val bad = result.startsWith("bad")
@@ -515,7 +529,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
 
     // fleet (2026-11-21, review b4-02): Wi-Fi 12 an hour (was the shared 6: spent after 24 min of an outage, then ~37 min
     // with no attempt at all - 11-15 traces). Its own 1/2/4/8-min backoff keeps it to one attempt per 8 min.
-    private fun maxPerHour(c: Check) = when (c) { Check.STREAM -> STREAM_MAX_PER_HOUR; Check.WIFI -> WIFI_MAX_PER_HOUR; else -> MAX_PER_HOUR }
+    private fun maxPerHour(c: Check) = when (c) { Check.STREAM -> STREAM_MAX_PER_HOUR; Check.WIFI -> WIFI_MAX_PER_HOUR; Check.MUSIC -> MUSIC_MAX_PER_HOUR; else -> MAX_PER_HOUR }
 
     private fun act(c: Check, s: CheckState, reason: String, busy: String? = null) {
         val now = SystemClock.elapsedRealtime()
@@ -543,6 +557,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
                 Check.RTSPCLIENTS -> host.rtspEvictStalled()
                 Check.WEBVIEW -> host.webviewReload()
                 Check.KEEPALIVE -> host.keepAliveRepark()
+                Check.MUSIC -> host.musicRestart()
                 Check.WIFI -> if (busy != null) wifiPlainAction(s, busy) else wifiAction(s)
                 Check.LAN -> lanAction(s)
             }
@@ -738,6 +753,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
          *  mid-hour unretried for up to 51 min). */
         private const val STREAM_MAX_PER_HOUR = 10
         private const val WIFI_MAX_PER_HOUR = 12
+        /** review b6-06: music client restarts at most 3 an hour; the link must be down this long first. */
+        private const val MUSIC_MAX_PER_HOUR = 3
+        private const val MUSIC_DOWN_MS = 120_000L
         /** Host.streamFrameAgeMs(): a (re)start is still coming up (not judged; see 'wait'). */
         const val STREAM_JUST_STARTED = -1L
         private const val HOUR_MS = 60 * 60_000L

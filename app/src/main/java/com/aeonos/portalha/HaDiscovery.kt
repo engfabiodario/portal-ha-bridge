@@ -688,6 +688,23 @@ object HaDiscovery {
         return """{"name":"Bridge Memory","unique_id":"${deviceId}_bridge_memory","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${bridgeMemoryStateTopic(deviceId)}","json_attributes_topic":"${bridgeMemoryAttributesTopic(deviceId)}","device_class":"data_size","unit_of_measurement":"MB","state_class":"measurement","suggested_display_precision":0,"icon":"mdi:memory","entity_category":"diagnostic"$defId}"""
     }
 
+    // ── Music link sensor (diagnostic, fleet 2026-11-22, review b6-06) ────────────
+    // State = off / idle / connecting / streaming / down (the Sendspin link to Music Assistant); attributes = drops, sync
+    // error, underruns, trims, pads, buffer, rtt / clock offset, codec, mute, focus. Published on a change + every 10 min.
+
+    fun musicLinkDiscoveryTopic(deviceId: String) = "homeassistant/sensor/${deviceId}_music_link/config"
+
+    fun musicLinkStateTopic(deviceId: String) = "portal/$deviceId/sensor/music_link"
+
+    fun musicLinkAttributesTopic(deviceId: String) = "portal/$deviceId/sensor/music_link/attributes"
+
+    fun musicLinkConfigPayload(deviceId: String, deviceName: String): String {
+        val name = deviceName.escape()
+        val slug = deviceName.lowercase(java.util.Locale.ROOT).replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        val defId = if (slug.isNotEmpty()) ",\"default_entity_id\":\"sensor.${slug}_music_link\"" else ""
+        return """{"name":"Music Link","unique_id":"${deviceId}_music_link","device":${device(deviceId, name)},${availability(deviceId)},"state_topic":"${musicLinkStateTopic(deviceId)}","json_attributes_topic":"${musicLinkAttributesTopic(deviceId)}","icon":"mdi:music-note-eighth","entity_category":"diagnostic"$defId}"""
+    }
+
     // ── Stale entity cleanup ──────────────────────────────────────────────────
 
     fun staleTopics(deviceId: String) = listOf(

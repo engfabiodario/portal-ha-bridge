@@ -188,22 +188,126 @@ class SendspinPlayer(
     }
     private var focusRequest: AudioFocusRequest? = null
 
+    // fleet (2026-11-22, review b6-08): two mute sources - the Bridge's own hooks (call, intercom, assistant turn) and
+    // audio focus (a transient loss) - combined, so one can not lift the other's mute; plus a watchdog for a stale one.
+    @Volatile private var hookMuted = false
+    @Volatile private var focusMuted = false
+    @Volatile private var mutedSinceMs = 0L
+    @Volatile private var focusHeld = false
+
+    private fun applyMute() {
+        val m = hookMuted || focusMuted
+        mutedSinceMs = if (!m) 0L else if (mutedSinceMs == 0L) android.os.SystemClock.elapsedRealtime() else mutedSinceMs
+        audioPlayer?.muteForSystem(m)
+    }
+
     /**
      * Silence playback while a call / Alexa turn / the intercom needs the speaker, without
      * dropping our place in the group stream. See SendspinAudioPlayer.muteForSystem.
      */
-    fun muteForSystem(muted: Boolean) { audioPlayer?.muteForSystem(muted) }
+    fun muteForSystem(muted: Boolean) { hookMuted = muted; applyMute() }
+
+    /**
+     * fleet (2026-11-22, review b6-08): a mute older than 2 min while nothing that mutes us is active ([busy] = call,
+     * ringing, assistant turn, intercom) is stale (a missed GAIN / end hook): lifted and logged. BridgeService ticks it.
+     */
+    fun muteWatchdog(busy: Boolean) {
+        val since = mutedSinceMs
+        if (since == 0L || busy || android.os.SystemClock.elapsedRealtime() - since < 120_000L) return
+        Log.w(TAG, "sendspin: mute ${(android.os.SystemClock.elapsedRealtime() - since) / 1000} s old with no call / intercom / assistant turn - lifted (hook=$hookMuted focus=$focusMuted)")
+        hookMuted = false; focusMuted = false
+        applyMute()
+    }
+
+    /** fleet (2026-11-22, review b6-08): stream / track start - take the focus again if something took it for good. */
+    private fun takeFocus(why: String) {
+        if (focusHeld) return
+        val req = focusRequest ?: return
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val r = runCatching { audio.requestAudioFocus(req) }.getOrDefault(AudioManager.AUDIOFOCUS_REQUEST_FAILED)
+        focusHeld = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        Log.i(TAG, "sendspin: audio focus ${if (focusHeld) "taken" else "refused ($r)"} ($why)")
+    }
+
+    private fun releaseFocus(why: String) {
+        if (!focusHeld) return
+        val req = focusRequest ?: return
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        runCatching { audio.abandonAudioFocusRequest(req) }
+        focusHeld = false
+        if (focusMuted) { focusMuted = false; applyMute() }
+        Log.i(TAG, "sendspin: audio focus given up ($why)")
+    }
+
+    // -- Music link health (fleet 2026-11-22, review b6-06): sensor.<slug>_music_link + self-heal 'music' --
+    @Volatile var libState = "IDLE"
+        private set
+    @Volatile private var libStateSinceMs = android.os.SystemClock.elapsedRealtime()
+    /** elapsedRealtime since the link is NOT connected (0 = connected). */
+    @Volatile private var downSinceMs = android.os.SystemClock.elapsedRealtime()
+    @Volatile var drops = 0
+        private set
+    @Volatile private var everConnected = false
+    /** Called (library thread) when the link state changes. */
+    @Volatile var onLinkChange: (() -> Unit)? = null
+
+    private fun connectedState(s: String) = s == "STREAMING" || s == "CLOCK_SYNCING"
+
+    /** ms the link has not been connected (0 = connected now). */
+    fun downForMs(): Long { val d = downSinceMs; return if (d == 0L) 0L else android.os.SystemClock.elapsedRealtime() - d }
+
+    /** streaming (audio playing) / idle (connected, nothing playing) / connecting / down. */
+    fun linkClass(): String = when {
+        downSinceMs == 0L && audioPlayer?.isPlaying == true -> "streaming"
+        downSinceMs == 0L -> "idle"
+        libState == "CONNECTING" || libState == "HANDSHAKING" -> "connecting"
+        else -> "down"
+    }
+
+    private fun f1(v: Double) = String.format(java.util.Locale.US, "%.1f", v)
+
+    fun linkAttributesJson(): String {
+        val c = client
+        val cs = runCatching { c?.clockSync }.getOrNull()
+        val rtt = runCatching { cs?.lastRttMicros }.getOrNull() ?: 0L
+        val off = runCatching { cs?.lastOffsetMicros }.getOrNull() ?: 0.0
+        val buf = runCatching { c?.audioBuffer?.size }.getOrNull() ?: 0
+        val fmt = runCatching { c?.streamFormat?.value }.getOrNull()
+        val sinceS = (android.os.SystemClock.elapsedRealtime() - libStateSinceMs) / 1000
+        val rep = SendspinAudioPlayer.lastReportWallMs
+        return "{\"library_state\":\"$libState\",\"state_for_s\":$sinceS,\"drops\":$drops," +
+            "\"sync_err_ms\":${f1(SendspinAudioPlayer.lastErrMs)},\"avg_err_ms\":${f1(SendspinAudioPlayer.avgErrMs)}," +
+            "\"stats_age_s\":${if (rep == 0L) -1 else (System.currentTimeMillis() - rep) / 1000}," +
+            "\"underruns\":${SendspinAudioPlayer.totUnderruns},\"trims\":${SendspinAudioPlayer.totTrims}," +
+            "\"pads\":${SendspinAudioPlayer.totPads},\"soft\":${SendspinAudioPlayer.totSoft}," +
+            "\"buffered_chunks\":$buf,\"out_ms\":${SendspinAudioPlayer.outMs},\"hw_ms\":${SendspinAudioPlayer.hwMs}," +
+            "\"rtt_ms\":${f1(rtt / 1000.0)},\"offset_ms\":${f1(off / 1000.0)}," +
+            "\"codec\":\"${fmt?.codec ?: ""}\",\"muted\":${hookMuted || focusMuted},\"focus\":$focusHeld}"
+    }
+
+    fun statusLine(): String = "music ${linkClass()} lib=$libState drops=$drops down=${downForMs() / 1000}s " +
+        "err=${f1(SendspinAudioPlayer.avgErrMs)}ms underruns=${SendspinAudioPlayer.totUnderruns} " +
+        "trims=${SendspinAudioPlayer.totTrims} pads=${SendspinAudioPlayer.totPads} muted=${hookMuted || focusMuted} focus=$focusHeld"
 
     // A phone call or another media app takes focus transiently and hands it back, so those are
     // safe to follow. A PERMANENT loss is not: Android never sends a matching GAIN afterwards, so
     // muting on it strands us silent forever — which is exactly what happened when falcon took
     // focus for an Alexa turn. BridgeService's explicit yield/reclaim hooks own that case.
+    // fleet (2026-11-22, review b6-08): a permanent loss lifts a focus mute at once (transient, then permanent in one
+    // turn = muted for good before) and marks the focus as lost; it is asked for again at the next stream / track start,
+    // so the Bridge is back in the focus stack (voice turns duck it again) after YouTube or a live view took the focus.
+    // The Bridge's own hook mutes (call, intercom, assistant turn) are kept apart (hookMuted) - focus never lifts them.
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
-            AudioManager.AUDIOFOCUS_GAIN -> muteForSystem(false)
+            AudioManager.AUDIOFOCUS_GAIN -> { focusHeld = true; focusMuted = false; applyMute() }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> muteForSystem(true)
-            else -> Log.i(TAG, "sendspin: permanent focus loss — leaving mute to the wake hooks")
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> { focusMuted = true; applyMute() }
+            else -> {
+                focusHeld = false
+                val was = focusMuted
+                focusMuted = false; applyMute()
+                Log.i(TAG, "sendspin: permanent focus loss${if (was) " - focus mute lifted" else ""}; asked again at the next stream start")
+            }
         }
     }
 
@@ -336,7 +440,16 @@ class SendspinPlayer(
             productName = "Portal HA Bridge",
             softwareVersion = BuildConfig.VERSION_NAME,
             audioPlayerFactory = { buffer, clock ->
-                SendspinAudioPlayer(buffer, clock).also { ap -> audioPlayer = ap; ap.onActive = { on -> idle?.onStream(on) } }
+                SendspinAudioPlayer(buffer, clock).also { ap ->
+                    audioPlayer = ap
+                    ap.onActive = { on ->
+                        idle?.onStream(on)
+                        // fleet (2026-11-22, review b6-08): the focus is given up when the stream ends (asked again at the next).
+                        if (!on) releaseFocus("stream end")
+                    }
+                    ap.onStreamBegin = { takeFocus("stream start") }
+                    if (hookMuted || focusMuted) ap.muteForSystem(true)   // a new player keeps a mute that is on
+                }
             },
             // fleet (2026-11-21, review b6-03): the library keeps the volume / mute Music Assistant set in this store and
             // restores + reports it at the next start. Without one (NoOp) every Bridge restart / install said 100 %.
@@ -359,7 +472,7 @@ class SendspinPlayer(
             .setOnAudioFocusChangeListener(focusListener)
             .setWillPauseWhenDucked(false)
             .build()
-            .also { runCatching { audio.requestAudioFocus(it) } }
+            .also { focusHeld = runCatching { audio.requestAudioFocus(it) }.getOrDefault(0) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED }
 
         // A fixed server URL skips discovery; the client reconnects on its own after drops.
         val fixed = fixedUrl
@@ -380,7 +493,21 @@ class SendspinPlayer(
             }
         }
 
-        s.launch { c.state.collect { Log.i(TAG, "sendspin: state $it"); idle?.onState(it) } }
+        downSinceMs = android.os.SystemClock.elapsedRealtime()
+        s.launch { c.state.collect {
+            Log.i(TAG, "sendspin: state $it"); idle?.onState(it)
+            // fleet (2026-11-22, review b6-06): link health.
+            val name = it.toString()
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (name != libState) { libState = name; libStateSinceMs = now }
+            if (connectedState(name)) {
+                if (downSinceMs != 0L) { downSinceMs = 0L; everConnected = true }
+            } else if (downSinceMs == 0L) {
+                downSinceMs = now
+                if (everConnected) { drops++; Log.i(TAG, "sendspin: link lost ($name, drop $drops)") }
+            }
+            runCatching { onLinkChange?.invoke() }
+        } }
         idle?.start()
         s.launch { c.albumArtwork.collect { art ->
             Log.i(TAG, "sendspin: artwork ${art?.size ?: 0} bytes")

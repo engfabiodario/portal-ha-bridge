@@ -62,8 +62,10 @@ class CameraSettingsActivity : AppCompatActivity() {
         tvCameraUrl = findViewById(R.id.tv_camera_url)
 
         findViewById<Button>(R.id.btn_back).setOnClickListener { finish() }
+        SettingsLock.install(this) { updateUi() }   // fleet (2026-11-22, review x10-02): wall lock
 
         btnRotate.setOnClickListener {
+            if (SettingsLock.locked(this)) { updateUi(); return@setOnClickListener }
             prefs.streamRotation = (prefs.streamRotation + 90) % 360
             BridgeService.setRotation(this, prefs.streamRotation)
             updateUi()
@@ -71,6 +73,7 @@ class CameraSettingsActivity : AppCompatActivity() {
 
         swService.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.cameraServiceEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, true, "Camera Service")) { updateUi(); return@setOnCheckedChangeListener }
             prefs.cameraServiceEnabled = checked
             updateUi()
             restartService(if (checked) "Camera service enabled" else "Camera service disabled")
@@ -79,6 +82,7 @@ class CameraSettingsActivity : AppCompatActivity() {
         // Motion and streaming are mutually exclusive (each opens the camera).
         swMotion.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.motionEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, false, "Motion detection")) { updateUi(); return@setOnCheckedChangeListener }
             prefs.motionEnabled = checked
             if (checked) {
                 prefs.streamEnabled = false   // mutually exclusive
@@ -93,6 +97,7 @@ class CameraSettingsActivity : AppCompatActivity() {
 
         swStream.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.streamEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, true, "Camera Streaming")) { updateUi(); return@setOnCheckedChangeListener }
             prefs.streamEnabled = checked
             if (checked) {
                 prefs.motionEnabled = false   // mutually exclusive
@@ -111,6 +116,7 @@ class CameraSettingsActivity : AppCompatActivity() {
         // broadcast (same channel the adb debug toggle uses).
         swStreamAudio.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.streamAudioEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, true, "Stream audio")) { updateUi(); return@setOnCheckedChangeListener }
             sendBroadcast(android.content.Intent("com.aeonos.portalha.DEBUG_STREAM_AUDIO")
                 .setPackage(packageName).putExtra("on", checked))
             Toast.makeText(this,
@@ -119,6 +125,7 @@ class CameraSettingsActivity : AppCompatActivity() {
         }
 
         btnCameraPower.setOnClickListener {
+            if (SettingsLock.refuses(this, !prefs.cameraOn, true, "Camera power")) { updateUi(); return@setOnClickListener }
             val on = !prefs.cameraOn
             prefs.cameraOn = on
             BridgeService.setCamera(this, on)
@@ -175,6 +182,14 @@ class CameraSettingsActivity : AppCompatActivity() {
 
         btnRotate.visibility = if (serviceOn) View.VISIBLE else View.GONE
         btnRotate.text = "Rotate Stream (currently ${prefs.streamRotation}°)"
+
+        // fleet (2026-11-22, review x10-02): wall lock - each control may only move toward the fleet state while locked.
+        SettingsLock.guard(this, swService, serviceOn, true)
+        SettingsLock.guard(this, swMotion, prefs.motionEnabled, false, serviceOn)
+        SettingsLock.guard(this, swStream, prefs.streamEnabled, true, serviceOn)
+        SettingsLock.guard(this, swStreamAudio, prefs.streamAudioEnabled, true, serviceOn && prefs.streamEnabled)
+        SettingsLock.guard(this, btnCameraPower, prefs.cameraOn, true)
+        SettingsLock.lockButton(this, btnRotate)
 
         if (serviceOn && prefs.streamEnabled) {
             val ip = BridgeService.localIp() ?: "<device-ip>"

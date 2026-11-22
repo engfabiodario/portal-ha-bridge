@@ -49,8 +49,15 @@ class SystemSettingsActivity : AppCompatActivity() {
             }
         }
 
-        findViewById<Button>(R.id.btn_sleep).setOnClickListener { ScreenControl.sleep() }
-        findViewById<Button>(R.id.btn_wake).setOnClickListener { ScreenControl.wake(this) }
+        findViewById<Button>(R.id.btn_sleep).setOnClickListener { if (!SettingsLock.locked(this)) ScreenControl.sleep() }
+        findViewById<Button>(R.id.btn_wake).setOnClickListener { if (!SettingsLock.locked(this)) ScreenControl.wake(this) }
+        // fleet (2026-11-22, review x10-02): wall lock - the Sleep / Wake tests are greyed while locked.
+        val lockTests = {
+            SettingsLock.lockButton(this, findViewById(R.id.btn_sleep))
+            SettingsLock.lockButton(this, findViewById(R.id.btn_wake))
+        }
+        SettingsLock.install(this) { lockTests() }
+        lockTests()
 
         findViewById<Button>(R.id.btn_accessibility).setOnClickListener {
             if (!ScreenControl.enableAccessibility(this)) {

@@ -95,6 +95,49 @@ class FleetServerClient(
         private const val FLUSH_CAP = 7_400
         /** Batch the TCP flushes (see sendLoop). Default false = the old flush per packet. Live for every client. */
         @Volatile @JvmStatic var batchFlush = false
+
+        /**
+         * fleet (2026-11-22, review b3-08, toggle rtp_fit_mss): video RTP packets sized to the client's TCP MSS minus the
+         * 4-byte interleave header, so each flushed packet is ONE segment. The library's packets are 1472 B (+4 = 1476):
+         * MEASURED 11-22 on Coffee Area (pktmon, laptop NIC, 60 s): MSS 1460 -> every full packet = a 1460 segment + a 16 B
+         * runt, 92 runts/s of 225 data segments/s. Read per client at PLAY (new clients only); flush per packet unchanged.
+         */
+        @Volatile @JvmStatic var fitMss = false
+        private const val TCP_MAXSEG = 2               // linux/tcp.h
+        private const val LIB_MAX_PACKET = 1472
+
+        /**
+         * fleet (2026-11-22, review b3-11): a client whose oldest queued packet is older than this drops to the next key
+         * frame (the overflow rule), so a slow link never serves seconds-old video. 0 = off (only the 1000-packet cap).
+         * control/set rtsp_max_age_ms:<n>. The age is measured always (status / hourly max) - also with the limit off.
+         */
+        @Volatile @JvmStatic var maxAgeMs = 0L
+        @Volatile @JvmStatic var ageDropsTotal = 0L
+        /** Highest queue age (ms) seen by any client per clock hour (index = hour of day), with that hour's epoch hour. */
+        private val hourMaxAge = LongArray(24)
+        private val hourStamp = LongArray(24)
+        private fun noteAge(ageMs: Long) {
+            val eh = System.currentTimeMillis() / 3_600_000L
+            val i = (((System.currentTimeMillis() / 3_600_000L) + TZ_HOURS) % 24).toInt().coerceIn(0, 23)
+            synchronized(hourMaxAge) {
+                if (hourStamp[i] != eh) { hourStamp[i] = eh; hourMaxAge[i] = 0L }
+                if (ageMs > hourMaxAge[i]) hourMaxAge[i] = ageMs
+            }
+        }
+        private val TZ_HOURS: Long = (java.util.TimeZone.getDefault().rawOffset / 3_600_000L).let { if (it < 0) it + 24 else it }
+        /** "HH:max_ms" for the hours of the last 24 h that had a client, oldest first. */
+        @JvmStatic fun ageHistory(): String {
+            val nowEh = System.currentTimeMillis() / 3_600_000L
+            val out = ArrayList<String>()
+            synchronized(hourMaxAge) {
+                for (back in 23 downTo 0) {
+                    val eh = nowEh - back
+                    val i = ((eh + TZ_HOURS) % 24).toInt().coerceIn(0, 23)
+                    if (hourStamp[i] == eh) out += "%02d:%d".format(i, hourMaxAge[i])
+                }
+            }
+            return out.joinToString(" ")
+        }
     }
 
     val remotePort: Int = socket.port
@@ -137,7 +180,16 @@ class FleetServerClient(
     @Volatile var sentAudio = 0L
         private set
 
-    private val queue = ArrayBlockingQueue<RtpFrame>(MAX_QUEUE_FRAMES)
+    /** A queued packet + the elapsedRealtime it was offered (review b3-11: age-bounded backlog). */
+    private class Queued(val f: RtpFrame, val at: Long)
+    private val queue = ArrayBlockingQueue<Queued>(MAX_QUEUE_FRAMES)
+    @Volatile var maxAgeSeenMs = 0L
+        private set
+    @Volatile var ageDrops = 0L
+        private set
+    /** Video packet size used for this client (review b3-08), 0 = library default. */
+    @Volatile var videoPacketBytes = 0
+        private set
     // Touched only by the encoder threads (under the server's client-list lock).
     @Volatile private var waitKeyFrame = true
     private var lastOverflowLog = 0L
@@ -324,6 +376,7 @@ class FleetServerClient(
         val ssrcAudio = rnd.nextInt().toLong()
         videoPacket?.setSSRC(ssrcVideo)
         audioPacket?.setSSRC(ssrcAudio)
+        if (fitMss && protocol == Protocol.TCP) videoPacket?.let { fitPacketToMss(it) }
         if (protocol == Protocol.UDP) {
             val rtp = BaseRtpSocket.getInstance(Protocol.UDP, scm.videoServerPorts[0], scm.audioServerPorts[0])
             val rep = BaseSenderReport.getInstance(Protocol.UDP, scm.videoServerPorts[1], scm.audioServerPorts[1])
@@ -349,6 +402,25 @@ class FleetServerClient(
         onMainThreadHandler { connectChecker.onConnectionSuccess() }
     }
 
+    /** review b3-08: maxPacketSize (private final in RootEncoder 2.4.6's BasePacket, read by its getter) = MSS - 4. */
+    private fun fitPacketToMss(vp: BasePacket) {
+        runCatching {
+            val fd = Socket::class.java.getMethod("getFileDescriptor\$").invoke(socket) as java.io.FileDescriptor
+            // Os.getsockoptInt is @hide (greylisted - fine with the fleet's hidden_api_policy): by reflection.
+            val mss = Os::class.java.getMethod("getsockoptInt", java.io.FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .invoke(null, fd, OsConstants.IPPROTO_TCP, TCP_MAXSEG) as Int
+            if (mss < 536 || mss - 4 >= LIB_MAX_PACKET) {
+                Log.i(TAG, "rtsp: client $label mss=$mss - video packets left at $LIB_MAX_PACKET B")
+                return
+            }
+            val f = BasePacket::class.java.getDeclaredField("maxPacketSize")
+            f.isAccessible = true
+            f.setInt(vp, mss - 4)
+            videoPacketBytes = f.getInt(vp)
+            Log.i(TAG, "rtsp: client $label mss=$mss - video packets <= $videoPacketBytes B (one TCP segment each)")
+        }.onFailure { Log.w(TAG, "rtsp: client $label packet sizing failed (library default kept): ${it.javaClass.simpleName}: ${it.message}") }
+    }
+
     // ── Media side ─────────────────────────────────────────────────────────────
 
     /** Encoder thread. Never blocks: a full queue drops for this client only.
@@ -364,7 +436,7 @@ class FleetServerClient(
         vp.createAndSendPacket(h264Buffer, info) { f ->
             if (waitKeyFrame) { droppedVideo++; return@createAndSendPacket }
             lastOfferAt = SystemClock.elapsedRealtime()
-            if (!queue.offer(restamp(f, ts))) overflow()
+            if (!queue.offer(Queued(restamp(f, ts), lastOfferAt))) overflow()
         }
     }
 
@@ -374,7 +446,7 @@ class FleetServerClient(
         val ts = rtpTs(absUs, scm.sampleRate.toLong())
         ap.createAndSendPacket(aacBuffer, info) { f ->
             lastOfferAt = SystemClock.elapsedRealtime()
-            if (!queue.offer(restamp(f, ts))) droppedAudio++
+            if (!queue.offer(Queued(restamp(f, ts), lastOfferAt))) droppedAudio++
         }
     }
 
@@ -400,10 +472,29 @@ class FleetServerClient(
         }
     }
 
+    /** review b3-11: the head packet is older than [maxAgeMs] - empty the backlog, video restarts at the next key frame. */
+    private fun ageDrop(ageMs: Long) {
+        queue.clear()
+        waitKeyFrame = true
+        ageDrops++; ageDropsTotal++
+        droppedVideo++
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastOverflowLog > 10_000L) {
+            lastOverflowLog = now
+            Log.w(TAG, "rtsp: client $label backlog ${ageMs} ms old (limit $maxAgeMs ms) - dropped, video restarts at the next key frame (age drops=$ageDrops)")
+        }
+    }
+
     private fun sendLoop() {
         try {
             while (!closed) {
-                val f = queue.poll(1, TimeUnit.SECONDS) ?: continue
+                val q = queue.poll(1, TimeUnit.SECONDS) ?: continue
+                val age = SystemClock.elapsedRealtime() - q.at
+                if (age > maxAgeSeenMs) maxAgeSeenMs = age
+                noteAge(age)
+                val lim = maxAgeMs
+                if (lim > 0L && age > lim) { ageDrop(age); continue }
+                val f = q.f
                 if (protocol == Protocol.TCP) {
                     writeInterleaved(2 * f.channelIdentifier, f.buffer, f.length)
                     if (f.isVideoFrame()) sentVideo++ else sentAudio++
@@ -555,5 +646,6 @@ class FleetServerClient(
         "$label ${if (canSend) "playing ${(now - playingSince) / 1000}s" else "setup"} " +
             "sent=${bytesSent / 1024}KB lastWrite=${(now - lastWriteAt) / 1000}s " +
             "writeBlocked=${if (writeStartedAt == 0L) 0 else (now - writeStartedAt) / 1000}s " +
-            "queue=${queue.size} dropV=$droppedVideo dropA=$droppedAudio overflows=$overflows"
+            "queue=${queue.size} dropV=$droppedVideo dropA=$droppedAudio overflows=$overflows " +
+            "maxAge=${maxAgeSeenMs}ms ageDrops=$ageDrops pkt=${if (videoPacketBytes == 0) LIB_MAX_PACKET else videoPacketBytes}"
 }

@@ -51,9 +51,11 @@ class VoiceSettingsActivity : AppCompatActivity() {
         swKeepWarm = findViewById(R.id.sw_alexa_keep_warm)
 
         findViewById<Button>(R.id.btn_back).setOnClickListener { saveWakePhrase(); saveAlexaPhrase(); finish() }
+        SettingsLock.install(this) { updateUi() }   // fleet (2026-11-22, review x10-02): wall lock
 
         swWake.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.wakeWordEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, false, "The Bridge wake word")) { updateUi(); return@setOnCheckedChangeListener }
             prefs.wakeWordEnabled = checked
             if (checked && prefs.coexistVoiceAssistant) prefs.coexistVoiceAssistant = false   // mutually exclusive
             BridgeService.applyDisplaySettings(this)
@@ -67,6 +69,7 @@ class VoiceSettingsActivity : AppCompatActivity() {
 
         swAlexa.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.alexaWakeEnabled) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, false, "Alexa")) { updateUi(); return@setOnCheckedChangeListener }
             if (checked && !alexaProvisioned()) {
                 // Enabling without falcon would arm a wake word that leads nowhere.
                 showAlexaProvisionDialog()
@@ -113,6 +116,7 @@ class VoiceSettingsActivity : AppCompatActivity() {
 
         swCoexist.setOnCheckedChangeListener { _, checked ->
             if (checked == prefs.coexistVoiceAssistant) return@setOnCheckedChangeListener
+            if (SettingsLock.refuses(this, checked, true, "Coexist with the voice assistant")) { updateUi(); return@setOnCheckedChangeListener }
             prefs.coexistVoiceAssistant = checked
             if (checked && prefs.wakeWordEnabled) prefs.wakeWordEnabled = false   // mutually exclusive
             BridgeService.applyDisplaySettings(this)
@@ -231,5 +235,11 @@ class VoiceSettingsActivity : AppCompatActivity() {
         swCoexist.isChecked = prefs.coexistVoiceAssistant
         swCoexist.isEnabled = !anyWake
         swCoexist.alpha = if (anyWake) 0.4f else 1f
+        // fleet (2026-11-22, review x10-02): wall lock - Coexist only ON, the Bridge's own wake words only OFF.
+        if (SettingsLock.locked(this)) {
+            if (prefs.coexistVoiceAssistant) { swCoexist.isEnabled = false; swCoexist.alpha = 0.45f }
+            if (!prefs.wakeWordEnabled) { swWake.isEnabled = false; swWake.alpha = 0.45f }
+            if (!prefs.alexaWakeEnabled) { swAlexa.isEnabled = false; swAlexa.alpha = 0.45f }
+        }
     }
 }
