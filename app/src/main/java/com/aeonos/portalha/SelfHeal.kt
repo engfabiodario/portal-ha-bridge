@@ -377,6 +377,9 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             val caps = cm.getNetworkCapabilities(n)
             caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         } == true
+        // fleet (2026-11-22, review b4-06): remember the network we are on (Android 9 traces often have no id).
+        @Suppress("DEPRECATION")
+        if (up) runCatching { wm.connectionInfo?.networkId?.let { if (it >= 0) lastSeenNetId = it } }
         if (up) "ok" else "bad: Wi-Fi link down"
     }.getOrElse { "n/a: ${it.message}" }
 
@@ -569,6 +572,15 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
             // booting (only neighbours' APs seen), then Android 9 sat in DisconnectedState with no scan for 25 min (rejoined
             // 03:27:51 on a PNO result). reconnect() on Android 9 starts a fresh scan + network selection; it is only sent
             // while the link is down, so a live connection is never touched.
+            // fleet (2026-11-22, review b4-06): from 5 min down, every 10 min enableNetwork(last id, true) instead - it
+            // clears a network barred for auto-join (the Guest 10-26 state); Android 9 accepts it (test:enablenet on Coffee
+            // Area 11-22: true). No radio toggle and no disconnect() on Android 9.
+            val nid9 = if (WifiTrace.lastNetId >= 0) WifiTrace.lastNetId else lastSeenNetId
+            if (downMin >= 5 && nid9 >= 0 && now - lastEnableNetMs >= 10 * 60_000L) {
+                lastEnableNetMs = now
+                @Suppress("DEPRECATION")
+                return "WifiManager.enableNetwork($nid9, true) = ${wm.enableNetwork(nid9, true)} (Android 9, down $downMin min)"
+            }
             @Suppress("DEPRECATION")
             val ok = wm.reconnect()
             s.wifiReconnected = true
@@ -620,6 +632,7 @@ class SelfHeal(private val ctx: Context, private val host: Host) {
     private var lastToggleMs = 0L
     private var lastKickMs = 0L
     private var lastEnableNetMs = 0L
+    @Volatile private var lastSeenNetId = -1
     private var togglesToday = 0
     private var togglesDay = -1
 
